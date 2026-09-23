@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity 0.8.24;
+
+/// @notice The Comptroller's view of the FundFactory's protocol-curated adapter list.
+interface IAdapterRegistry {
+	function isAdapterRegistered(address adapter) external view returns (bool);
+}
+
+/// @notice The Comptroller's view of the FundFactory's protocol AUM-fee configuration
+///         (live-read at every fee settlement; the factory bytecode-caps the rate).
+interface IProtocolFeeConfig {
+	function getProtocolFeeConfig() external view returns (uint256 feeBps, address recipient);
+}
