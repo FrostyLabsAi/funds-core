@@ -39,7 +39,7 @@ for i in $(seq 1 60); do
 done
 step "anvil up (pid ${ANVIL_PID})"
 
-step "deploying funds-core stack + fund + VerantaPerpPosition"
+step "deploying funds-core stack + fund + VerantaPerpPositionV2"
 cd "$CORE" || fail "cd funds-core"
 OUT=$(E2E_KEEPER=$KEEPER_ADDR timeout 600 forge script script/probe/DeployVerantaE2E.s.sol:DeployVerantaE2E \
 	--rpc-url "$RPC" --private-key "$KEY0" --broadcast --skip-simulation --slow 2>&1)

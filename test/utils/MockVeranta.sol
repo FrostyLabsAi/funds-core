@@ -2,13 +2,30 @@
 pragma solidity 0.8.24;
 
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
-import {IVerantaTradingRouter, IVerantaMulticall} from '../../src/interfaces/external/IVeranta.sol';
+import {
+	IVerantaTradingRouter,
+	IVerantaMulticall,
+	IVerantaTradingStorage,
+	IVerantaPairStorage,
+	IVerantaReferral
+} from '../../src/interfaces/external/IVeranta.sol';
 
 /// @notice One mock playing Veranta's whole surface: TradingRouter (writes), Multicall
-///         (reads) and TradingStorage (the USDC spender). Mirrors the real two-step market
-///         open: openTrade escrows collateral as a PENDING order; the test acts as the
-///         operator via fillPending / expirePending.
-contract MockVeranta is IVerantaTradingRouter, IVerantaMulticall {
+///         (reads), TradingStorage (the USDC spender + per-trader slot reads) and
+///         PairStorage (pair count). Mirrors the real two-step market open: openTrade
+///         escrows collateral as a PENDING order; the test acts as the operator via
+///         fillPending / expirePending. Fills take the trader's first empty slot per pair,
+///         like the real firstEmptyTradeIndex.
+contract MockVeranta is
+	IVerantaTradingRouter,
+	IVerantaMulticall,
+	IVerantaTradingStorage,
+	IVerantaPairStorage,
+	IVerantaReferral
+{
+	uint256 public constant maxTradesPerPair = 40; // live Veranta value (verified 2026-09-23)
+	uint256 public pairsCount = 10;
+
 	IERC20 public immutable usdc;
 
 	PendingOrder[] internal _pending;
@@ -146,6 +163,15 @@ contract MockVeranta is IVerantaTradingRouter, IVerantaMulticall {
 		return (expiry != 0, expiry);
 	}
 
+	// ─── IVerantaReferral (the mock doubles as the Referral contract) ─────────────
+
+	mapping(address => bytes32) public traderReferralCodes;
+
+	/// @dev Caller-scoped like the real contract: msg.sender, never a delegated trader.
+	function setTraderReferralCodeByUser(bytes32 code) external {
+		traderReferralCodes[msg.sender] = code;
+	}
+
 	// ─── Pyth stand-in (keeper margin path reads these; fees are 0 wei on Base too) ─
 
 	function getUpdateFee(bytes[] calldata) external pure returns (uint256) {
@@ -167,6 +193,7 @@ contract MockVeranta is IVerantaTradingRouter, IVerantaMulticall {
 		_pending.pop();
 
 		t.openPrice = fillPrice;
+		t.index = _firstEmptyTradeIndex(t.trader, t.pairIndex);
 		uint256 coinExposure = (t.positionSizeUSDC * t.leverage * 1e10) / fillPrice / 1e6;
 		// Faithful to the live venue: stored trades carry collateral in initialPosToken;
 		// positionSizeUSDC becomes a dummy (a timestamp-magnitude value, like mainnet rows —
@@ -191,6 +218,10 @@ contract MockVeranta is IVerantaTradingRouter, IVerantaMulticall {
 		);
 	}
 
+	function setPairsCount(uint256 count) external {
+		pairsCount = count;
+	}
+
 	function setRolloverFee(uint256 tradeIdx, uint256 fee) external {
 		_trades[tradeIdx].rolloverFee = fee;
 	}
@@ -206,6 +237,7 @@ contract MockVeranta is IVerantaTradingRouter, IVerantaMulticall {
 		order.pairIndex = pairIndex;
 		order.index = index;
 		order.positionSize = positionSize;
+		order.leverage = 2e10; // real resting orders always carry leverage (0 = empty slot)
 		_limits.push(AggregatedOpenLimitOrder({order: order, liquidationPrice: 0, orderType: 3, coinExposure: 0}));
 	}
 
@@ -260,12 +292,63 @@ contract MockVeranta is IVerantaTradingRouter, IVerantaMulticall {
 		}
 	}
 
-	function getDynamicDataForPosition(address, uint256 pairIndex, uint256 index)
+	/// @dev Like the real Multicall: rollover + funding for the stored trade at the slot.
+	function getDynamicDataForPosition(address trader, uint256 pairIndex, uint256 index)
 		external
 		view
 		returns (uint256, uint256, int256)
 	{
-		return (0, 0, fundingFee[pairIndex][index]);
+		uint256 rollover;
+		for (uint256 i; i < _trades.length; ++i) {
+			Trade memory t = _trades[i].trade;
+			if (t.trader == trader && t.pairIndex == pairIndex && t.index == index) rollover = _trades[i].rolloverFee;
+		}
+		return (0, rollover, fundingFee[pairIndex][index]);
+	}
+
+	// ─── IVerantaTradingStorage (per-trader slot reads) ─────────────────────────
+
+	function openTradesCount(address trader, uint256 pairIndex) external view returns (uint256 count) {
+		for (uint256 i; i < _trades.length; ++i) {
+			if (_trades[i].trade.trader == trader && _trades[i].trade.pairIndex == pairIndex) ++count;
+		}
+	}
+
+	function openLimitOrdersCount(address trader, uint256 pairIndex) external view returns (uint256 count) {
+		for (uint256 i; i < _limits.length; ++i) {
+			if (_limits[i].order.trader == trader && _limits[i].order.pairIndex == pairIndex) ++count;
+		}
+	}
+
+	/// @dev Empty slot → zeroed struct (leverage 0), like the real mapping read.
+	function openTrades(address trader, uint256 pairIndex, uint256 index) external view returns (Trade memory t) {
+		for (uint256 i; i < _trades.length; ++i) {
+			Trade memory candidate = _trades[i].trade;
+			if (candidate.trader == trader && candidate.pairIndex == pairIndex && candidate.index == index) return candidate;
+		}
+	}
+
+	function getOpenLimitOrder(address trader, uint256 pairIndex, uint256 index)
+		external
+		view
+		returns (AggregatedLimitOrder memory order)
+	{
+		for (uint256 i; i < _limits.length; ++i) {
+			AggregatedLimitOrder memory candidate = _limits[i].order;
+			if (candidate.trader == trader && candidate.pairIndex == pairIndex && candidate.index == index) return candidate;
+		}
+	}
+
+	function _firstEmptyTradeIndex(address trader, uint256 pairIndex) internal view returns (uint256 index) {
+		for (; index < maxTradesPerPair; ++index) {
+			bool used;
+			for (uint256 i; i < _trades.length; ++i) {
+				Trade memory t = _trades[i].trade;
+				if (t.trader == trader && t.pairIndex == pairIndex && t.index == index) used = true;
+			}
+			if (!used) return index;
+		}
+		revert('MockVeranta: pair full');
 	}
 
 	function _filterTrades(address trader) internal view returns (AggregatedTrade[] memory trades) {

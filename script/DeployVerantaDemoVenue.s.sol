@@ -4,8 +4,13 @@ pragma solidity 0.8.24;
 import {Script, console2} from 'forge-std/Script.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
-import {VerantaPerpPositionFactory} from '../src/positions/VerantaPerpPosition.sol';
-import {IVerantaTradingRouter, IVerantaMulticall} from '../src/interfaces/external/IVeranta.sol';
+import {VerantaPerpPositionV2Factory} from '../src/positions/VerantaPerpPositionV2.sol';
+import {
+	IVerantaTradingRouter,
+	IVerantaMulticall,
+	IVerantaPairStorage,
+	IVerantaReferral
+} from '../src/interfaces/external/IVeranta.sol';
 import {MockVeranta} from '../test/utils/MockVeranta.sol';
 
 /// @title DeployVerantaDemoVenue
@@ -33,19 +38,22 @@ contract DeployVerantaDemoVenue is Script {
 
 		vm.startBroadcast();
 		MockVeranta venue = new MockVeranta(tUsdc);
-		// The mock is router + multicall + USDC spender in one contract
-		VerantaPerpPositionFactory positionFactory = new VerantaPerpPositionFactory(
+		// The mock is router + multicall + storage + pair storage + USDC spender in one contract
+		VerantaPerpPositionV2Factory positionFactory = new VerantaPerpPositionV2Factory(
 			tUsdc,
 			IVerantaTradingRouter(address(venue)),
 			IVerantaMulticall(address(venue)),
 			address(venue),
+			IVerantaPairStorage(address(venue)),
 			keeper
 		);
 		positionFactory.setPairAsset(ETH_PAIR, tEth);
+		// the mock also plays Veranta's Referral contract (LinkReferral is testable end to end)
+		positionFactory.setReferral(IVerantaReferral(address(venue)), 'frostyfi');
 		factory.registerPositionType(VERANTA_TYPE_ID, address(positionFactory));
 		vm.stopBroadcast();
 
 		console2.log('DemoVeranta venue:', address(venue));
-		console2.log('VerantaPerpPositionFactory (type 6):', address(positionFactory));
+		console2.log('VerantaPerpPositionV2Factory (type 6):', address(positionFactory));
 	}
 }

@@ -7,12 +7,20 @@ import {FundFactory} from '../src/core/FundFactory.sol';
 import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
 import {Comptroller} from '../src/core/Comptroller.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
-import {VerantaPerpPosition, VerantaPerpPositionFactory} from '../src/positions/VerantaPerpPosition.sol';
-import {IVerantaTradingRouter, IVerantaMulticall} from '../src/interfaces/external/IVeranta.sol';
+import {VerantaPerpPositionV2, VerantaPerpPositionV2Factory} from '../src/positions/VerantaPerpPositionV2.sol';
+import {
+	IVerantaTradingRouter,
+	IVerantaMulticall,
+	IVerantaPairStorage,
+	IVerantaReferral
+} from '../src/interfaces/external/IVeranta.sol';
+import {Ownable} from '@openzeppelin/contracts/access/Ownable.sol';
 import {MockERC20, MockAggregator} from './utils/Mocks.sol';
 import {MockVeranta} from './utils/MockVeranta.sol';
 
-contract VerantaPerpTest is Test {
+/// @notice V1's full suite, run against VerantaPerpPositionV2 — the bounded read must value
+///         every case exactly as V1 did — plus V2-only cases below.
+contract VerantaPerpV2Test is Test {
 	uint256 internal constant VERANTA_TYPE_ID = 6;
 	uint256 internal constant ETH_PAIR = 1;
 
@@ -23,7 +31,7 @@ contract VerantaPerpTest is Test {
 	MockERC20 internal teth; // $2,500 feed price
 	MockAggregator internal tethFeed;
 	MockVeranta internal veranta;
-	VerantaPerpPositionFactory internal positionFactory;
+	VerantaPerpPositionV2Factory internal positionFactory;
 
 	address internal admin = makeAddr('admin');
 	address internal manager = makeAddr('manager');
@@ -42,11 +50,12 @@ contract VerantaPerpTest is Test {
 		vm.stopPrank();
 
 		veranta = new MockVeranta(IERC20(address(usdc)));
-		positionFactory = new VerantaPerpPositionFactory(
+		positionFactory = new VerantaPerpPositionV2Factory(
 			IERC20(address(usdc)),
 			IVerantaTradingRouter(address(veranta)),
 			IVerantaMulticall(address(veranta)),
 			address(veranta), // the mock is also the USDC spender (TradingStorage stand-in)
+			IVerantaPairStorage(address(veranta)),
 			keeper
 		);
 		positionFactory.setPairAsset(ETH_PAIR, address(teth));
@@ -82,9 +91,9 @@ contract VerantaPerpTest is Test {
 
 	// ─── helpers ────────────────────────────────────────────────────────────────
 
-	function _createPosition() internal returns (VerantaPerpPosition position) {
+	function _createPosition() internal returns (VerantaPerpPositionV2 position) {
 		vm.prank(manager);
-		position = VerantaPerpPosition(comptroller.createExternalPosition(VERANTA_TYPE_ID, ''));
+		position = VerantaPerpPositionV2(comptroller.createExternalPosition(VERANTA_TYPE_ID, ''));
 	}
 
 	function _none() internal pure returns (address[] memory a, uint256[] memory b) {
@@ -92,14 +101,14 @@ contract VerantaPerpTest is Test {
 		b = new uint256[](0);
 	}
 
-	function _call(VerantaPerpPosition position, bytes memory actionData) internal {
+	function _call(VerantaPerpPositionV2 position, bytes memory actionData) internal {
 		(address[] memory noAssets, uint256[] memory noAmounts) = _none();
 		vm.prank(manager);
 		comptroller.callOnExternalPosition(address(position), noAssets, noAmounts, noAssets, actionData);
 	}
 
 	/// @dev Move 1,000 USDC vault → position and open: pair ETH, 2x, `buy`, ref price $2,500.
-	function _openStandardTrade(VerantaPerpPosition position, bool buy) internal {
+	function _openStandardTrade(VerantaPerpPositionV2 position, bool buy) internal {
 		address[] memory transferAssets = new address[](1);
 		transferAssets[0] = address(usdc);
 		uint256[] memory transferAmounts = new uint256[](1);
@@ -107,8 +116,8 @@ contract VerantaPerpTest is Test {
 		(address[] memory noAssets,) = _none();
 
 		bytes memory open = abi.encode(
-			uint8(VerantaPerpPosition.Action.OpenTrade),
-			abi.encode(ETH_PAIR, uint256(1_000e6), uint256(2e10), buy, uint256(2_500e10), uint256(1e10), uint8(0))
+			uint8(VerantaPerpPositionV2.Action.OpenTrade),
+			abi.encode(ETH_PAIR, uint256(1_000e6), uint256(2e10), buy, uint256(2_500e10), uint256(1e10), uint8(0), uint256(0), uint256(0))
 		);
 		vm.prank(manager);
 		comptroller.callOnExternalPosition(address(position), transferAssets, transferAmounts, noAssets, open);
@@ -117,7 +126,7 @@ contract VerantaPerpTest is Test {
 	// ─── open + pending state ───────────────────────────────────────────────────
 
 	function test_openTrade_pendingOrderValuedAtCollateral() public {
-		VerantaPerpPosition position = _createPosition();
+		VerantaPerpPositionV2 position = _createPosition();
 		assertEq(comptroller.calcGav(), 10_000e6);
 
 		_openStandardTrade(position, false);
@@ -129,16 +138,16 @@ contract VerantaPerpTest is Test {
 	}
 
 	function test_cancelPendingMarketOrder_refundsPosition() public {
-		VerantaPerpPosition position = _createPosition();
+		VerantaPerpPositionV2 position = _createPosition();
 		_openStandardTrade(position, false);
 
-		_call(position, abi.encode(uint8(VerantaPerpPosition.Action.CancelPendingMarketOrder), abi.encode(uint256(1))));
+		_call(position, abi.encode(uint8(VerantaPerpPositionV2.Action.CancelPendingMarketOrder), abi.encode(uint256(1))));
 		assertEq(usdc.balanceOf(address(position)), 1_000e6);
 		assertEq(comptroller.calcGav(), 10_000e6);
 	}
 
 	function test_openTrade_rejectsUnmappedPair() public {
-		VerantaPerpPosition position = _createPosition();
+		VerantaPerpPositionV2 position = _createPosition();
 		address[] memory transferAssets = new address[](1);
 		transferAssets[0] = address(usdc);
 		uint256[] memory transferAmounts = new uint256[](1);
@@ -146,11 +155,11 @@ contract VerantaPerpTest is Test {
 		(address[] memory noAssets,) = _none();
 
 		bytes memory open = abi.encode(
-			uint8(VerantaPerpPosition.Action.OpenTrade),
-			abi.encode(uint256(99), uint256(1_000e6), uint256(2e10), false, uint256(2_500e10), uint256(1e10), uint8(0))
+			uint8(VerantaPerpPositionV2.Action.OpenTrade),
+			abi.encode(uint256(99), uint256(1_000e6), uint256(2e10), false, uint256(2_500e10), uint256(1e10), uint8(0), uint256(0), uint256(0))
 		);
 		vm.prank(manager);
-		vm.expectRevert(abi.encodeWithSelector(VerantaPerpPosition.PairNotConfigured.selector, 99));
+		vm.expectRevert(abi.encodeWithSelector(VerantaPerpPositionV2.PairNotConfigured.selector, 99));
 		comptroller.callOnExternalPosition(address(position), transferAssets, transferAmounts, noAssets, open);
 	}
 
@@ -158,7 +167,7 @@ contract VerantaPerpTest is Test {
 		MockERC20 rogue = new MockERC20('Rogue', 'RGE', 18);
 		positionFactory.setPairAsset(7, address(rogue)); // mapped but not VI-priceable
 
-		VerantaPerpPosition position = _createPosition();
+		VerantaPerpPositionV2 position = _createPosition();
 		address[] memory transferAssets = new address[](1);
 		transferAssets[0] = address(usdc);
 		uint256[] memory transferAmounts = new uint256[](1);
@@ -166,18 +175,18 @@ contract VerantaPerpTest is Test {
 		(address[] memory noAssets,) = _none();
 
 		bytes memory open = abi.encode(
-			uint8(VerantaPerpPosition.Action.OpenTrade),
-			abi.encode(uint256(7), uint256(1_000e6), uint256(2e10), false, uint256(2_500e10), uint256(1e10), uint8(0))
+			uint8(VerantaPerpPositionV2.Action.OpenTrade),
+			abi.encode(uint256(7), uint256(1_000e6), uint256(2e10), false, uint256(2_500e10), uint256(1e10), uint8(0), uint256(0), uint256(0))
 		);
 		vm.prank(manager);
-		vm.expectRevert(abi.encodeWithSelector(VerantaPerpPosition.UnsupportedAsset.selector, address(rogue)));
+		vm.expectRevert(abi.encodeWithSelector(VerantaPerpPositionV2.UnsupportedAsset.selector, address(rogue)));
 		comptroller.callOnExternalPosition(address(position), transferAssets, transferAmounts, noAssets, open);
 	}
 
 	// ─── valuation: the linear decomposition ────────────────────────────────────
 
 	function test_shortHedge_gavFlatAtEntry_thenTracksPriceInverse() public {
-		VerantaPerpPosition position = _createPosition();
+		VerantaPerpPositionV2 position = _createPosition();
 		_openStandardTrade(position, false);
 		veranta.fillPending(2_500e10); // coinExposure = 1000×2 / 2500 = 0.8 ETH
 
@@ -195,7 +204,7 @@ contract VerantaPerpTest is Test {
 	}
 
 	function test_longTrade_gavTracksPrice() public {
-		VerantaPerpPosition position = _createPosition();
+		VerantaPerpPositionV2 position = _createPosition();
 		_openStandardTrade(position, true);
 		veranta.fillPending(2_500e10);
 
@@ -211,7 +220,7 @@ contract VerantaPerpTest is Test {
 	}
 
 	function test_accruedFeesReduceValue_fundingCreditIncreasesIt() public {
-		VerantaPerpPosition position = _createPosition();
+		VerantaPerpPositionV2 position = _createPosition();
 		_openStandardTrade(position, false);
 		veranta.fillPending(2_500e10);
 
@@ -226,7 +235,7 @@ contract VerantaPerpTest is Test {
 
 	function test_delta_neutral_pairIsFlatThroughPriceMoves() public {
 		// The flagship shape: vault holds 0.8 tETH spot, position shorts 0.8 tETH
-		VerantaPerpPosition position = _createPosition();
+		VerantaPerpPositionV2 position = _createPosition();
 		_openStandardTrade(position, false);
 		veranta.fillPending(2_500e10);
 		teth.mint(address(comptroller.vault()), 0.8e18);
@@ -245,7 +254,7 @@ contract VerantaPerpTest is Test {
 		// exceeds its 1000 collateral. Veranta would have liquidated it; calcGav's
 		// per-position zero floor models exactly that — the position contributes 0,
 		// never a negative, and the spot leg keeps its gains.
-		VerantaPerpPosition position = _createPosition();
+		VerantaPerpPositionV2 position = _createPosition();
 		_openStandardTrade(position, false);
 		veranta.fillPending(2_500e10);
 		teth.mint(address(comptroller.vault()), 0.8e18);
@@ -258,13 +267,13 @@ contract VerantaPerpTest is Test {
 	}
 
 	function test_closeTrade_refundsAndGavHolds() public {
-		VerantaPerpPosition position = _createPosition();
+		VerantaPerpPositionV2 position = _createPosition();
 		_openStandardTrade(position, false);
 		veranta.fillPending(2_500e10);
 
 		_call(
 			position,
-			abi.encode(uint8(VerantaPerpPosition.Action.CloseTrade), abi.encode(ETH_PAIR, uint256(0), uint256(1_000e6), uint256(2_500e10)))
+			abi.encode(uint8(VerantaPerpPositionV2.Action.CloseTrade), abi.encode(ETH_PAIR, uint256(0), uint256(1_000e6), uint256(2_500e10)))
 		);
 		assertEq(usdc.balanceOf(address(position)), 1_000e6);
 		assertEq(comptroller.calcGav(), 10_000e6);
@@ -273,34 +282,34 @@ contract VerantaPerpTest is Test {
 	// ─── autopilot delegation ───────────────────────────────────────────────────
 
 	function test_setAutopilot_delegatesPinnedKeeper() public {
-		VerantaPerpPosition position = _createPosition();
+		VerantaPerpPositionV2 position = _createPosition();
 		uint256 expiry = block.timestamp + 90 days;
 
-		_call(position, abi.encode(uint8(VerantaPerpPosition.Action.SetAutopilot), abi.encode(expiry)));
+		_call(position, abi.encode(uint8(VerantaPerpPositionV2.Action.SetAutopilot), abi.encode(expiry)));
 		(bool enabled, uint256 storedExpiry) = veranta.multipleDelegations(address(position), keeper);
 		assertTrue(enabled);
 		assertEq(storedExpiry, expiry);
 		assertEq(position.activeDelegate(), keeper);
 
-		_call(position, abi.encode(uint8(VerantaPerpPosition.Action.RemoveAutopilot), ''));
+		_call(position, abi.encode(uint8(VerantaPerpPositionV2.Action.RemoveAutopilot), ''));
 		(enabled,) = veranta.multipleDelegations(address(position), keeper);
 		assertFalse(enabled);
 		assertEq(position.activeDelegate(), address(0));
 	}
 
 	function test_removeAutopilot_revertsWhenInactive() public {
-		VerantaPerpPosition position = _createPosition();
+		VerantaPerpPositionV2 position = _createPosition();
 		(address[] memory noAssets, uint256[] memory noAmounts) = _none();
 		vm.prank(manager);
-		vm.expectRevert(VerantaPerpPosition.AutopilotNotActive.selector);
+		vm.expectRevert(VerantaPerpPositionV2.AutopilotNotActive.selector);
 		comptroller.callOnExternalPosition(
-			address(position), noAssets, noAmounts, noAssets, abi.encode(uint8(VerantaPerpPosition.Action.RemoveAutopilot), '')
+			address(position), noAssets, noAmounts, noAssets, abi.encode(uint8(VerantaPerpPositionV2.Action.RemoveAutopilot), '')
 		);
 	}
 
 	function test_autopilot_keeperRotationOnlyAffectsNewOptIns() public {
-		VerantaPerpPosition position = _createPosition();
-		_call(position, abi.encode(uint8(VerantaPerpPosition.Action.SetAutopilot), abi.encode(block.timestamp + 30 days)));
+		VerantaPerpPositionV2 position = _createPosition();
+		_call(position, abi.encode(uint8(VerantaPerpPositionV2.Action.SetAutopilot), abi.encode(block.timestamp + 30 days)));
 
 		address keeper2 = makeAddr('keeper2');
 		positionFactory.setAutopilotKeeper(keeper2);
@@ -309,7 +318,7 @@ contract VerantaPerpTest is Test {
 		(bool oldEnabled,) = veranta.multipleDelegations(address(position), keeper);
 		assertTrue(oldEnabled);
 
-		_call(position, abi.encode(uint8(VerantaPerpPosition.Action.SetAutopilot), abi.encode(block.timestamp + 30 days)));
+		_call(position, abi.encode(uint8(VerantaPerpPositionV2.Action.SetAutopilot), abi.encode(block.timestamp + 30 days)));
 		(bool newEnabled,) = veranta.multipleDelegations(address(position), keeper2);
 		assertTrue(newEnabled);
 		assertEq(position.activeDelegate(), keeper2);
@@ -319,7 +328,7 @@ contract VerantaPerpTest is Test {
 		// The KEEPER PATH end to end on the mock (the path the live keeper drives):
 		// manager opts in → keeper EOA opens a short via delegatedAction → collateral
 		// pulled from the POSITION, order pending with the position as trader.
-		VerantaPerpPosition position = _createPosition();
+		VerantaPerpPositionV2 position = _createPosition();
 		address[] memory transferAssets = new address[](1);
 		transferAssets[0] = address(usdc);
 		uint256[] memory transferAmounts = new uint256[](1);
@@ -328,7 +337,7 @@ contract VerantaPerpTest is Test {
 		vm.prank(manager);
 		comptroller.callOnExternalPosition(
 			address(position), transferAssets, transferAmounts, noAssets,
-			abi.encode(uint8(VerantaPerpPosition.Action.SetAutopilot), abi.encode(block.timestamp + 90 days))
+			abi.encode(uint8(VerantaPerpPositionV2.Action.SetAutopilot), abi.encode(block.timestamp + 90 days))
 		);
 
 		bytes memory openCall = abi.encodeCall(
@@ -366,7 +375,7 @@ contract VerantaPerpTest is Test {
 		// the POSITION's idle USDC via delegatedAction — collateral (initialPosToken) rises
 		// by amount minus the ~3bps venue fee, the dummy positionSizeUSDC is untouched, and
 		// GAV loses only the fee. The keeper never touches the money itself.
-		VerantaPerpPosition position = _createPosition();
+		VerantaPerpPositionV2 position = _createPosition();
 		_openStandardTrade(position, false);
 		veranta.fillPending(2_500e10);
 
@@ -379,7 +388,7 @@ contract VerantaPerpTest is Test {
 		vm.prank(manager);
 		comptroller.callOnExternalPosition(
 			address(position), transferAssets, transferAmounts, noAssets,
-			abi.encode(uint8(VerantaPerpPosition.Action.SetAutopilot), abi.encode(block.timestamp + 90 days))
+			abi.encode(uint8(VerantaPerpPositionV2.Action.SetAutopilot), abi.encode(block.timestamp + 90 days))
 		);
 
 		uint256 gavBefore = comptroller.calcGav();
@@ -400,27 +409,27 @@ contract VerantaPerpTest is Test {
 	// ─── custody ────────────────────────────────────────────────────────────────
 
 	function test_returnToVault_onlyDestinationIsVault() public {
-		VerantaPerpPosition position = _createPosition();
+		VerantaPerpPositionV2 position = _createPosition();
 		_openStandardTrade(position, false);
-		_call(position, abi.encode(uint8(VerantaPerpPosition.Action.CancelPendingMarketOrder), abi.encode(uint256(1))));
+		_call(position, abi.encode(uint8(VerantaPerpPositionV2.Action.CancelPendingMarketOrder), abi.encode(uint256(1))));
 
 		uint256 vaultBefore = usdc.balanceOf(address(comptroller.vault()));
-		_call(position, abi.encode(uint8(VerantaPerpPosition.Action.ReturnToVault), abi.encode(uint256(1_000e6))));
+		_call(position, abi.encode(uint8(VerantaPerpPositionV2.Action.ReturnToVault), abi.encode(uint256(1_000e6))));
 		assertEq(usdc.balanceOf(address(comptroller.vault())), vaultBefore + 1_000e6);
 		assertEq(usdc.balanceOf(address(position)), 0);
 	}
 
 	function test_receiveCallFromFund_onlyComptroller() public {
-		VerantaPerpPosition position = _createPosition();
+		VerantaPerpPositionV2 position = _createPosition();
 		vm.prank(manager);
-		vm.expectRevert(VerantaPerpPosition.OnlyComptroller.selector);
-		position.receiveCallFromFund(abi.encode(uint8(VerantaPerpPosition.Action.ReturnToVault), abi.encode(uint256(1))));
+		vm.expectRevert(VerantaPerpPositionV2.OnlyComptroller.selector);
+		position.receiveCallFromFund(abi.encode(uint8(VerantaPerpPositionV2.Action.ReturnToVault), abi.encode(uint256(1))));
 	}
 
 	/// M-8 (security review 2026-09-22): zeroing a pair's asset mapping with a live
 	/// trade must DEGRADE valuation (USDC leg only), never brick fund-wide GAV.
 	function test_m8_zeroedPairAsset_degradesValuationInsteadOfBricking() public {
-		VerantaPerpPosition position = _createPosition();
+		VerantaPerpPositionV2 position = _createPosition();
 		_openStandardTrade(position, false);
 
 		positionFactory.setPairAsset(ETH_PAIR, address(0)); // owner disables new opens
@@ -434,18 +443,100 @@ contract VerantaPerpTest is Test {
 		amounts; // silence unused warning when the mock reports only the USDC leg
 	}
 
+	// ─── TP/SL at open ──────────────────────────────────────────────────────────
+
+	function test_openTrade_carriesTpSlToVeranta_andKeepsThemThroughTheFill() public {
+		VerantaPerpPositionV2 position = _createPosition();
+		address[] memory transferAssets = new address[](1);
+		transferAssets[0] = address(usdc);
+		uint256[] memory transferAmounts = new uint256[](1);
+		transferAmounts[0] = 1_000e6;
+		(address[] memory noAssets,) = _none();
+
+		// short at $2,500: take profit $2,200, stop $2,700
+		bytes memory open = abi.encode(
+			uint8(VerantaPerpPositionV2.Action.OpenTrade),
+			abi.encode(ETH_PAIR, uint256(1_000e6), uint256(2e10), false, uint256(2_500e10), uint256(1e10), uint8(0), uint256(2_200e10), uint256(2_700e10))
+		);
+		vm.expectEmit(address(position));
+		emit VerantaPerpPositionV2.TpSlRequested(ETH_PAIR, 2_200e10, 2_700e10);
+		vm.prank(manager);
+		comptroller.callOnExternalPosition(address(position), transferAssets, transferAmounts, noAssets, open);
+
+		IVerantaMulticall.PendingOrder[] memory pending = veranta.getPendingOrder(address(position));
+		assertEq(pending.length, 1);
+		assertEq(pending[0].orderInfo.trade.tp, 2_200e10);
+		assertEq(pending[0].orderInfo.trade.sl, 2_700e10);
+
+		veranta.fillPending(2_500e10);
+		IVerantaTradingRouter.Trade memory t = veranta.openTrades(address(position), ETH_PAIR, 0);
+		assertEq(t.tp, 2_200e10);
+		assertEq(t.sl, 2_700e10);
+	}
+
+	/// The pre-TP/SL 7-field encoding must fail loudly, never open a trade without the
+	/// levels the manager set.
+	function test_openTrade_legacyEncodingWithoutTpSlReverts() public {
+		VerantaPerpPositionV2 position = _createPosition();
+		address[] memory transferAssets = new address[](1);
+		transferAssets[0] = address(usdc);
+		uint256[] memory transferAmounts = new uint256[](1);
+		transferAmounts[0] = 1_000e6; // funded, so only the args decode can revert
+		(address[] memory noAssets,) = _none();
+		bytes memory legacy = abi.encode(
+			uint8(VerantaPerpPositionV2.Action.OpenTrade),
+			abi.encode(ETH_PAIR, uint256(1_000e6), uint256(2e10), false, uint256(2_500e10), uint256(1e10), uint8(0))
+		);
+		vm.prank(manager);
+		vm.expectRevert();
+		comptroller.callOnExternalPosition(address(position), transferAssets, transferAmounts, noAssets, legacy);
+		assertEq(veranta.getPendingOrder(address(position)).length, 0);
+	}
+
+	// ─── referral link ──────────────────────────────────────────────────────────
+
+	function test_linkReferral_linksTheProtocolCodeAsThePosition() public {
+		VerantaPerpPositionV2 position = _createPosition();
+		positionFactory.setReferral(IVerantaReferral(address(veranta)), bytes32('frostyfi'));
+
+		_call(position, abi.encode(uint8(VerantaPerpPositionV2.Action.LinkReferral), ''));
+		assertEq(veranta.traderReferralCodes(address(position)), bytes32('frostyfi'), 'the position is the referred trader');
+		assertEq(veranta.traderReferralCodes(address(comptroller)), bytes32(0));
+	}
+
+	function test_linkReferral_revertsUntilConfigured() public {
+		VerantaPerpPositionV2 position = _createPosition();
+		(address[] memory noAssets, uint256[] memory noAmounts) = _none();
+		bytes memory link = abi.encode(uint8(VerantaPerpPositionV2.Action.LinkReferral), '');
+
+		vm.prank(manager);
+		vm.expectRevert(VerantaPerpPositionV2.ReferralNotConfigured.selector);
+		comptroller.callOnExternalPosition(address(position), noAssets, noAmounts, noAssets, link);
+
+		positionFactory.setReferral(IVerantaReferral(address(veranta)), bytes32(0)); // contract but no code
+		vm.prank(manager);
+		vm.expectRevert(VerantaPerpPositionV2.ReferralNotConfigured.selector);
+		comptroller.callOnExternalPosition(address(position), noAssets, noAmounts, noAssets, link);
+	}
+
+	function test_setReferral_onlyOwner() public {
+		vm.prank(manager);
+		vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, manager));
+		positionFactory.setReferral(IVerantaReferral(address(veranta)), bytes32('managercode'));
+	}
+
 	function test_unknownAction_reverts() public {
-		VerantaPerpPosition position = _createPosition();
+		VerantaPerpPositionV2 position = _createPosition();
 		(address[] memory noAssets, uint256[] memory noAmounts) = _none();
 		vm.prank(manager);
-		vm.expectRevert(VerantaPerpPosition.UnknownAction.selector);
+		vm.expectRevert(VerantaPerpPositionV2.UnknownAction.selector);
 		comptroller.callOnExternalPosition(
 			address(position), noAssets, noAmounts, noAssets, abi.encode(uint8(42), '')
 		);
 	}
 
 	function test_restingLimitOrder_valuedAtEscrow() public {
-		VerantaPerpPosition position = _createPosition();
+		VerantaPerpPositionV2 position = _createPosition();
 		// Fund the position, then simulate a resting limit order escrowing 600 USDC
 		address[] memory transferAssets = new address[](1);
 		transferAssets[0] = address(usdc);
@@ -455,7 +546,7 @@ contract VerantaPerpTest is Test {
 		vm.prank(manager);
 		comptroller.callOnExternalPosition(
 			address(position), transferAssets, transferAmounts, noAssets,
-			abi.encode(uint8(VerantaPerpPosition.Action.ReturnToVault), abi.encode(uint256(0)))
+			abi.encode(uint8(VerantaPerpPositionV2.Action.ReturnToVault), abi.encode(uint256(0)))
 		);
 		vm.prank(address(position));
 		usdc.approve(address(veranta), 600e6);
@@ -464,8 +555,75 @@ contract VerantaPerpTest is Test {
 		assertEq(usdc.balanceOf(address(position)), 0);
 		assertEq(comptroller.calcGav(), 10_000e6);
 
-		_call(position, abi.encode(uint8(VerantaPerpPosition.Action.CancelLimitOrder), abi.encode(ETH_PAIR, uint256(0))));
+		_call(position, abi.encode(uint8(VerantaPerpPositionV2.Action.CancelLimitOrder), abi.encode(ETH_PAIR, uint256(0))));
 		assertEq(usdc.balanceOf(address(position)), 600e6);
 		assertEq(comptroller.calcGav(), 10_000e6);
+	}
+
+	// ─── V2-only: the bounded read ──────────────────────────────────────────────
+
+	/// A hedge the autopilot keeper opens THROUGH VERANTA'S DELEGATION never passes through
+	/// this contract — valuation must still see it (a "pairs we traded" set would miss it).
+	function test_v2_keeperOpenedTradeOnUntouchedPair_isValued() public {
+		uint256 otherPair = 3;
+		positionFactory.setPairAsset(otherPair, address(teth));
+		VerantaPerpPositionV2 position = _createPosition();
+		address[] memory transferAssets = new address[](1);
+		transferAssets[0] = address(usdc);
+		uint256[] memory transferAmounts = new uint256[](1);
+		transferAmounts[0] = 1_000e6;
+		(address[] memory noAssets,) = _none();
+		vm.prank(manager);
+		comptroller.callOnExternalPosition(
+			address(position), transferAssets, transferAmounts, noAssets,
+			abi.encode(uint8(VerantaPerpPositionV2.Action.SetAutopilot), abi.encode(block.timestamp + 90 days))
+		);
+		bytes memory openCall = abi.encodeCall(
+			IVerantaTradingRouter.openTrade,
+			(
+				IVerantaTradingRouter.Trade({
+					trader: address(position), pairIndex: otherPair, index: 0, initialPosToken: 0,
+					positionSizeUSDC: 1_000e6, openPrice: 2_500e10, buy: false, leverage: 2e10,
+					tp: 0, sl: 0, timestamp: 0
+				}),
+				0,
+				1e10
+			)
+		);
+		vm.prank(keeper);
+		veranta.delegatedAction(address(position), openCall);
+		veranta.fillPending(2_500e10);
+
+		assertEq(comptroller.calcGav(), 10_000e6, 'keeper hedge valued at entry');
+		tethFeed.setAnswer(3_000e8); // short 0.8 ETH loses 400
+		assertEq(comptroller.calcGav(), 9_600e6, 'keeper hedge tracks price');
+	}
+
+	/// Several trades on one pair sit in distinct slots — every one is valued.
+	function test_v2_twoTradesOnOnePair_bothValued() public {
+		VerantaPerpPositionV2 position = _createPosition();
+		_openStandardTrade(position, false);
+		veranta.fillPending(2_500e10); // slot 0
+		_openStandardTrade(position, false);
+		veranta.fillPending(2_500e10); // slot 1
+
+		assertEq(comptroller.calcGav(), 10_000e6);
+		tethFeed.setAnswer(3_000e8); // 2 × 0.8 ETH short → −800
+		assertEq(comptroller.calcGav(), 9_200e6);
+	}
+
+	/// The regression guard for the mainnet gas blowup: with 135 listed pairs and one
+	/// trade, valuation reads ONE trade slot (V1's getPositions reads 135 × 40 of each).
+	function test_v2_readsOnlyOccupiedSlots() public {
+		veranta.setPairsCount(135);
+		VerantaPerpPositionV2 position = _createPosition();
+		_openStandardTrade(position, false);
+		veranta.fillPending(2_500e10);
+
+		vm.expectCall(address(veranta), abi.encodeWithSelector(veranta.openTrades.selector), 1);
+		vm.expectCall(address(veranta), abi.encodeWithSelector(veranta.getOpenLimitOrder.selector), 0);
+		vm.expectCall(address(veranta), abi.encodeWithSelector(veranta.openTradesCount.selector), 135);
+		vm.expectCall(address(veranta), abi.encodeWithSelector(veranta.getPositions.selector), 0);
+		position.getManagedAssets();
 	}
 }

@@ -7,8 +7,13 @@ import {FundFactory} from '../src/core/FundFactory.sol';
 import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
 import {Comptroller} from '../src/core/Comptroller.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
-import {VerantaPerpPosition, VerantaPerpPositionFactory} from '../src/positions/VerantaPerpPosition.sol';
-import {IVerantaTradingRouter, IVerantaMulticall} from '../src/interfaces/external/IVeranta.sol';
+import {VerantaPerpPositionV2, VerantaPerpPositionV2Factory} from '../src/positions/VerantaPerpPositionV2.sol';
+import {
+	IVerantaTradingRouter,
+	IVerantaMulticall,
+	IVerantaPairStorage,
+	IVerantaReferral
+} from '../src/interfaces/external/IVeranta.sol';
 
 /// @notice E2E against the REAL Veranta v2 contracts on a Base mainnet fork — the test HL
 ///         never allowed. Their operator does not run on our fork, so market opens stay
@@ -26,10 +31,14 @@ contract VerantaPerpForkTest is Test {
 	address internal constant VERANTA_ROUTER = 0x44914408af82bC9983bbb330e3578E1105e11d4e;
 	address internal constant VERANTA_STORAGE = 0x8a311D7048c35985aa31C131B9A13e03a5f7422d;
 	address internal constant VERANTA_MULTICALL = 0xA7cFc43872F4D7B0E6141ee8c36f1F7FEe5d099e;
+	address internal constant VERANTA_PAIR_STORAGE = 0x5db3772136e5557EFE028Db05EE95C84D76faEC4; // multicall.pairsStorage()
+	address internal constant VERANTA_REFERRAL = 0x1A110bBA13A1f16cCa4b79758BD39290f29De82D; // tx-builder /v2/meta
+	bytes32 internal constant FROSTYFI_CODE = 'frostyfi'; // registered 2026-09-22
 	uint256 internal constant ETH_PAIR = 0; // Crypto.ETH/USD per the live pair catalog
 
 	Comptroller internal comptroller;
-	VerantaPerpPosition internal position;
+	VerantaPerpPositionV2 internal position;
+	VerantaPerpPositionV2Factory internal positionFactory;
 	IVerantaMulticall internal multicall = IVerantaMulticall(VERANTA_MULTICALL);
 
 	address internal admin = makeAddr('admin');
@@ -55,11 +64,12 @@ contract VerantaPerpForkTest is Test {
 		interpreter.addPrimitive(WETH, CHAINLINK_ETH_USD, 1 days);
 		vm.stopPrank();
 
-		VerantaPerpPositionFactory positionFactory = new VerantaPerpPositionFactory(
+		positionFactory = new VerantaPerpPositionV2Factory(
 			IERC20(USDC),
 			IVerantaTradingRouter(VERANTA_ROUTER),
 			IVerantaMulticall(VERANTA_MULTICALL),
 			VERANTA_STORAGE,
+			IVerantaPairStorage(VERANTA_PAIR_STORAGE),
 			keeper
 		);
 		positionFactory.setPairAsset(ETH_PAIR, WETH);
@@ -93,7 +103,7 @@ contract VerantaPerpForkTest is Test {
 		comptroller.executeDepositRequest(alice);
 
 		vm.prank(manager);
-		position = VerantaPerpPosition(comptroller.createExternalPosition(6, ''));
+		position = VerantaPerpPositionV2(comptroller.createExternalPosition(6, ''));
 	}
 
 	function test_fork_openShort_pendingAcceptedFromContractTrader() public {
@@ -111,8 +121,8 @@ contract VerantaPerpForkTest is Test {
 		uint256 refPrice1e10 = uint256(ethPrice) * 1e2; // 8dp feed → 1e10 scale
 
 		bytes memory open = abi.encode(
-			uint8(VerantaPerpPosition.Action.OpenTrade),
-			abi.encode(ETH_PAIR, uint256(200e6), uint256(2e10), false, refPrice1e10, uint256(5e10), uint8(0))
+			uint8(VerantaPerpPositionV2.Action.OpenTrade),
+			abi.encode(ETH_PAIR, uint256(200e6), uint256(2e10), false, refPrice1e10, uint256(5e10), uint8(0), uint256(0), uint256(0))
 		);
 		vm.prank(manager);
 		comptroller.callOnExternalPosition(address(position), transferAssets, transferAmounts, noAssets, open);
@@ -127,20 +137,77 @@ contract VerantaPerpForkTest is Test {
 		// Valuation carries the escrow — GAV whole through the pending window
 		assertEq(comptroller.calcGav(), 10_000e6);
 
-		// Operator never fills on a fork → cancel refunds the escrow to the position
+		// A trader cannot cancel a pending market order on today's Veranta: the router's
+		// cancelPendingMarketOrder is onlyOperator (verified source; OnlyOperator() =
+		// 0x27e1f1e5). The operator fills or refunds; the escrow stays valued meanwhile.
 		bytes memory cancel = abi.encode(
-			uint8(VerantaPerpPosition.Action.CancelPendingMarketOrder), abi.encode(pending[0].orderId)
+			uint8(VerantaPerpPositionV2.Action.CancelPendingMarketOrder), abi.encode(pending[0].orderId)
 		);
 		vm.prank(manager);
+		vm.expectRevert(bytes4(0x27e1f1e5));
 		comptroller.callOnExternalPosition(address(position), noAssets, new uint256[](0), noAssets, cancel);
-		assertEq(IERC20(USDC).balanceOf(address(position)), 200e6);
 		assertEq(comptroller.calcGav(), 10_000e6);
+	}
+
+	/// TP/SL at open on the REAL router: the levels ride the pending order to the operator.
+	function test_fork_openShortWithTpSl_levelsStoredOnPendingOrder() public {
+		vm.skip(!forked);
+		(, int256 ethPrice,,,) = AggregatorV3Like(CHAINLINK_ETH_USD).latestRoundData();
+		uint256 ref = uint256(ethPrice) * 1e2;
+		uint256 tp = (ref * 90) / 100; // short: profit below
+		uint256 sl = (ref * 110) / 100; // short: stop above
+
+		_openShort(ref, tp, sl);
+		IVerantaMulticall.PendingOrder[] memory pending = multicall.getPendingOrder(address(position));
+		assertEq(pending.length, 1);
+		assertEq(pending[0].orderInfo.trade.tp, tp);
+		assertEq(pending[0].orderInfo.trade.sl, sl);
+		assertEq(comptroller.calcGav(), 10_000e6);
+	}
+
+	/// A stop on the wrong side (short, stop BELOW the price) is refused at placement by the
+	/// live router — WrongSl() = 0x62dd5ee3 — so a bad level never escrows collateral.
+	function test_fork_openShortWithWrongSideSl_revertsWrongSl() public {
+		vm.skip(!forked);
+		(, int256 ethPrice,,,) = AggregatorV3Like(CHAINLINK_ETH_USD).latestRoundData();
+		uint256 ref = uint256(ethPrice) * 1e2;
+		vm.expectRevert(bytes4(0x62dd5ee3));
+		this.openShortExternal(ref, 0, (ref * 90) / 100);
+	}
+
+	function openShortExternal(uint256 ref, uint256 tp, uint256 sl) external {
+		_openShort(ref, tp, sl);
+	}
+
+	function _openShort(uint256 ref, uint256 tp, uint256 sl) internal {
+		address[] memory transferAssets = new address[](1);
+		transferAssets[0] = USDC;
+		uint256[] memory transferAmounts = new uint256[](1);
+		transferAmounts[0] = 200e6;
+		bytes memory open = abi.encode(
+			uint8(VerantaPerpPositionV2.Action.OpenTrade),
+			abi.encode(ETH_PAIR, uint256(200e6), uint256(2e10), false, ref, uint256(5e10), uint8(0), tp, sl)
+		);
+		vm.prank(manager);
+		comptroller.callOnExternalPosition(address(position), transferAssets, transferAmounts, new address[](0), open);
+	}
+
+	/// Referral linking is caller-scoped — proves the live Referral accepts a CONTRACT
+	/// trader linking our registered code.
+	function test_fork_linkReferral_acceptedForContractTrader() public {
+		vm.skip(!forked);
+		positionFactory.setReferral(IVerantaReferral(VERANTA_REFERRAL), FROSTYFI_CODE);
+		bytes memory link = abi.encode(uint8(VerantaPerpPositionV2.Action.LinkReferral), '');
+		vm.prank(manager);
+		comptroller.callOnExternalPosition(address(position), new address[](0), new uint256[](0), new address[](0), link);
+
+		assertEq(IVerantaReferral(VERANTA_REFERRAL).traderReferralCodes(address(position)), FROSTYFI_CODE);
 	}
 
 	function test_fork_setDelegate_acceptedForContractTrader() public {
 		vm.skip(!forked);
 		bytes memory setAp = abi.encode(
-			uint8(VerantaPerpPosition.Action.SetAutopilot), abi.encode(block.timestamp + 90 days)
+			uint8(VerantaPerpPositionV2.Action.SetAutopilot), abi.encode(block.timestamp + 90 days)
 		);
 		vm.prank(manager);
 		comptroller.callOnExternalPosition(address(position), new address[](0), new uint256[](0), new address[](0), setAp);

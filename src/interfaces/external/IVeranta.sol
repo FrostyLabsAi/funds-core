@@ -135,3 +135,36 @@ interface IVerantaMulticall {
 		view
 		returns (uint256 liquidationPrice, uint256 rolloverFee, int256 unrealisedFundingFee);
 }
+
+/// @notice Veranta TradingStorage per-trader reads (verified source: Sourcify exact match,
+///         Multicall impl 0x8b44d59d2db7b2e191b1388b78465756cab91159 → ITradingStorage).
+///         The cheap path: two count reads per pair, slot reads only where non-zero —
+///         instead of Multicall.getPositions, which scans every pair × maxTradesPerPair
+///         slot (≈1.6–1.9M gas per pair, ≈215M for 135 pairs on Base 2026-09-23).
+interface IVerantaTradingStorage {
+	function openTradesCount(address trader, uint256 pairIndex) external view returns (uint256);
+	function openLimitOrdersCount(address trader, uint256 pairIndex) external view returns (uint256);
+	function maxTradesPerPair() external view returns (uint256);
+	function openTrades(address trader, uint256 pairIndex, uint256 index)
+		external
+		view
+		returns (IVerantaTradingRouter.Trade memory);
+	/// @dev Same field layout as ITradingStorage.OpenLimitOrder (`block` ↔ blockNumber).
+	function getOpenLimitOrder(address trader, uint256 pairIndex, uint256 index)
+		external
+		view
+		returns (IVerantaMulticall.AggregatedLimitOrder memory);
+}
+
+/// @notice Veranta PairStorage (Multicall.pairsStorage()) — the live pair count.
+interface IVerantaPairStorage {
+	function pairsCount() external view returns (uint256);
+}
+
+/// @notice Veranta Referral (Base 0x1A110bBA13A1f16cCa4b79758BD39290f29De82D; selectors read
+///         from impl 0xe0c63b398d3aae03f0b9e0512384fb14a967053f 2026-09-23). Linking is
+///         caller-scoped: the trader itself must call — a delegate cannot.
+interface IVerantaReferral {
+	function setTraderReferralCodeByUser(bytes32 code) external;
+	function traderReferralCodes(address trader) external view returns (bytes32);
+}

@@ -7,12 +7,12 @@ import {FundFactory} from '../../src/core/FundFactory.sol';
 import {ComptrollerDeployer, SharesVaultDeployer} from '../../src/core/FundComponentDeployers.sol';
 import {Comptroller} from '../../src/core/Comptroller.sol';
 import {ValueInterpreter} from '../../src/core/ValueInterpreter.sol';
-import {VerantaPerpPositionFactory} from '../../src/positions/VerantaPerpPosition.sol';
-import {IVerantaTradingRouter, IVerantaMulticall} from '../../src/interfaces/external/IVeranta.sol';
+import {VerantaPerpPositionV2Factory} from '../../src/positions/VerantaPerpPositionV2.sol';
+import {IVerantaTradingRouter, IVerantaMulticall, IVerantaPairStorage} from '../../src/interfaces/external/IVeranta.sol';
 
 /// @notice Anvil-fork ONLY: full-stack deploy for the Veranta keeper e2e — VI on real
 ///         Chainlink feeds, position factory vs the real Veranta contracts, one fund,
-///         one VerantaPerpPosition. Broadcaster = fund manager.
+///         one VerantaPerpPositionV2. Broadcaster = fund manager.
 contract DeployVerantaE2E is Script {
 	address internal constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
 	address internal constant WETH = 0x4200000000000000000000000000000000000006;
@@ -21,6 +21,7 @@ contract DeployVerantaE2E is Script {
 	address internal constant VERANTA_ROUTER = 0x44914408af82bC9983bbb330e3578E1105e11d4e;
 	address internal constant VERANTA_STORAGE = 0x8a311D7048c35985aa31C131B9A13e03a5f7422d;
 	address internal constant VERANTA_MULTICALL = 0xA7cFc43872F4D7B0E6141ee8c36f1F7FEe5d099e;
+	address internal constant VERANTA_PAIR_STORAGE = 0x5db3772136e5557EFE028Db05EE95C84D76faEC4; // multicall.pairsStorage()
 
 	function run() external {
 		address keeper = vm.envAddress('E2E_KEEPER');
@@ -30,11 +31,12 @@ contract DeployVerantaE2E is Script {
 		interpreter.addPrimitive(USDC, CHAINLINK_USDC_USD, 2 days);
 		interpreter.addPrimitive(WETH, CHAINLINK_ETH_USD, 1 days);
 
-		VerantaPerpPositionFactory positionFactory = new VerantaPerpPositionFactory(
+		VerantaPerpPositionV2Factory positionFactory = new VerantaPerpPositionV2Factory(
 			IERC20(USDC),
 			IVerantaTradingRouter(VERANTA_ROUTER),
 			IVerantaMulticall(VERANTA_MULTICALL),
 			VERANTA_STORAGE,
+			IVerantaPairStorage(VERANTA_PAIR_STORAGE),
 			keeper
 		);
 		positionFactory.setPairAsset(0, WETH); // Crypto.ETH/USD

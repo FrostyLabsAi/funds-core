@@ -17,12 +17,12 @@ import {IValueInterpreter} from '../src/interfaces/IValueInterpreter.sol';
 import {FrostyCompounder} from '../src/yield/FrostyCompounder.sol';
 import {LimitOrderPositionFactory} from '../src/positions/LimitOrderPosition.sol';
 import {UniswapV3LPPositionFactory} from '../src/positions/UniswapV3LPPosition.sol';
-import {VerantaPerpPositionFactory} from '../src/positions/VerantaPerpPosition.sol';
+import {VerantaPerpPositionV2Factory} from '../src/positions/VerantaPerpPositionV2.sol';
 import {AdvisorRegistry} from '../src/protect/AdvisorRegistry.sol';
 import {IUniswapV3SwapRouter} from '../src/interfaces/external/IUniswapV3SwapRouter.sol';
 import {IUniswapV3NonfungiblePositionManager} from
 	'../src/interfaces/external/IUniswapV3NonfungiblePositionManager.sol';
-import {IVerantaTradingRouter, IVerantaMulticall} from '../src/interfaces/external/IVeranta.sol';
+import {IVerantaTradingRouter, IVerantaMulticall, IVerantaPairStorage} from '../src/interfaces/external/IVeranta.sol';
 import {AggregatorV3Interface} from '../src/interfaces/AggregatorV3Interface.sol';
 import {MockERC20, MockAggregator} from '../test/utils/Mocks.sol';
 import {MockVeranta} from '../test/utils/MockVeranta.sol';
@@ -157,8 +157,14 @@ contract DeployWave7 is Script {
 		// filled by the operator bot. Pair 0 = tETH (VI-priced, so GAV can value it).
 		MockVeranta venue = new MockVeranta(IERC20(TUSDC));
 		verantaVenue = address(venue);
-		VerantaPerpPositionFactory vFactory = new VerantaPerpPositionFactory(
-			IERC20(TUSDC), IVerantaTradingRouter(verantaVenue), IVerantaMulticall(verantaVenue), verantaVenue, keeper
+		// V2 position (bounded valuation read); the mock also plays PairStorage
+		VerantaPerpPositionV2Factory vFactory = new VerantaPerpPositionV2Factory(
+			IERC20(TUSDC),
+			IVerantaTradingRouter(verantaVenue),
+			IVerantaMulticall(verantaVenue),
+			verantaVenue,
+			IVerantaPairStorage(verantaVenue),
+			keeper
 		);
 		vFactory.setPairAsset(0, TETH);
 		verantaFactory = address(vFactory);
