@@ -86,6 +86,24 @@ contract ValueInterpreter is IValueInterpreter, Ownable2Step {
 
 	event AnswerBoundsSet(address indexed asset, int256 min, int256 max);
 
+	/// @notice Chainlink L2 Sequencer Uptime Feed (Base: 0xBCF8…6433). Chainlink's docs
+	///         require L2 consumers to check it: while the sequencer is down, feeds cannot
+	///         update and only L1-forced transactions land, so every price is suspect —
+	///         and right after it comes back, prices are still catching up. Unset (zero)
+	///         on chains without one (Sepolia testnets). answer 0 = up, 1 = down;
+	///         startedAt = when the status last changed.
+	AggregatorV3Interface public sequencerUptimeFeed;
+	/// @notice How long after the sequencer comes back up pricing stays refused.
+	uint32 public sequencerGracePeriod;
+	/// @dev Bytecode cap on the grace period (config is attack surface).
+	uint32 public constant MAX_SEQUENCER_GRACE_PERIOD = 1 days;
+
+	event SequencerUptimeFeedSet(address feed, uint32 gracePeriod);
+
+	error SequencerDown();
+	error SequencerGracePeriodNotOver(uint256 upSince);
+	error BadGracePeriod(uint32 gracePeriod);
+
 	constructor(address initialOwner) Ownable(initialOwner) {}
 
 	/// @notice Record the sanity band for an asset's feed — use the aggregator's own
@@ -94,6 +112,16 @@ contract ValueInterpreter is IValueInterpreter, Ownable2Step {
 		if (min != 0 && max != 0 && min >= max) revert BadBounds();
 		answerBounds[asset] = AnswerBounds({min: min, max: max});
 		emit AnswerBoundsSet(asset, min, max);
+	}
+
+	/// @notice Set (or clear, with the zero address) the L2 sequencer uptime check.
+	function setSequencerUptimeFeed(address feed, uint32 gracePeriod) external onlyOwner {
+		if (feed != address(0) && (gracePeriod == 0 || gracePeriod > MAX_SEQUENCER_GRACE_PERIOD)) {
+			revert BadGracePeriod(gracePeriod);
+		}
+		sequencerUptimeFeed = AggregatorV3Interface(feed);
+		sequencerGracePeriod = feed == address(0) ? 0 : gracePeriod;
+		emit SequencerUptimeFeedSet(feed, sequencerGracePeriod);
 	}
 
 	// ─── Admin ───────────────────────────────────────────────────────────────────
@@ -174,6 +202,7 @@ contract ValueInterpreter is IValueInterpreter, Ownable2Step {
 		returns (uint256 value)
 	{
 		if (baseAsset == quoteAsset) return amount;
+		_checkSequencer();
 
 		AssetInfo memory quote = assetInfo[quoteAsset];
 		if (address(quote.aggregator) == address(0)) revert QuoteAssetMustBePrimitive(quoteAsset);
@@ -216,6 +245,7 @@ contract ValueInterpreter is IValueInterpreter, Ownable2Step {
 	/// @inheritdoc IValueInterpreter
 	function calcUsdRate(address asset) external view returns (uint256 rate) {
 		if (isZeroPricedAsset[asset]) return 0;
+		_checkSequencer();
 
 		AssetInfo memory info = assetInfo[asset];
 		if (address(info.aggregator) != address(0)) return _validatedRate(asset, info);
@@ -232,6 +262,17 @@ contract ValueInterpreter is IValueInterpreter, Ownable2Step {
 	{
 		AssetInfo memory info = assetInfo[asset];
 		return (address(info.aggregator), info.heartbeat, info.assetDecimals, info.rateDecimals);
+	}
+
+	/// @dev Chainlink's L2 pattern (docs.chain.link/data-feeds/l2-sequencer-feeds): refuse
+	///      to price while the sequencer is down, and for `sequencerGracePeriod` after it
+	///      comes back. Anything but 0 counts as down (fail closed).
+	function _checkSequencer() private view {
+		AggregatorV3Interface feed = sequencerUptimeFeed;
+		if (address(feed) == address(0)) return;
+		(, int256 answer, uint256 startedAt,,) = feed.latestRoundData();
+		if (answer != 0) revert SequencerDown();
+		if (block.timestamp - startedAt <= sequencerGracePeriod) revert SequencerGracePeriodNotOver(startedAt);
 	}
 
 	/// @dev Returns the asset's USD rate scaled to 1e18, reverting on unregistered feeds,

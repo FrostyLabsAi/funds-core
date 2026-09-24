@@ -212,3 +212,21 @@ justifies a paid feed.
    the 5% spot-vs-TWAP guard. The caps apply to EVERY fund holding a TWAP-priced asset
    (attached by the factory, not opt-in) — they protect co-investors from a mark the pool
    could never pay out in cash.
+5. **"Liquidity" = ±10% depth (decided 2026-09-24):** the USD value of what the window's
+   HARMONIC-MEAN in-range liquidity holds between −10% and +10% of the TWAP price, both
+   tokens counted, converted through the quote's Chainlink price. Not full-range-equivalent
+   liquidity (reads 14–30× the real deposits on concentrated pools: a $50k floor would cost
+   ~$600 to push 5%; at ±10% depth it costs ~$12k). The per-fund caps use the same figure
+   (`TwapAggregatorAdapter.poolDepthUsd()`).
+
+# Build notes — 2026-09-24
+
+- `TwapAggregatorAdapter` + `TwapListingRegistry` built (tests: unit + Base-fork, incl. a real
+  50M-USDC swap pushing spot +8% → refused, mean moved 0 ticks; AERO listed via two real pools
+  agreeing within 0.24%).
+- The registry does NOT write the ValueInterpreter: listing is owner-only at launch, so the VI
+  owner adds the primitive (one Safe batch). The VI lister role ships with permissionless
+  listing as a new VI version — the deployed VI stays untouched.
+- **Operational:** some deep pools keep no price history (Slipstream AERO/USDC ts200:
+  observation cardinality 1). Listing them first needs `increaseObservationCardinalityNext`
+  (permissionless, gas only) plus 30 minutes.

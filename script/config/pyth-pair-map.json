@@ -4,7 +4,7 @@
  "_notes": [
   "pythId = Pyth Core bytes32 feed id (getPriceUnsafe). chainlinkBackup = Chainlink aggregator on Base where Veranta lists one.",
   "POLICY: Chainlink primary where a feed exists (incl. the 13 B20 equities + XAU/XAG from the Chainlink RDD, not repeated here); Pyth fills the rest.",
-  "16 pairs carry a ZERO pythId (WTI/BRENT contract-month feeds + long-tail equities) \u2014 Pyth LAZER-only on Veranta. Perps never need VI feeds; spot wrappers of these need generic Pyth Core ids looked up separately if ever listed.",
+  "16 pairs carry a ZERO pythId (WTI/BRENT contract-month feeds + long-tail equities) \u2014 Pyth LAZER-only on Veranta. Perps DO need a VI price for their pairAsset (VerantaPerpPosition refuses to open without one and values legs through the VI), so these 16 pairs are untradeable for funds until priced. Free Pyth API plan (verified 2026-09-24): Hermes serves only 19 of these ids — the rest answer 403 Not entitled.",
   "Regenerate before mainnet registration \u2014 ids can rotate on venue redeploys."
  ],
  "pairs": [

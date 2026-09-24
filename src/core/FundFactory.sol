@@ -98,6 +98,11 @@ contract FundFactory is Ownable2Step {
 	///      impersonation by name collision. Names are reserved forever, even past shutdown.
 	mapping(bytes32 nameHash => bool) public isFundNameTaken;
 
+	/// @dev Protocol-level policies EVERY new fund carries on top of its own ruleset (e.g. the
+	///      TwapExposurePolicy — the TWAP price tier's caps are not a manager's choice). Changing
+	///      the list affects new funds and reconfigurations only; existing rulesets are set-once.
+	PolicyReg[] internal mandatoryPolicies;
+
 	event FundCreated(
 		address indexed fundOwner,
 		address indexed comptroller,
@@ -118,6 +123,7 @@ contract FundFactory is Ownable2Step {
 	event PositionTypeDeregistered(uint256 indexed typeId);
 	event FundDepositsPausedByGuardian(address indexed comptroller);
 	event FundDepositsUnpausedByOwner(address indexed comptroller);
+	event MandatoryPolicySet(uint256 indexed index, IPolicy.PolicyHook hook, address indexed policy);
 
 	error ZeroAddress();
 	error PerfFeeAboveMax();
@@ -294,12 +300,45 @@ contract FundFactory is Ownable2Step {
 				IPolicy.PolicyHook.PostCallOnIntegration, unrestrictedMandate
 			);
 		}
+		_attachMandatoryPolicies(Comptroller(comptrollerAddress));
 	}
 
 	function createFund(FundConfig calldata config) external returns (address comptrollerAddress) {
 		comptrollerAddress = _createFund(config);
 		// No ruleset supplied → the fund still carries its declaration on-chain
 		Comptroller(comptrollerAddress).addPolicy(IPolicy.PolicyHook.PostCallOnIntegration, unrestrictedMandate);
+		_attachMandatoryPolicies(Comptroller(comptrollerAddress));
+	}
+
+	/// @notice Replace the protocol's mandatory-policy list (new funds + reconfigurations).
+	function setMandatoryPolicies(PolicyReg[] calldata policies) external onlyOwner {
+		delete mandatoryPolicies;
+		for (uint256 i; i < policies.length; ++i) {
+			if (policies[i].policy == address(0)) revert ZeroAddress();
+			mandatoryPolicies.push(policies[i]);
+			emit MandatoryPolicySet(i, policies[i].hook, policies[i].policy);
+		}
+	}
+
+	function getMandatoryPolicies() external view returns (PolicyReg[] memory) {
+		return mandatoryPolicies;
+	}
+
+	/// @dev Attach every mandatory policy the fund does not already carry on that hook (a
+	///      manager may have included one in their own ruleset; no double runs).
+	function _attachMandatoryPolicies(Comptroller comptroller) private {
+		for (uint256 i; i < mandatoryPolicies.length; ++i) {
+			PolicyReg memory reg = mandatoryPolicies[i];
+			address[] memory existing = comptroller.getPolicies(reg.hook);
+			bool present;
+			for (uint256 j; j < existing.length; ++j) {
+				if (existing[j] == reg.policy) {
+					present = true;
+					break;
+				}
+			}
+			if (!present) comptroller.addPolicy(reg.hook, reg.policy);
+		}
 	}
 
 	function _createFund(FundConfig calldata config) private returns (address comptrollerAddress) {
@@ -427,13 +466,15 @@ contract FundFactory is Ownable2Step {
 		Comptroller(request.newComptroller).initializeForMigration(shares, vault, old);
 
 		// The ruleset is SET-ONCE for the FUND, not the comptroller: reconfiguration
-		// changes terms, never the mandate — every policy carries over verbatim.
+		// changes terms, never the mandate — every policy carries over verbatim, and any
+		// protocol-mandatory policy the fund predates is added (a tightening only).
 		for (uint8 h; h <= uint8(IPolicy.PolicyHook.RemoveExternalPosition); ++h) {
 			address[] memory hookPolicies = old.getPolicies(IPolicy.PolicyHook(h));
 			for (uint256 i; i < hookPolicies.length; ++i) {
 				Comptroller(request.newComptroller).addPolicy(IPolicy.PolicyHook(h), hookPolicies[i]);
 			}
 		}
+		_attachMandatoryPolicies(Comptroller(request.newComptroller));
 
 		// The old Comptroller is dead for deposits forever (escrow cancellation still works).
 		old.setGuardianDepositsPaused(true);
