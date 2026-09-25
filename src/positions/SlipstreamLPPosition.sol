@@ -148,6 +148,13 @@ contract SlipstreamLPPosition is IExternalPosition {
 	}
 
 	/// @inheritdoc IExternalPosition
+	/// @dev Never: removing liquidity pays out at the pool's live price (sandwichable), so every
+	///      LP action stays priced by the Comptroller's loss measurement.
+	function isRiskReducing(bytes calldata) external pure returns (bool) {
+		return false;
+	}
+
+	/// @inheritdoc IExternalPosition
 	function receiveCallFromFund(bytes calldata actionData) external onlyComptroller {
 		(uint8 rawAction, bytes memory args) = abi.decode(actionData, (uint8, bytes));
 

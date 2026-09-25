@@ -19,4 +19,11 @@ interface IExternalPosition {
 	/// @notice Entry point for position actions. MUST only be callable via the owning fund's
 	///         Comptroller so every interaction passes policy hooks.
 	function receiveCallFromFund(bytes calldata actionData) external;
+
+	/// @notice True only for an action that can move value solely back toward the fund (e.g.
+	///         closing a perp, cancelling an order, returning cash to the vault). The Comptroller
+	///         runs such an action — when nothing leaves the vault with it — WITHOUT pricing
+	///         the position, so a down or stale oracle never stops a manager from cutting risk
+	///         (security review 2026-09-24, H-1). Answer false for anything else.
+	function isRiskReducing(bytes calldata actionData) external view returns (bool);
 }

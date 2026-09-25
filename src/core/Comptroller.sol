@@ -735,9 +735,15 @@ contract Comptroller is ReentrancyGuard {
 		if (!externalPositions.contains(position)) revert NotActiveExternalPosition(position);
 		if (assetsToTransfer.length != amountsToTransfer.length) revert ArrayLengthMismatch();
 
-		// value going in (position + transfers) vs value coming out (position + vault receipts)
-		uint256 beforeValue =
-			_calcExternalPositionValue(IExternalPosition(position)) + _assetsValue(assetsToTransfer, amountsToTransfer);
+		// A RISK-REDUCING action (the position type vouches it can only move value back toward
+		// the fund — e.g. closing a perp) with nothing leaving the vault is not priced: a
+		// down or stale oracle must never stop a manager from cutting risk (security review
+		// 2026-09-24, H-1). Everything else: value going in (position + transfers) vs value
+		// coming out (position + vault receipts).
+		bool unpriced = assetsToTransfer.length == 0 && IExternalPosition(position).isRiskReducing(actionData);
+		uint256 beforeValue = unpriced
+			? 0
+			: _calcExternalPositionValue(IExternalPosition(position)) + _assetsValue(assetsToTransfer, amountsToTransfer);
 		uint256[] memory receiveBalancesBefore = _vaultBalances(assetsToReceive);
 
 		for (uint256 i; i < assetsToTransfer.length; ++i) {
@@ -746,8 +752,8 @@ contract Comptroller is ReentrancyGuard {
 
 		IExternalPosition(position).receiveCallFromFund(actionData);
 
-		uint256 afterValue = _calcExternalPositionValue(IExternalPosition(position))
-			+ _receivedValue(assetsToReceive, receiveBalancesBefore);
+		uint256 afterValue = (unpriced ? 0 : _calcExternalPositionValue(IExternalPosition(position)))
+			+ _receivedValue(assetsToReceive, receiveBalancesBefore, !unpriced);
 		uint256 lossValue = beforeValue > afterValue ? beforeValue - afterValue : 0;
 
 		_runPolicies(IPolicy.PolicyHook.PostCallOnExternalPosition, abi.encode(position, lossValue));
@@ -772,9 +778,13 @@ contract Comptroller is ReentrancyGuard {
 
 	/// @dev Values what the vault actually received (balance deltas) and auto-tracks it;
 	///      duplicate entries are skipped — counting one delta twice would hide losses.
-	function _receivedValue(address[] calldata assets, uint256[] memory balancesBefore) private returns (uint256 value) {
+	function _receivedValue(address[] calldata assets, uint256[] memory balancesBefore, bool priced)
+		private
+		returns (uint256 value)
+	{
 		for (uint256 i; i < assets.length; ++i) {
 			_trackAsset(assets[i]);
+			if (!priced) continue;
 			bool duplicate;
 			for (uint256 j; j < i; ++j) {
 				if (assets[j] == assets[i]) {

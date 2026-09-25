@@ -15,7 +15,10 @@ import {UniswapV3SwapAdapter} from '../src/adapters/UniswapV3SwapAdapter.sol';
 import {TwapListingRegistry, IUniswapV3PoolFactory, ISlipstreamPoolFactory} from '../src/pricing/TwapListingRegistry.sol';
 import {TwapAggregatorAdapter} from '../src/pricing/TwapAggregatorAdapter.sol';
 import {TwapExposurePolicy} from '../src/policies/TwapExposurePolicy.sol';
-import {MockERC20, MockAggregator, MockSwapRouter} from './utils/Mocks.sol';
+import {MockERC20, MockAggregator, MockSwapRouter, MockUniV3PositionManager} from './utils/Mocks.sol';
+import {LimitOrderPosition, LimitOrderPositionFactory} from '../src/positions/LimitOrderPosition.sol';
+import {UniswapV3LPPositionFactory} from '../src/positions/UniswapV3LPPosition.sol';
+import {IUniswapV3NonfungiblePositionManager} from '../src/interfaces/external/IUniswapV3NonfungiblePositionManager.sol';
 import {ScriptedPool} from './TwapAggregatorAdapter.t.sol';
 import {ScriptedFactory} from './TwapListingRegistry.t.sol';
 
@@ -77,9 +80,11 @@ contract TwapExposurePolicyTest is Test {
 	// ─── helpers ────────────────────────────────────────────────────────────────
 
 	function _fund(bool degen) internal returns (Comptroller c) {
-		FundFactory.PolicyReg[] memory regs = new FundFactory.PolicyReg[](2);
+		FundFactory.PolicyReg[] memory regs = new FundFactory.PolicyReg[](4);
 		regs[0] = FundFactory.PolicyReg({hook: IPolicy.PolicyHook.PostCallOnIntegration, policy: address(policy)});
 		regs[1] = FundFactory.PolicyReg({hook: IPolicy.PolicyHook.PostDepositRequest, policy: address(policy)});
+		regs[2] = FundFactory.PolicyReg({hook: IPolicy.PolicyHook.CreateExternalPosition, policy: address(policy)});
+		regs[3] = FundFactory.PolicyReg({hook: IPolicy.PolicyHook.PostCallOnExternalPosition, policy: address(policy)});
 		c = Comptroller(
 			factory.createFund(
 				FundFactory.FundConfig({
@@ -261,9 +266,11 @@ contract TwapExposurePolicyTest is Test {
 	// ─── mandatory: a fund with NO ruleset of its own is still capped ───────────
 
 	function test_mandatoryViaTheFactory_bareFundIsCapped() public {
-		FundFactory.PolicyReg[] memory regs = new FundFactory.PolicyReg[](2);
+		FundFactory.PolicyReg[] memory regs = new FundFactory.PolicyReg[](4);
 		regs[0] = FundFactory.PolicyReg({hook: IPolicy.PolicyHook.PostCallOnIntegration, policy: address(policy)});
 		regs[1] = FundFactory.PolicyReg({hook: IPolicy.PolicyHook.PostDepositRequest, policy: address(policy)});
+		regs[2] = FundFactory.PolicyReg({hook: IPolicy.PolicyHook.CreateExternalPosition, policy: address(policy)});
+		regs[3] = FundFactory.PolicyReg({hook: IPolicy.PolicyHook.PostCallOnExternalPosition, policy: address(policy)});
 		factory.setMandatoryPolicies(regs);
 
 		Comptroller bare = Comptroller(
@@ -291,8 +298,100 @@ contract TwapExposurePolicyTest is Test {
 
 	function test_hooks() public view {
 		IPolicy.PolicyHook[] memory hooks = policy.implementedHooks();
-		assertEq(hooks.length, 2);
+		assertEq(hooks.length, 4);
 		assertEq(uint8(hooks[0]), uint8(IPolicy.PolicyHook.PostCallOnIntegration));
 		assertEq(uint8(hooks[1]), uint8(IPolicy.PolicyHook.PostDepositRequest));
+		assertEq(uint8(hooks[2]), uint8(IPolicy.PolicyHook.CreateExternalPosition));
+		assertEq(uint8(hooks[3]), uint8(IPolicy.PolicyHook.PostCallOnExternalPosition));
+	}
+
+	// ─── external positions (security review 2026-09-24, M-2) ──────────────────
+
+	uint256 internal constant LIMIT_ORDER_TYPE = 2;
+	uint256 internal constant LP_TYPE = 3;
+
+	function _registerPositionTypes() internal {
+		factory.registerPositionType(LIMIT_ORDER_TYPE, address(new LimitOrderPositionFactory()));
+		factory.registerPositionType(
+			LP_TYPE,
+			address(new UniswapV3LPPositionFactory(IUniswapV3NonfungiblePositionManager(address(new MockUniV3PositionManager()))))
+		);
+	}
+
+	function _limitOrderPosition(Comptroller c) internal returns (LimitOrderPosition position) {
+		vm.prank(manager);
+		position = LimitOrderPosition(c.createExternalPosition(LIMIT_ORDER_TYPE, ''));
+	}
+
+	function _place(Comptroller c, LimitOrderPosition position, address sell, address buy, uint256 sellAmt, uint256 minBuy, address moveIn)
+		internal
+	{
+		address[] memory transferAssets = new address[](1);
+		transferAssets[0] = moveIn;
+		uint256[] memory transferAmounts = new uint256[](1);
+		transferAmounts[0] = sellAmt;
+		address[] memory none = new address[](0);
+		bytes memory place = abi.encode(
+			uint8(LimitOrderPosition.Action.PlaceOrder),
+			abi.encode(sell, buy, uint128(sellAmt), uint128(minBuy), uint64(block.timestamp + 1 days))
+		);
+		vm.prank(manager);
+		c.callOnExternalPosition(address(position), transferAssets, transferAmounts, none, place);
+	}
+
+	function test_m2_lpOnATwapToken_refusedForNonDegen_allowedForDegen() public {
+		_registerPositionTypes();
+		Comptroller c = _fund(false);
+		vm.prank(manager);
+		vm.expectRevert(abi.encodeWithSelector(TwapExposurePolicy.TwapAssetInExternalPosition.selector, address(meme)));
+		c.createExternalPosition(LP_TYPE, abi.encode(address(meme), address(usdc), uint24(3000)));
+
+		Comptroller degen = _fund(true);
+		vm.prank(manager);
+		degen.createExternalPosition(LP_TYPE, abi.encode(address(meme), address(usdc), uint24(3000)));
+	}
+
+	function test_m2_limitOrderBuyingATwapToken_refused() public {
+		_registerPositionTypes();
+		Comptroller c = _fund(false);
+		LimitOrderPosition position = _limitOrderPosition(c);
+		_keepQuoteFresh();
+		// sell 5,000 USDC for ≥ 2 MEME ($2,500 each — oracle parity)
+		address[] memory transferAssets = new address[](1);
+		transferAssets[0] = address(usdc);
+		uint256[] memory transferAmounts = new uint256[](1);
+		transferAmounts[0] = 5_000e6;
+		address[] memory none = new address[](0);
+		bytes memory place = abi.encode(
+			uint8(LimitOrderPosition.Action.PlaceOrder),
+			abi.encode(address(usdc), address(meme), uint128(5_000e6), uint128(2e18), uint64(block.timestamp + 1 days))
+		);
+		vm.prank(manager);
+		vm.expectRevert(abi.encodeWithSelector(TwapExposurePolicy.TwapAssetInExternalPosition.selector, address(meme)));
+		c.callOnExternalPosition(address(position), transferAssets, transferAmounts, none, place);
+	}
+
+	function test_m2_limitOrderSellingATwapToken_isAnExit_allowed() public {
+		_registerPositionTypes();
+		Comptroller c = _fund(false);
+		_buyMeme(c, 10_000e6); // 4 MEME
+		LimitOrderPosition position = _limitOrderPosition(c);
+		_keepQuoteFresh();
+		_place(c, position, address(meme), address(usdc), 4e18, 10_000e6, address(meme));
+		assertEq(meme.balanceOf(address(position)), 4e18);
+	}
+
+	function test_m2_tokensParkedInAPosition_stillCountTowardTheGavCap() public {
+		_registerPositionTypes();
+		Comptroller c = _fund(false);
+		_buyMeme(c, 15_000e6); // 15% of GAV
+		// park all of it as limit-order SELL inventory: the vault no longer shows it
+		LimitOrderPosition position = _limitOrderPosition(c);
+		_keepQuoteFresh();
+		_place(c, position, address(meme), address(usdc), _memeHeld(c), 15_000e6, address(meme));
+		assertEq(_memeHeld(c), 0);
+		// another 10% would put the fund at ~25% TWAP exposure — refused
+		_keepQuoteFresh();
+		_buyMemeExpectingRevert(c, 10_000e6, abi.encodePacked(TwapExposurePolicy.TwapShareOfGavExceeded.selector));
 	}
 }

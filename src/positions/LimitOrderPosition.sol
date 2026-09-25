@@ -100,6 +100,14 @@ contract LimitOrderPosition is IExternalPosition {
 	// ─── Manager actions (via Comptroller.callOnExternalPosition) ───────────────
 
 	/// @inheritdoc IExternalPosition
+	/// @dev Cancelling keeps the inventory in this position; returning sends it only to the
+	///      fund's vault. Placing an order sets a price — it is always priced.
+	function isRiskReducing(bytes calldata actionData) external pure returns (bool) {
+		(uint8 rawAction,) = abi.decode(actionData, (uint8, bytes));
+		return rawAction == uint8(Action.CancelOrder) || rawAction == uint8(Action.ReturnToVault);
+	}
+
+	/// @inheritdoc IExternalPosition
 	function receiveCallFromFund(bytes calldata actionData) external onlyComptroller {
 		(uint8 rawAction, bytes memory args) = abi.decode(actionData, (uint8, bytes));
 

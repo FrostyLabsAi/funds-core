@@ -484,6 +484,10 @@ contract MockExternalPosition is IExternalPosition {
 		amounts = new uint256[](0);
 	}
 
+	function isRiskReducing(bytes calldata) external pure returns (bool) {
+		return false;
+	}
+
 	function receiveCallFromFund(bytes calldata actionData) external {
 		if (msg.sender != comptroller) revert OnlyComptroller();
 		lastAction = actionData;

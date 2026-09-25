@@ -45,6 +45,20 @@ contract ScriptedPool {
 	function slot0() external view returns (uint160, int24, uint16, uint16, uint16, bool) {
 		return (TickMath.getSqrtRatioAtTick(spotTick), spotTick, 0, 1, 1, true);
 	}
+
+	// Flat liquidity profile (no initialized ticks): the band minimum equals the current
+	// in-range liquidity, which is scripted equal to the window's harmonic mean.
+	function tickSpacing() external pure returns (int24) {
+		return 60;
+	}
+
+	function liquidity() external view returns (uint128) {
+		return meanLiquidity;
+	}
+
+	function tickBitmap(int16) external pure returns (uint256) {
+		return 0;
+	}
 }
 
 contract TwapAggregatorAdapterTest is Test {
@@ -260,5 +274,17 @@ contract ScriptedPoolPulled {
 
 	function slot0() external view returns (uint160, int24, uint16, uint16, uint16, bool) {
 		return (TickMath.getSqrtRatioAtTick(tick), tick, 0, 1, 1, true);
+	}
+	// Liquidity is back to L now (flat profile) — only the window's harmonic mean remembers the pull
+	function tickSpacing() external pure returns (int24) {
+		return 60;
+	}
+
+	function liquidity() external view returns (uint128) {
+		return l;
+	}
+
+	function tickBitmap(int16) external pure returns (uint256) {
+		return 0;
 	}
 }

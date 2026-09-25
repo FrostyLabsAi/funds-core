@@ -17,6 +17,9 @@ interface IConcentratedPoolOracle {
 		external
 		view
 		returns (int56[] memory tickCumulatives, uint160[] memory secondsPerLiquidityCumulativeX128s);
+	function tickSpacing() external view returns (int24);
+	function liquidity() external view returns (uint128);
+	function tickBitmap(int16 wordPosition) external view returns (uint256);
 }
 
 /// @title TwapAggregatorAdapter
@@ -39,10 +42,14 @@ interface IConcentratedPoolOracle {
 ///      price stays the market price and `isBelowFloor()` reports it — the registry starts a
 ///      72-hour clock, the manager is warned, and after 72h the exposure policy pauses NEW
 ///      deposits until the fund exits. Safe to keep pricing because the exposure caps bound
-///      how much of NAV a thin pool can move. Depth is measured on the window's HARMONIC-MEAN
-///      in-range liquidity (a liquidity pull drags it down) as the USD held within ±10% of the
-///      TWAP price — not full-range-equivalent liquidity, which reads 14–30× the real deposits
-///      on concentrated pools (Base 2026-09-24).
+///      how much of NAV a thin pool can move. Depth is the USD held within ±10% of the TWAP
+///      price, the LOWER of (a) the window's HARMONIC-MEAN in-range liquidity spread over the
+///      band (a liquidity pull drags it down) and (b) what the pool's CURRENT liquidity actually
+///      holds inside the band, summed segment by segment across initialized ticks. (a) alone
+///      let a tight range around spot read as band-wide depth — $4k read as +$33k on a Base
+///      fork (security review 2026-09-24, M-1); (b) alone is instantaneous. Faking depth now
+///      takes holding liquidity for the window AND real liquidity across the band at the
+///      moment of the check (residual: supplied within that same transaction).
 ///      Answers carry 18 decimals (the VI reads `decimals()`), so sub-cent tokens keep
 ///      precision; `updatedAt` is the read's own timestamp — the price IS computed now.
 contract TwapAggregatorAdapter is AggregatorV3Interface {
@@ -152,14 +159,123 @@ contract TwapAggregatorAdapter is AggregatorV3Interface {
 	///         liquidity figure exposure caps are measured against. Reverts only if the
 	///         pool cannot serve the window or the quote feed is unusable.
 	function poolDepthUsd() external view returns (uint256) {
-		(int24 meanTick, uint128 meanLiquidity) = _consult();
-		return _depthUsd18(meanTick, meanLiquidity, _quoteUsd18());
+		return _depthUsd();
 	}
 
-	/// @notice True while the window's ±10% harmonic-mean depth is under `minLiquidityUsd`.
+	/// @notice True while the ±10% depth is under `minLiquidityUsd`.
 	function isBelowFloor() external view returns (bool) {
+		return _depthUsd() < minLiquidityUsd * 1e18;
+	}
+
+	/// @notice The USD the pool's CURRENT liquidity actually holds inside ±10% of spot
+	///         (segment by segment across initialized ticks — no uniform-liquidity assumption).
+	function spotBandDepthUsd() external view returns (uint256) {
+		(int24 meanTick,) = _consult();
+		return _spotBandDepthUsd18(meanTick, _quoteUsd18());
+	}
+
+	/// @dev min(window-weighted depth, actual current band depth) — see the contract notes (M-1)
+	function _depthUsd() internal view returns (uint256) {
 		(int24 meanTick, uint128 meanLiquidity) = _consult();
-		return _depthUsd18(meanTick, meanLiquidity, _quoteUsd18()) < minLiquidityUsd * 1e18;
+		uint256 quoteUsd18 = _quoteUsd18();
+		uint256 weighted = _depthUsd18(meanTick, meanLiquidity, quoteUsd18);
+		uint256 actual = _spotBandDepthUsd18(meanTick, quoteUsd18);
+		return actual < weighted ? actual : weighted;
+	}
+
+	struct BandWalk {
+		uint160 sqrtPrice;
+		int24 spacing;
+		int256 active;
+		int24 prev;
+		uint256 amount0;
+		uint256 amount1;
+	}
+
+	/// @dev Walks the initialized ticks inside [spot − 10%, spot + 10%] (Uniswap v3 and
+	///      Slipstream share tickBitmap / ticks().liquidityNet / tickSpacing) outward from the
+	///      current price, summing each segment's token amounts at its own active liquidity.
+	function _spotBandDepthUsd18(int24 meanTick, uint256 quoteUsd18) internal view returns (uint256) {
+		(bool ok, bytes memory data) = address(pool).staticcall(abi.encodeWithSignature('slot0()'));
+		if (!ok || data.length < 64) revert ObservationWindowUnavailable();
+		(uint160 sqrtPrice, int24 spotTick) = abi.decode(data, (uint160, int24));
+		BandWalk memory w = BandWalk(sqrtPrice, pool.tickSpacing(), int256(uint256(pool.liquidity())), spotTick, 0, 0);
+		int256 current = w.active;
+
+		int24 upper = spotTick + BAND_UP_TICKS > TickMath.MAX_TICK ? TickMath.MAX_TICK : spotTick + BAND_UP_TICKS;
+		_walkUp(w, spotTick, upper);
+		w.active = current;
+		w.prev = spotTick;
+		int24 lower = spotTick - BAND_DOWN_TICKS < TickMath.MIN_TICK ? TickMath.MIN_TICK : spotTick - BAND_DOWN_TICKS;
+		_walkDown(w, spotTick, lower);
+
+		(uint256 assetAmount, uint256 quoteAmount) = assetIsToken0 ? (w.amount0, w.amount1) : (w.amount1, w.amount0);
+		if (assetAmount > type(uint128).max) assetAmount = type(uint128).max; // conservative clamp
+		uint256 quoteTotal = quoteAmount + _convertAtTick(meanTick, uint128(assetAmount), assetIsToken0);
+		return Math.mulDiv(quoteTotal, quoteUsd18, 10 ** quoteDecimals);
+	}
+
+	/// @dev Upward from spot: segment [prev, t) at the active liquidity, then cross t (+net).
+	function _walkUp(BandWalk memory w, int24 spotTick, int24 upper) internal view {
+		int24 last = _compress(upper - 1, w.spacing);
+		for (int24 c = _compress(spotTick, w.spacing) + 1; c <= last;) {
+			int24 wordStart = (c >> 8) << 8;
+			uint256 word = pool.tickBitmap(int16(c >> 8)) & (type(uint256).max << uint8(uint24(c - wordStart)));
+			if (last - wordStart < 255) word &= type(uint256).max >> (255 - uint8(uint24(last - wordStart)));
+			while (word != 0) {
+				int24 t = (wordStart + int24(uint24(Math.log2(word & (~word + 1))))) * w.spacing;
+				_addSegment(w, w.prev, t);
+				w.active += _liquidityNet(t);
+				w.prev = t;
+				word &= word - 1;
+			}
+			c = wordStart + 256;
+		}
+		_addSegment(w, w.prev, upper);
+	}
+
+	/// @dev Downward from spot: segment [t, prev) at the active liquidity, then cross t (−net).
+	function _walkDown(BandWalk memory w, int24 spotTick, int24 lower) internal view {
+		int24 first = _compress(lower, w.spacing) + 1;
+		for (int24 c = _compress(spotTick, w.spacing); c >= first;) {
+			int24 wordStart = (c >> 8) << 8;
+			uint256 word = pool.tickBitmap(int16(c >> 8)) & (type(uint256).max >> (255 - uint8(uint24(c - wordStart))));
+			if (first > wordStart) word &= type(uint256).max << uint8(uint24(first - wordStart));
+			while (word != 0) {
+				uint256 bit = Math.log2(word);
+				int24 t = (wordStart + int24(uint24(bit))) * w.spacing;
+				_addSegment(w, t, w.prev);
+				w.active -= _liquidityNet(t);
+				w.prev = t;
+				word &= ~(uint256(1) << bit);
+			}
+			c = wordStart - 1;
+		}
+		_addSegment(w, lower, w.prev);
+	}
+
+	/// @dev Add the token amounts the active liquidity holds on [lo, hi] at the current price.
+	function _addSegment(BandWalk memory w, int24 lo, int24 hi) internal pure {
+		if (w.active <= 0 || lo >= hi) return;
+		uint128 l = w.active > int256(uint256(type(uint128).max)) ? type(uint128).max : uint128(uint256(w.active));
+		(uint256 a0, uint256 a1) =
+			LiquidityAmounts.getAmountsForLiquidity(w.sqrtPrice, TickMath.getSqrtRatioAtTick(lo), TickMath.getSqrtRatioAtTick(hi), l);
+		w.amount0 += a0;
+		w.amount1 += a1;
+	}
+
+	/// @dev ticks(t) starts (liquidityGross, liquidityNet) on both Uniswap v3 and Slipstream
+	function _liquidityNet(int24 tick) internal view returns (int256) {
+		(bool ok, bytes memory data) = address(pool).staticcall(abi.encodeWithSignature('ticks(int24)', tick));
+		if (!ok || data.length < 64) revert ObservationWindowUnavailable();
+		(, int128 net) = abi.decode(data, (uint128, int128));
+		return int256(net);
+	}
+
+	/// @dev tick / spacing rounded toward −∞ (TickBitmap's compression)
+	function _compress(int24 tick, int24 spacing) internal pure returns (int24 compressed) {
+		compressed = tick / spacing;
+		if (tick < 0 && tick % spacing != 0) compressed--;
 	}
 
 	/// @notice Arithmetic-mean tick and harmonic-mean liquidity over `window`

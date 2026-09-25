@@ -105,6 +105,7 @@ contract VerantaPerpPositionV2 is IExternalPosition {
 	error UnsupportedAsset(address asset);
 	error AutopilotNotActive();
 	error ReferralNotConfigured();
+	error ValuationIncomplete(uint256 pairIndex);
 
 	modifier onlyComptroller() {
 		if (msg.sender != comptroller) revert OnlyComptroller();
@@ -134,6 +135,17 @@ contract VerantaPerpPositionV2 is IExternalPosition {
 	}
 
 	// ─── Manager actions (via Comptroller.callOnExternalPosition) ───────────────
+
+	/// @inheritdoc IExternalPosition
+	/// @dev Closing, cancelling (collateral refunds land HERE — Veranta pays only the trader),
+	///      removing the keeper delegate, and returning cash (only ever to the fund's vault) can
+	///      move value solely back toward the fund.
+	function isRiskReducing(bytes calldata actionData) external pure returns (bool) {
+		(uint8 rawAction,) = abi.decode(actionData, (uint8, bytes));
+		return rawAction == uint8(Action.CloseTrade) || rawAction == uint8(Action.CancelLimitOrder)
+			|| rawAction == uint8(Action.CancelPendingMarketOrder) || rawAction == uint8(Action.RemoveAutopilot)
+			|| rawAction == uint8(Action.ReturnToVault);
+	}
 
 	/// @inheritdoc IExternalPosition
 	function receiveCallFromFund(bytes calldata actionData) external onlyComptroller {
@@ -280,8 +292,8 @@ contract VerantaPerpPositionV2 is IExternalPosition {
 		if (tradesLeft == 0 && ordersLeft == 0) return (0, 0, false);
 		held = true;
 
-		// Slot reads are try-wrapped exactly like Veranta's own Multicall ("skip row that
-		// reverts on read") — one odd slot must never revert fund-wide GAV
+		// Slot reads are try-wrapped like Veranta's own Multicall ("skip row that reverts on
+		// read") so an odd EMPTY slot is skipped — but every COUNTED row must be read (below)
 		for (uint256 slot; slot < maxSlots && (tradesLeft > 0 || ordersLeft > 0); ++slot) {
 			if (tradesLeft > 0) {
 				try tradingStorage.openTrades(address(this), pairIndex, slot) returns (IVerantaTradingRouter.Trade memory t) {
@@ -305,6 +317,9 @@ contract VerantaPerpPositionV2 is IExternalPosition {
 				} catch {}
 			}
 		}
+		// Every counted trade and order must have been valued: one that could not be read is
+		// refused, never silently dropped from GAV (security review 2026-09-24, M-3)
+		if (tradesLeft > 0 || ordersLeft > 0) revert ValuationIncomplete(pairIndex);
 	}
 
 	/// @dev One stored trade → its USDC-leg contribution and its signed coin units.

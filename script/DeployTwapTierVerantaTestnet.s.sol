@@ -59,9 +59,11 @@ contract DeployTwapTierVerantaTestnet is Script {
 		vi.addPrimitive(AERO, address(aero), 1 hours); // the VI owner's step
 
 		TwapExposurePolicy policy = new TwapExposurePolicy(registry);
-		FundFactory.PolicyReg[] memory mandatory = new FundFactory.PolicyReg[](2);
+		FundFactory.PolicyReg[] memory mandatory = new FundFactory.PolicyReg[](4);
 		mandatory[0] = FundFactory.PolicyReg({hook: IPolicy.PolicyHook.PostCallOnIntegration, policy: address(policy)});
 		mandatory[1] = FundFactory.PolicyReg({hook: IPolicy.PolicyHook.PostDepositRequest, policy: address(policy)});
+		mandatory[2] = FundFactory.PolicyReg({hook: IPolicy.PolicyHook.CreateExternalPosition, policy: address(policy)});
+		mandatory[3] = FundFactory.PolicyReg({hook: IPolicy.PolicyHook.PostCallOnExternalPosition, policy: address(policy)});
 		factory.setMandatoryPolicies(mandatory);
 
 		Comptroller fund = Comptroller(
