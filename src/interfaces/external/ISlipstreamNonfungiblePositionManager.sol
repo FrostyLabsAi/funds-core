@@ -82,4 +82,16 @@ interface ISlipstreamNonfungiblePositionManager {
 		);
 
 	function approve(address to, uint256 tokenId) external;
+
+	/// @notice The Slipstream CLFactory this manager mints into
+	function factory() external view returns (address);
+}
+
+/// @notice Slipstream CLFactory + CLPool views used to authenticate a pool's gauge.
+interface ISlipstreamPoolLookup {
+	function getPool(address tokenA, address tokenB, int24 tickSpacing) external view returns (address);
+}
+
+interface ISlipstreamPoolGauge {
+	function gauge() external view returns (address);
 }

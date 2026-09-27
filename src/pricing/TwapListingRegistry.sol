@@ -55,9 +55,13 @@ contract TwapListingRegistry is Ownable2Step {
 	/// @notice How long a pool may stay under the floor before its asset is delisted.
 	uint256 public constant DELIST_GRACE = 72 hours;
 
+	/// @dev Aerodrome runs TWO live Slipstream deployments on Base with liquidity split between
+	///      them (verified 2026-09-24: AERO/USDC on the original, WETH/USDC + cbBTC/USDC deepest
+	///      on the newer "gauges v3" one) — both are canonical, so both are listable.
 	enum Venue {
 		UniswapV3,
-		Slipstream
+		Slipstream,
+		Slipstream2
 	}
 
 	struct Quote {
@@ -76,6 +80,7 @@ contract TwapListingRegistry is Ownable2Step {
 	IValueInterpreter public immutable valueInterpreter;
 	IUniswapV3PoolFactory public immutable uniswapFactory;
 	ISlipstreamPoolFactory public immutable slipstreamFactory;
+	ISlipstreamPoolFactory public immutable slipstream2Factory;
 
 	mapping(address => Quote) public quotes;
 	mapping(address => Listing) public listings;
@@ -97,15 +102,22 @@ contract TwapListingRegistry is Ownable2Step {
 	error PoolNotFound(address asset, address quote);
 	error BelowFloorAtListing(uint256 depthUsd18);
 
-	constructor(IValueInterpreter valueInterpreter_, IUniswapV3PoolFactory uniswapFactory_, ISlipstreamPoolFactory slipstreamFactory_)
-		Ownable(msg.sender)
-	{
-		if (address(valueInterpreter_) == address(0) || address(uniswapFactory_) == address(0) || address(slipstreamFactory_) == address(0)) {
+	constructor(
+		IValueInterpreter valueInterpreter_,
+		IUniswapV3PoolFactory uniswapFactory_,
+		ISlipstreamPoolFactory slipstreamFactory_,
+		ISlipstreamPoolFactory slipstream2Factory_
+	) Ownable(msg.sender) {
+		if (
+			address(valueInterpreter_) == address(0) || address(uniswapFactory_) == address(0)
+				|| address(slipstreamFactory_) == address(0) || address(slipstream2Factory_) == address(0)
+		) {
 			revert ZeroAddress();
 		}
 		valueInterpreter = valueInterpreter_;
 		uniswapFactory = uniswapFactory_;
 		slipstreamFactory = slipstreamFactory_;
+		slipstream2Factory = slipstream2Factory_;
 		listers[msg.sender] = true;
 		emit ListerSet(msg.sender, true);
 	}
@@ -141,7 +153,7 @@ contract TwapListingRegistry is Ownable2Step {
 
 		address pool = venue == Venue.UniswapV3
 			? uniswapFactory.getPool(asset, quote, uint24(feeOrTickSpacing))
-			: slipstreamFactory.getPool(asset, quote, feeOrTickSpacing);
+			: (venue == Venue.Slipstream ? slipstreamFactory : slipstream2Factory).getPool(asset, quote, feeOrTickSpacing);
 		if (pool == address(0)) revert PoolNotFound(asset, quote);
 
 		adapter = new TwapAggregatorAdapter(

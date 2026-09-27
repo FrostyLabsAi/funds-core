@@ -47,6 +47,7 @@ contract TwapListingRegistryTest is Test {
 	ValueInterpreter internal vi;
 	ScriptedFactory internal uni;
 	ScriptedFactory internal cl;
+	ScriptedFactory internal cl2;
 	TwapListingRegistry internal registry;
 	MockERC20 internal meme;
 	MockERC20 internal usdc;
@@ -67,7 +68,8 @@ contract TwapListingRegistryTest is Test {
 		vi.addPrimitive(address(usdc), address(usdcFeed), 2 days);
 		uni = new ScriptedFactory();
 		cl = new ScriptedFactory();
-		registry = new TwapListingRegistry(IValueInterpreter(address(vi)), IUniswapV3PoolFactory(address(uni)), ISlipstreamPoolFactory(address(cl)));
+		cl2 = new ScriptedFactory();
+		registry = new TwapListingRegistry(IValueInterpreter(address(vi)), IUniswapV3PoolFactory(address(uni)), ISlipstreamPoolFactory(address(cl)), ISlipstreamPoolFactory(address(cl2)));
 		registry.setQuote(address(usdc), AggregatorV3Interface(address(usdcFeed)), 2 days);
 
 		pool = new ScriptedPool(address(meme), address(usdc));
@@ -100,6 +102,18 @@ contract TwapListingRegistryTest is Test {
 		clPool.set(TICK_2500, TICK_2500, 1e18);
 		cl.setCl(address(meme), address(usdc), 100, address(clPool));
 		TwapAggregatorAdapter a = registry.list(address(meme), address(usdc), TwapListingRegistry.Venue.Slipstream, 100);
+		assertEq(address(a.pool()), address(clPool));
+	}
+
+	/// Aerodrome's second Slipstream deployment resolves from ITS factory, never the other one
+	function test_list_slipstream2VenueUsesTheSecondFactory() public {
+		ScriptedPool clPool = new ScriptedPool(address(meme), address(usdc));
+		clPool.set(TICK_2500, TICK_2500, 1e18);
+		cl2.setCl(address(meme), address(usdc), 50, address(clPool));
+		// not on the original deployment → PoolNotFound there
+		vm.expectRevert(abi.encodeWithSelector(TwapListingRegistry.PoolNotFound.selector, address(meme), address(usdc)));
+		registry.list(address(meme), address(usdc), TwapListingRegistry.Venue.Slipstream, 50);
+		TwapAggregatorAdapter a = registry.list(address(meme), address(usdc), TwapListingRegistry.Venue.Slipstream2, 50);
 		assertEq(address(a.pool()), address(clPool));
 	}
 

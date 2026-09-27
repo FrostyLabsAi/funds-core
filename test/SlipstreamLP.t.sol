@@ -54,6 +54,7 @@ contract SlipstreamLPTest is Test {
 		factory = new FundFactory(interpreter, new ComptrollerDeployer(), new SharesVaultDeployer());
 		positionManager = new MockPositionManager();
 		gauge = new MockCLGauge(aero);
+		positionManager.setPoolGauge(address(gauge));
 		factory.registerPositionType(
 			LP_TYPE_ID, address(new SlipstreamLPPositionFactory(ISlipstreamNonfungiblePositionManager(address(positionManager))))
 		);

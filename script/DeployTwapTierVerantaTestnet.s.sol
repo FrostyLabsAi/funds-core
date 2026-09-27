@@ -36,6 +36,7 @@ contract DeployTwapTierVerantaTestnet is Script {
 	address internal constant SWAP_ROUTER02 = 0x2626664c2603336E57B271c5C0b26F421741e481;
 	address internal constant UNI_FACTORY = 0x33128a8fC17869897dcE68Ed026d694621f6FDfD;
 	address internal constant CL_FACTORY = 0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A;
+	address internal constant CL2_FACTORY = 0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef; // Aerodrome's newer Slipstream
 
 	function run() external {
 		uint256 key = vm.envUint('VT_DEPLOYER_KEY');
@@ -52,7 +53,7 @@ contract DeployTwapTierVerantaTestnet is Script {
 		factory.registerPositionType(6, VERANTA_V2_FACTORY);
 
 		TwapListingRegistry registry = new TwapListingRegistry(
-			IValueInterpreter(address(vi)), IUniswapV3PoolFactory(UNI_FACTORY), ISlipstreamPoolFactory(CL_FACTORY)
+			IValueInterpreter(address(vi)), IUniswapV3PoolFactory(UNI_FACTORY), ISlipstreamPoolFactory(CL_FACTORY), ISlipstreamPoolFactory(CL2_FACTORY)
 		);
 		registry.setQuote(USDC, AggregatorV3Interface(USDC_PUSHED_FEED), 7 days);
 		TwapAggregatorAdapter aero = registry.list(AERO, USDC, TwapListingRegistry.Venue.Slipstream, 100);

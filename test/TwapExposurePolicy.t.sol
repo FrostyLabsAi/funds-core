@@ -63,7 +63,7 @@ contract TwapExposurePolicyTest is Test {
 		pool = new ScriptedPool(address(meme), address(usdc));
 		pool.set(TICK_2500, TICK_2500, L_DEEP);
 		uni.setUni(address(meme), address(usdc), 3000, address(pool));
-		registry = new TwapListingRegistry(IValueInterpreter(address(vi)), IUniswapV3PoolFactory(address(uni)), ISlipstreamPoolFactory(address(new ScriptedFactory())));
+		registry = new TwapListingRegistry(IValueInterpreter(address(vi)), IUniswapV3PoolFactory(address(uni)), ISlipstreamPoolFactory(address(new ScriptedFactory())), ISlipstreamPoolFactory(address(new ScriptedFactory())));
 		registry.setQuote(address(usdc), AggregatorV3Interface(address(usdcFeed)), 2 days);
 		TwapAggregatorAdapter adapter = registry.list(address(meme), address(usdc), TwapListingRegistry.Venue.UniswapV3, 3000);
 		vi.addPrimitive(address(meme), address(adapter), 1 hours); // the VI owner's step

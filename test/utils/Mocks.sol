@@ -88,6 +88,25 @@ contract MockPositionManager {
 	uint128 public nextDecreaseAmount1;
 	mapping(uint256 => MockPosition) public mockPositions;
 	mapping(uint256 => address) public approved;
+	/// @dev Plays the Slipstream factory + pool too, so a position factory can authenticate a
+	///      gauge against "the pool's gauge" (SlipstreamLPPositionFactory._requirePoolGauge)
+	address public poolGauge;
+
+	function setPoolGauge(address gauge_) external {
+		poolGauge = gauge_;
+	}
+
+	function factory() external view returns (address) {
+		return address(this);
+	}
+
+	function getPool(address, address, int24) external view returns (address) {
+		return address(this);
+	}
+
+	function gauge() external view returns (address) {
+		return poolGauge;
+	}
 
 	function setNextLiquidity(uint128 liquidity) external {
 		nextLiquidity = liquidity;

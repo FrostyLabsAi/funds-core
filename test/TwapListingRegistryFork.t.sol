@@ -24,6 +24,7 @@ contract TwapListingRegistryForkTest is Test {
 	address internal constant CL_ETH_USD = 0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70;
 	address internal constant UNI_FACTORY = 0x33128a8fC17869897dcE68Ed026d694621f6FDfD;
 	address internal constant CL_FACTORY = 0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A;
+	address internal constant CL2_FACTORY = 0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef; // Aerodrome's newer Slipstream
 
 	bool internal forked;
 
@@ -39,7 +40,7 @@ contract TwapListingRegistryForkTest is Test {
 	function _registry() internal returns (TwapListingRegistry r, ValueInterpreter vi) {
 		vi = new ValueInterpreter(address(this));
 		vi.addPrimitive(USDC, CL_USDC_USD, 2 days);
-		r = new TwapListingRegistry(IValueInterpreter(address(vi)), IUniswapV3PoolFactory(UNI_FACTORY), ISlipstreamPoolFactory(CL_FACTORY));
+		r = new TwapListingRegistry(IValueInterpreter(address(vi)), IUniswapV3PoolFactory(UNI_FACTORY), ISlipstreamPoolFactory(CL_FACTORY), ISlipstreamPoolFactory(CL2_FACTORY));
 		r.setQuote(USDC, AggregatorV3Interface(CL_USDC_USD), 2 days);
 		r.setQuote(WETH, AggregatorV3Interface(CL_ETH_USD), 1 days);
 	}

@@ -5,10 +5,11 @@ import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {IERC20Metadata} from '@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol';
 import {SafeERC20} from '@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol';
 import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
+import {IERC721Receiver} from '@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol';
 import {IExternalPosition} from '../interfaces/IExternalPosition.sol';
 import {IExternalPositionTypeFactory} from '../interfaces/IExternalPositionTypeFactory.sol';
 import {IValueInterpreter} from '../interfaces/IValueInterpreter.sol';
-import {ISlipstreamNonfungiblePositionManager} from
+import {ISlipstreamNonfungiblePositionManager, ISlipstreamPoolLookup, ISlipstreamPoolGauge} from
 	'../interfaces/external/ISlipstreamNonfungiblePositionManager.sol';
 import {ICLGauge} from '../interfaces/external/ICLGauge.sol';
 import {Comptroller} from '../core/Comptroller.sol';
@@ -29,7 +30,7 @@ import {LiquidityAmounts} from '../libraries/LiquidityAmounts.sol';
 ///      (getUniV3PositionValue/_fairSqrtPriceX96), the same math that survived that repo's
 ///      audit tooling. Uncollected fees (tokensOwed) and idle balances held here are
 ///      included; unclaimed AERO is NOT (conservative; it counts once claimed to the vault).
-contract SlipstreamLPPosition is IExternalPosition {
+contract SlipstreamLPPosition is IExternalPosition, IERC721Receiver {
 	using SafeERC20 for IERC20;
 
 	enum Action {
@@ -74,6 +75,7 @@ contract SlipstreamLPPosition is IExternalPosition {
 	error PositionAlreadyExists();
 	error StakingDisabled();
 	error PositionIsStaked();
+	error UnexpectedNft(address nft, uint256 tokenId);
 	error PositionNotStaked();
 	error ZeroAddress();
 
@@ -145,6 +147,15 @@ contract SlipstreamLPPosition is IExternalPosition {
 	function getDebtAssets() external pure returns (address[] memory assets, uint256[] memory amounts) {
 		assets = new address[](0);
 		amounts = new uint256[](0);
+	}
+
+	/// @notice Aerodrome's CLGauge returns a staked NFT with `safeTransferFrom` on withdraw —
+	///         without this hook Unstake reverts and a staked LP is locked in the gauge forever
+	///         (fork-proven 2026-09-27; mock gauges used a plain transfer and hid it). Only this
+	///         position's own NFT, from its own position manager, is accepted.
+	function onERC721Received(address, address, uint256 tokenId_, bytes calldata) external view returns (bytes4) {
+		if (msg.sender != address(positionManager) || tokenId_ != tokenId) revert UnexpectedNft(msg.sender, tokenId_);
+		return IERC721Receiver.onERC721Received.selector;
 	}
 
 	/// @inheritdoc IExternalPosition
@@ -356,6 +367,7 @@ contract SlipstreamLPPositionFactory is IExternalPositionTypeFactory {
 		(address token0, address token1, int24 tickSpacing, address gauge) =
 			abi.decode(initArgs, (address, address, int24, address));
 		_requireSupported(comptroller, token0, token1);
+		_requirePoolGauge(token0, token1, tickSpacing, gauge);
 		position = address(
 			new SlipstreamLPPosition(
 				comptroller, positionManager, ICLGauge(gauge), IERC20(token0), IERC20(token1), tickSpacing
@@ -364,6 +376,16 @@ contract SlipstreamLPPositionFactory is IExternalPositionTypeFactory {
 	}
 
 	error UnsupportedAsset(address asset);
+	error GaugeNotPoolGauge(address gauge, address pool);
+
+	/// @dev Staking hands the position NFT to `gauge` — it must be Aerodrome's own gauge for this
+	///      exact pool, never a manager's choice (a fake gauge keeps the NFT on `deposit`;
+	///      fork-proven 2026-09-27). address(0) = staking disabled.
+	function _requirePoolGauge(address token0, address token1, int24 tickSpacing, address gauge) internal view {
+		if (gauge == address(0)) return;
+		address pool = ISlipstreamPoolLookup(positionManager.factory()).getPool(token0, token1, tickSpacing);
+		if (pool == address(0) || ISlipstreamPoolGauge(pool).gauge() != gauge) revert GaugeNotPoolGauge(gauge, pool);
+	}
 
 	/// @dev Anything the position will ever report in getManagedAssets must be
 	///      protocol-priceable — an unpriceable token0/token1 bricks calcGav fund-wide

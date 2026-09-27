@@ -12,7 +12,7 @@ import {IPolicy} from '../src/interfaces/IPolicy.sol';
 import {MockERC20, MockAggregator} from './utils/Mocks.sol';
 
 /// @notice Regression tests for the 2026-09-22 review MEDIUMS:
-///         M-1 reconfiguration cannot revive suspended funds · M-2 exit window ≥ holder
+///         M-1 reconfiguration cannot revive suspended funds (a guardian pause carries over) · M-2 exit window ≥ holder
 ///         timelock · M-3 policies only attach to implemented hooks · M-6 no
 ///         unexecutable deposit windows · M-7 Chainlink answer-bounds clamp detection.
 contract MediumRegressionsTest is Test {
@@ -25,6 +25,7 @@ contract MediumRegressionsTest is Test {
 	address internal manager = makeAddr('manager');
 	address internal guardian = makeAddr('guardian');
 	address internal alice = makeAddr('alice');
+	address internal bob = makeAddr('bob');
 	uint256 internal fundNonce;
 
 	function setUp() public {
@@ -66,24 +67,66 @@ contract MediumRegressionsTest is Test {
 	}
 
 	// ─── M-1 · reconfiguration must not revive suspended funds ──────────────────
+	// A guardian pause may reconfigure (the bug-fix path: pause, then move to the fixed
+	// build) but the pause CARRIES OVER — the fresh Comptroller never starts open.
 
-	function test_m1_guardianPausedFund_cannotRequestReconfiguration() public {
+	function _assertStillPausedAfterSwap(Comptroller oldComptroller, address newComptroller) internal {
+		assertTrue(Comptroller(newComptroller).guardianDepositsPaused(), 'the swap reopened deposits');
+		assertTrue(oldComptroller.guardianDepositsPaused());
+
+		usdc.mint(bob, 100e6);
+		vm.startPrank(bob);
+		usdc.approve(newComptroller, 100e6);
+		vm.expectRevert(Comptroller.DepositsSuspended.selector);
+		Comptroller(newComptroller).requestDeposit(100e6);
+		vm.stopPrank();
+
+		// Neither the fund owner nor the guardian can reopen — only the factory owner
+		vm.prank(manager);
+		vm.expectRevert();
+		factory.unpauseFundDeposits(newComptroller);
+		vm.prank(guardian);
+		vm.expectRevert();
+		factory.unpauseFundDeposits(newComptroller);
+		factory.unpauseFundDeposits(newComptroller); // this test contract = factory owner
+		assertFalse(Comptroller(newComptroller).guardianDepositsPaused());
+	}
+
+	function test_m1_guardianPausedFund_reconfiguresStillPaused() public {
 		Comptroller comptroller = _seededFund(0);
 		vm.prank(guardian);
 		factory.pauseFundDeposits(address(comptroller));
 
 		vm.prank(manager);
-		vm.expectRevert(FundFactory.FundSuspended.selector);
-		factory.createReconfigurationRequest(address(comptroller), _config(0, 30 minutes));
+		address newComptroller = factory.createReconfigurationRequest(address(comptroller), _config(0, 30 minutes));
+		skip(2 days);
+		vm.prank(manager);
+		factory.executeReconfiguration(address(comptroller));
+
+		_assertStillPausedAfterSwap(comptroller, newComptroller);
 	}
 
-	function test_m1_pauseDuringWindow_blocksExecution() public {
+	function test_m1_pauseDuringWindow_carriesOver() public {
 		Comptroller comptroller = _seededFund(0);
 		vm.prank(manager);
-		factory.createReconfigurationRequest(address(comptroller), _config(0, 30 minutes));
+		address newComptroller = factory.createReconfigurationRequest(address(comptroller), _config(0, 30 minutes));
 
 		vm.prank(guardian);
 		factory.pauseFundDeposits(address(comptroller)); // emergency lands mid-window
+		skip(2 days);
+
+		vm.prank(manager);
+		factory.executeReconfiguration(address(comptroller));
+
+		_assertStillPausedAfterSwap(comptroller, newComptroller);
+	}
+
+	function test_m1_shutDownDuringWindow_blocksExecution() public {
+		Comptroller comptroller = _seededFund(0);
+		vm.prank(manager);
+		factory.createReconfigurationRequest(address(comptroller), _config(0, 30 minutes));
+		vm.prank(manager);
+		comptroller.shutDownFund();
 		skip(2 days);
 
 		vm.prank(manager);
