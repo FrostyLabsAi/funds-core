@@ -27,7 +27,6 @@ import {UniswapV3LPPositionFactory} from '../../src/positions/UniswapV3LPPositio
 import {SlipstreamLPPositionFactory} from '../../src/positions/SlipstreamLPPosition.sol';
 import {VerantaPerpPositionV2Factory} from '../../src/positions/VerantaPerpPositionV2.sol';
 import {ERC4626ExitValueFeed} from '../../src/pricing/ERC4626ExitValueFeed.sol';
-import {RedstonePriceStore} from '../../src/pricing/RedstonePriceStore.sol';
 import {TwapListingRegistry, IUniswapV3PoolFactory, ISlipstreamPoolFactory} from '../../src/pricing/TwapListingRegistry.sol';
 import {TwapExposurePolicy} from '../../src/policies/TwapExposurePolicy.sol';
 
@@ -109,7 +108,6 @@ library FundsMainnet {
 		TwapListingRegistry twapRegistry;
 		TwapExposurePolicy twapPolicy;
 		VerantaPerpPositionV2Factory verantaFactory;
-		RedstonePriceStore redstoneStore;
 		address uniAdapter;
 		address slipstreamAdapter;
 		address slipstream2Adapter;
@@ -131,7 +129,6 @@ library FundsMainnet {
 		_deployFactory(d, cfg);
 		_deployVenues(d, cfg);
 		_deployTwapTier(d);
-		d.redstoneStore = new RedstonePriceStore('redstone-primary-prod', primaryProdSigners(), 3);
 	}
 
 	function _deployPricing(Deployed memory d, Config memory cfg) private {
@@ -220,14 +217,4 @@ library FundsMainnet {
 		d.twapPolicy = policy;
 	}
 
-	/// @notice redstone-primary-prod, threshold 3 — RedStone's PrimaryProdDataServiceConsumerBase
-	///         (read 2026-09-24), the same five seen signing on the gateway.
-	function primaryProdSigners() internal pure returns (address[] memory s) {
-		s = new address[](5);
-		s[0] = 0x8BB8F32Df04c8b654987DAaeD53D6B6091e3B774;
-		s[1] = 0xdEB22f54738d54976C4c0fe5ce6d408E40d88499;
-		s[2] = 0x51Ce04Be4b3E32572C4Ec9135221d0691Ba7d202;
-		s[3] = 0xDD682daEC5A90dD295d14DA4b0bec9281017b5bE;
-		s[4] = 0x9c5AE89C4Af6aA32cE58588DBaF90d18a855B6de;
-	}
 }

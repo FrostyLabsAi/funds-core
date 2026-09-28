@@ -9,7 +9,6 @@ import {ProtocolFeeReserve} from '../../src/core/ProtocolFeeReserve.sol';
 import {TwapListingRegistry} from '../../src/pricing/TwapListingRegistry.sol';
 import {TwapExposurePolicy} from '../../src/policies/TwapExposurePolicy.sol';
 import {VerantaPerpPositionV2Factory} from '../../src/positions/VerantaPerpPositionV2.sol';
-import {RedstonePriceStore} from '../../src/pricing/RedstonePriceStore.sol';
 import {FundsMainnet} from './FundsMainnet.sol';
 import {FundsGovernance} from './FundsGovernance.sol';
 
@@ -29,7 +28,6 @@ abstract contract FundsGovernanceBase is Script {
 		d.twapRegistry = TwapListingRegistry(vm.parseJsonAddress(json, '.twapRegistry'));
 		d.twapPolicy = TwapExposurePolicy(vm.parseJsonAddress(json, '.twapPolicy'));
 		d.verantaFactory = VerantaPerpPositionV2Factory(vm.parseJsonAddress(json, '.verantaFactory'));
-		d.redstoneStore = RedstonePriceStore(vm.parseJsonAddress(json, '.redstoneStore'));
 		d.uniAdapter = vm.parseJsonAddress(json, '.uniAdapter');
 		d.slipstreamAdapter = vm.parseJsonAddress(json, '.slipstreamAdapter');
 		d.slipstream2Adapter = vm.parseJsonAddress(json, '.slipstream2Adapter');

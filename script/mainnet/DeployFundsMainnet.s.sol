@@ -5,8 +5,8 @@ import {Script, console2} from 'forge-std/Script.sol';
 import {FundsMainnet} from './FundsMainnet.sol';
 
 /// @notice FrostyFunds genesis on Base — what test/fork/FundsMainnetGenesisFork rehearses.
-///         Afterwards the deployer owns everything (run the listing batches — DeployRedstoneTier,
-///         DeployPythAdapters, MapPerpPairs — now), then TransferFundsGovernance hands off.
+///         Afterwards the deployer owns everything (run the listing batches — list-coinbase-stocks.sh,
+///         ListVerantaPairs, ListYieldVaults — now), then TransferFundsGovernance hands off.
 ///         Writes every address to deployments/base-mainnet.json for the governance scripts.
 ///         Run: forge script script/mainnet/DeployFundsMainnet.s.sol --rpc-url <base> --broadcast \
 ///              --private-key <deployer> [--verify]
@@ -44,7 +44,6 @@ contract DeployFundsMainnet is Script {
 		vm.serializeAddress(k, 'twapRegistry', address(d.twapRegistry));
 		vm.serializeAddress(k, 'twapPolicy', address(d.twapPolicy));
 		vm.serializeAddress(k, 'verantaFactory', address(d.verantaFactory));
-		vm.serializeAddress(k, 'redstoneStore', address(d.redstoneStore));
 		vm.serializeAddress(k, 'uniAdapter', d.uniAdapter);
 		vm.serializeAddress(k, 'slipstreamAdapter', d.slipstreamAdapter);
 		vm.serializeAddress(k, 'slipstream2Adapter', d.slipstream2Adapter);
