@@ -11,7 +11,8 @@ import {VerantaListing} from './VerantaListing.sol';
 /// @notice Runbook step 3 (while the deployer still owns the VI and the perp factory): deploy the
 ///         Veranta price store (or reuse STORE) and list every Veranta pair genesis left unmapped —
 ///         see VerantaListing. Run AFTER list-coinbase-stocks.sh so the stock perps keep their
-///         Coinbase-token mapping. Then point the relay workflow at the store.
+///         Coinbase-token mapping. Then set the keeper's VERANTA_PRICE_STORES to the store (it pushes
+///         every pair a fund holds, every 5 minutes).
 ///         Run: forge script script/mainnet/ListVerantaPairs.s.sol --rpc-url <base> --broadcast --slow \
 ///              --private-key <deployer>   [STORE=<existing store>] [DEPLOYMENTS_FILE=…]
 contract ListVerantaPairs is Script {
