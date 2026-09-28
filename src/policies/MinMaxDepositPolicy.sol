@@ -4,8 +4,7 @@ pragma solidity 0.8.24;
 import {IPolicy} from '../interfaces/IPolicy.sol';
 
 /// @title MinMaxDepositPolicy
-/// @notice Bounds the size of a single deposit. maxDeposit = 0 disables new deposits entirely
-///         (a fund-closing switch), per v4 MinMaxInvestmentPolicy (spec/topics/policies.md).
+/// @notice Bounds the size of a single deposit; maxDeposit = 0 closes the fund to deposits.
 /// @dev Immutable bounds — deploy a new instance to change them.
 contract MinMaxDepositPolicy is IPolicy {
 	uint256 public immutable minDeposit;
@@ -20,7 +19,7 @@ contract MinMaxDepositPolicy is IPolicy {
 
 	/// @inheritdoc IPolicy
 	function validate(PolicyHook, bytes calldata validationData) external view {
-		// PostDepositRequest: (depositor, assets) — assets is the second word.
+		// (depositor, assets): assets is the second word
 		(, uint256 assets) = abi.decode(validationData, (address, uint256));
 		if (assets < minDeposit || maxDeposit == 0 || assets > maxDeposit) revert DepositOutOfBounds(assets);
 	}

@@ -7,16 +7,12 @@ import {SafeERC20} from '@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {IIntegrationAdapter} from '../interfaces/IIntegrationAdapter.sol';
 
 /// @title ERC4626Adapter
-/// @notice Generic deposit/redeem adapter for ANY ERC-4626 vault (Morpho, Euler, Yearn v3,
-///         and the long tail of 4626-shaped yield products). One deployed instance serves
-///         them all — the fund's investable set is bounded by the ValueInterpreter anyway:
-///         a 4626 share the fund receives must be a registered derivative or the trade
-///         reverts at auto-tracking.
+/// @notice Deposit/redeem adapter for any ERC-4626 vault. A received share must be a
+///         registered ValueInterpreter derivative, or the trade reverts at auto-tracking.
 /// @dev integrationData = abi.encode(action, vault, amount, minOut)
 ///      action 0 (Deposit): amount = underlying assets in, minOut = min shares back
 ///      action 1 (Redeem):  amount = shares in,            minOut = min assets back
-///      Stateless; outputs go straight to the fund's Vault; incoming amounts verified by
-///      the Comptroller's balance-delta accounting, never the 4626's return values.
+///      Outputs go straight to the fund's Vault; the Comptroller checks amounts by balance delta.
 contract ERC4626Adapter is IIntegrationAdapter {
 	using SafeERC20 for IERC20;
 
@@ -49,7 +45,7 @@ contract ERC4626Adapter is IIntegrationAdapter {
 
 		if (action == ACTION_DEPOSIT) {
 			spendAssets[0] = underlying;
-			incomingAssets[0] = vault; // the share token IS the vault contract per EIP-4626
+			incomingAssets[0] = vault; // the share token is the vault contract
 		} else if (action == ACTION_REDEEM) {
 			spendAssets[0] = vault;
 			incomingAssets[0] = underlying;
@@ -67,8 +63,7 @@ contract ERC4626Adapter is IIntegrationAdapter {
 			IERC20(IERC4626(target4626).asset()).forceApprove(target4626, amount);
 			IERC4626(target4626).deposit(amount, vault); // shares minted straight to the fund's Vault
 		} else if (action == ACTION_REDEEM) {
-			// Shares were transferred to this adapter as the spend asset; redeem them with
-			// the underlying going straight to the fund's Vault.
+			// shares arrived here as the spend asset; the underlying goes to the fund's Vault
 			IERC4626(target4626).redeem(amount, vault, address(this));
 		} else {
 			revert UnknownAction();

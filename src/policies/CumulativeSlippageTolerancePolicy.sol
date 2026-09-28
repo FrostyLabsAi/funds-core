@@ -7,13 +7,9 @@ import {Comptroller} from '../core/Comptroller.sol';
 import {IValueInterpreter} from '../interfaces/IValueInterpreter.sol';
 
 /// @title CumulativeSlippageTolerancePolicy
-/// @notice Rate-limits value loss through adapter trades: each trade's slippage (spend value
-///         minus received value, as a fraction of fund GAV) accrues to a cumulative total
-///         that must stay under `toleranceBps`; the total replenishes linearly over 7 days.
-/// @dev Port of Enzyme v4's CumulativeSlippageTolerancePolicy (spec/topics/policies.md):
-///      "slow the rate at which a malicious manager can drain a fund enough to allow
-///      alerting and exiting" — the core defense for anonymous marketplace managers.
-///      One instance is shareable by many funds (state is keyed by calling Comptroller).
+/// @notice Rate-limits value loss: each trade's loss (as a fraction of GAV) accrues to a total
+///         that must stay under `toleranceBps`, replenishing linearly over 7 days.
+/// @dev Slows a malicious manager enough for investors to exit. Shared across funds (state keyed by Comptroller).
 contract CumulativeSlippageTolerancePolicy is IPolicy {
 	uint256 public constant BPS = 10_000;
 	uint256 public constant TOLERANCE_PERIOD = 7 days;
@@ -38,10 +34,8 @@ contract CumulativeSlippageTolerancePolicy is IPolicy {
 	}
 
 	/// @inheritdoc IPolicy
-	/// @dev Two loss sources feed ONE budget: adapter trades (value computed here from
-	///      the hook's stated spend/incoming, which the Comptroller measures as vault
-	///      deltas) and external-position calls (the Comptroller passes the MEASURED
-	///      value lost inside the call — security review 2026-09-22, H-1).
+	/// @dev One budget for adapter trades (valued from measured vault deltas) and external-position
+	///      calls (the Comptroller passes the measured loss).
 	function validate(PolicyHook hook, bytes calldata validationData) external {
 		uint256 loss;
 		if (hook == PolicyHook.PostCallOnExternalPosition) {

@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
-/// @notice Uniswap v3 periphery SwapRouter02 (exactInputSingle only). NOTE: unlike the
-///         original SwapRouter, SwapRouter02 has NO deadline field in the params struct —
-///         the two selectors are incompatible, and SwapRouter02 is what Uniswap deploys
-///         on Base / Base Sepolia.
+/// @notice Uniswap SwapRouter02 (exactInputSingle only), the router deployed on Base. Its params
+///         have no deadline field, unlike the original SwapRouter (incompatible selectors).
 interface IUniswapV3SwapRouter {
 	struct ExactInputSingleParams {
 		address tokenIn;

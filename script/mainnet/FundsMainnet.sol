@@ -40,8 +40,13 @@ import {TwapExposurePolicy} from '../../src/policies/TwapExposurePolicy.sol';
 ///         proxies from Chainlink's own Base directory — SVR feeds can lag behind for the OEV
 ///         auction and must never price NAV.
 ///         Genesis leaves the deployer as owner of everything so the listing batches can run;
-///         FundsGovernance then moves every power to the (FROST-shared) timelock with the Safe
-///         as guardian, and proves the deployer holds nothing.
+///         FundsGovernance then moves every power to the governance timelock with the Safe as
+///         guardian, and proves the deployer holds nothing.
+///         FROST is OPTIONAL (founder decision 2026-09-28: FrostyFunds launches first). Without it
+///         there is no ProtocolFeeReserve and the protocol fee is off; governance turns it on
+///         later with one timelock batch — `settleFees()` on every live fund, then
+///         `setProtocolFee(bps, reserve)` — so no fund is charged for the time it was off (each
+///         fund's fee clock only advances when that fund settles).
 library FundsMainnet {
 	// ─── Base mainnet externals (verified 2026-09-24) ───────────────────────────
 	address internal constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
@@ -92,7 +97,7 @@ library FundsMainnet {
 	struct Config {
 		address deployer; // the broadcasting EOA — owns everything until FundsGovernance hands off
 		address safe; // guardian: one-way OFF switches only
-		address frost; // the fee reserve's buyback-and-burn asset
+		address frost; // the fee reserve's buyback-and-burn asset; zero = no reserve, fee off
 		address autopilotKeeper; // Veranta delegate for funds that opt in
 		uint16 protocolFeeBps; // AUM fee, bytecode-capped at 1%
 	}
@@ -116,11 +121,11 @@ library FundsMainnet {
 
 	/// @notice Deploy and wire everything; the caller (deployer EOA) owns it all afterwards.
 	function deploy(Config memory cfg) internal returns (Deployed memory d) {
-		if (cfg.deployer == address(0) || cfg.safe == address(0) || cfg.frost == address(0) || cfg.autopilotKeeper == address(0)) {
-			revert BadConfig();
-		}
+		if (cfg.deployer == address(0) || cfg.safe == address(0) || cfg.autopilotKeeper == address(0)) revert BadConfig();
 		if (cfg.autopilotKeeper == cfg.deployer) revert BadConfig();
 		if (cfg.protocolFeeBps > MAX_PROTOCOL_FEE_BPS) revert BadConfig();
+		// a fee needs its reserve, and the reserve needs FROST
+		if (cfg.frost == address(0) && cfg.protocolFeeBps != 0) revert BadConfig();
 
 		_deployPricing(d, cfg);
 		_deployFactory(d, cfg);
@@ -146,8 +151,10 @@ library FundsMainnet {
 
 	function _deployFactory(Deployed memory d, Config memory cfg) private {
 		FundFactory factory = new FundFactory(d.valueInterpreter, new ComptrollerDeployer(), new SharesVaultDeployer());
-		d.feeReserve = new ProtocolFeeReserve(cfg.frost, cfg.deployer);
-		factory.setProtocolFee(cfg.protocolFeeBps, address(d.feeReserve));
+		if (cfg.frost != address(0)) {
+			d.feeReserve = new ProtocolFeeReserve(cfg.frost, cfg.deployer);
+			factory.setProtocolFee(cfg.protocolFeeBps, address(d.feeReserve));
+		}
 		factory.setGuardian(cfg.safe);
 		d.factory = factory;
 	}

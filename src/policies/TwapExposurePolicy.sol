@@ -12,26 +12,13 @@ import {TwapListingRegistry} from '../pricing/TwapListingRegistry.sol';
 import {TwapAggregatorAdapter} from '../pricing/TwapAggregatorAdapter.sol';
 
 /// @title TwapExposurePolicy
-/// @notice The limits every fund lives within when it holds TWAP-priced assets
-///         (docs/design/twap-oracle.md, founder decisions 2026-09-23/24):
+/// @notice Limits for funds holding TWAP-priced assets:
 ///         - at most 20% of GAV across all TWAP-priced holdings;
-///         - per asset, at most a share of its pool's ±10% depth: 10% while the pool is under
-///           $250k, 50% at or above — so a position always stays small enough to sell back
-///           into its own pool;
-///         - a DELISTED asset (its pool under the $50k floor for 72h — TwapListingRegistry)
-///           pauses NEW deposits into any fund still holding it, until the fund sells it.
-///           Redemptions and exits are never paused by this policy.
-/// @dev Caps are checked on BUYS only — a trade whose incoming assets include a TWAP-priced
-///      asset. A sale is never blocked, even when the fund is over a cap because the pool
-///      thinned after it bought: exits must always work.
-///      DEGEN funds (`allowRiskyAssets`, investors opted in) skip the caps — a fund may take
-///      over a token's float ("community takeover") there, with NAV relying on a pool it may
-///      itself provide. The deposit pause applies to every fund.
-///      External positions (security review 2026-09-24, M-2): a non-degen fund can neither
-///      open an LP on a TWAP-priced token (checked at creation — an LP's pair is fixed) nor
-///      place a limit order that BUYS one (checked after every position call on the newest
-///      order); both caps count TWAP units held inside positions (e.g. limit-order sell
-///      inventory), so parking tokens in a position cannot hide exposure.
+///         - per asset, at most 10% of its pool's ±10% depth (50% once the pool is ≥ $250k);
+///         - a delisted asset pauses NEW deposits into funds still holding it until sold.
+/// @dev Caps apply to buys only — sales are never blocked. Degen funds (`allowRiskyAssets`) skip
+///      the caps but not the deposit pause. Non-degen funds can't LP a TWAP-priced token or place
+///      a limit order buying one; TWAP units inside positions count toward the caps.
 contract TwapExposurePolicy is IPolicy {
 	uint256 public constant BPS = 10_000;
 	uint256 public constant MAX_GAV_BPS = 2_000;
@@ -152,15 +139,13 @@ contract TwapExposurePolicy is IPolicy {
 		}
 	}
 
-	/// @dev An LP position's pair is fixed at creation (token0/token1) — a TWAP-priced side is
-	///      refused for non-degen funds. Positions without a pair answer nothing and pass.
+	/// @dev An LP's pair is fixed at creation: refuse a TWAP-priced side. Positions without a pair pass.
 	function _checkLpPair(address position) internal view {
 		_refuseTwap(_addressView(position, 'token0()'));
 		_refuseTwap(_addressView(position, 'token1()'));
 	}
 
-	/// @dev A limit-order position's newest order must not BUY a TWAP-priced asset (selling
-	///      one is an exit and always allowed). Positions without orders answer nothing and pass.
+	/// @dev The newest limit order must not buy a TWAP-priced asset (selling is allowed). Positions without orders pass.
 	function _checkNewestOrder(address position) internal view {
 		(bool ok, bytes memory ret) = position.staticcall(abi.encodeWithSignature('orderCount()'));
 		if (!ok || ret.length != 32) return;

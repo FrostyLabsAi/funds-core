@@ -2,12 +2,9 @@
 pragma solidity 0.8.24;
 
 /// @title IDerivativePriceFeed
-/// @notice Prices a derivative asset (vault share, LP token, receipt token) by resolving it
-///         into underlying-asset amounts, which the ValueInterpreter then prices via its
-///         primitive feeds. Pattern per Enzyme v4's derivative feeds
-///         (spec/architecture/release.md#valueinterpreter).
-/// @dev Underlyings MUST resolve to primitives — the ValueInterpreter rejects
-///      derivative-of-derivative chains to make pricing cycles impossible.
+/// @notice Prices a derivative (vault share, LP token) by resolving it into underlying amounts,
+///         which the ValueInterpreter prices via its primitive feeds.
+/// @dev Underlyings must be primitives: derivative-of-derivative chains are rejected (no pricing cycles).
 interface IDerivativePriceFeed {
 	/// @notice Resolve `amount` of `derivative` into underlying assets and amounts.
 	function calcUnderlyingValues(address derivative, uint256 amount)

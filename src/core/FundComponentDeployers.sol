@@ -11,13 +11,9 @@ import {IValueInterpreter} from '../interfaces/IValueInterpreter.sol';
 import {IComptrollerDeployer} from '../interfaces/IComptrollerDeployer.sol';
 
 /// @title Fund component deployers
-/// @notice Creation bytecode lives here instead of inside FundFactory, keeping every
-///         contract under the EIP-170 runtime limit — the same split melon-v1's
-///         FundFactory and frosty-core's BondMarketDeployers use for the same reason.
-/// @dev Both deployers pass THEIR CALLER through as the components' `factory` authority:
-///      when the real FundFactory calls them, components trust the real FundFactory.
-///      Anyone else calling a deployer mints components wired to themselves — harmless,
-///      since only factory-registered funds exist in the registry or reserve names.
+/// @notice Holds component creation code outside FundFactory to keep it under EIP-170.
+/// @dev Deployers pass their caller through as the components' `factory`. Anyone else calling
+///      one gets components wired to themselves — harmless, they are never in the registry.
 
 contract ComptrollerDeployer is IComptrollerDeployer {
 	function deploy(
@@ -45,15 +41,11 @@ contract ComptrollerDeployer is IComptrollerDeployer {
 }
 
 /// @title ComptrollerBlueprintDeployer
-/// @notice The Comptroller fix path (FundFactory.setComptrollerDeployer): deploys a Comptroller
-///         build from creation code kept in data contracts rather than embedded in this one, so a
-///         fixed build is not bound by the embedding ComptrollerDeployer's EIP-170 headroom
-///         (5 bytes on 2026-09-27 — any real fix outgrows it).
-/// @dev The build must keep Comptroller's constructor signature (`deploy` appends exactly those
-///      arguments, caller first as `factory`) and every function FundFactory calls on a
-///      Comptroller, including `initializeForMigration`. Data contracts are SSTORE2-style:
-///      runtime = STOP ‖ chunk, so none of them is callable. `initcodeHash` lets a fund owner
-///      check, inside the reconfiguration window, exactly which build will take over.
+/// @notice Comptroller fix path (FundFactory.setComptrollerDeployer): deploys a Comptroller build
+///         from creation code stored in data contracts, so a fixed build isn't bound by EIP-170.
+/// @dev The build must keep Comptroller's constructor signature and every function FundFactory
+///      calls on it (incl. `initializeForMigration`). Data contracts are STOP ‖ chunk, never
+///      callable. `initcodeHash` lets fund owners check which build will take over.
 contract ComptrollerBlueprintDeployer is IComptrollerDeployer {
 	uint256 private constant CHUNK_SIZE = 24_000; // + the STOP prefix stays under EIP-170 (24,576)
 

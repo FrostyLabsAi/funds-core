@@ -5,10 +5,8 @@ import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {SafeERC20} from '@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol';
 
 /// @title Vault
-/// @notice Dumb custody. Holds the fund's tracked ERC20 assets; releases them only to the Comptroller.
-/// @dev Successor to melon-v1 Vault (melon-v1/src/fund/vault/Vault.sol) — deliberately kept
-///      as small as its ancestor. Asset tracking (tracked vs untracked, Gamma lesson #4:
-///      no silent residue) lives in the Comptroller's accounting, not here.
+/// @notice Dumb custody: holds the fund's ERC20 assets and releases them only at the Comptroller's call.
+/// @dev Asset tracking lives in the Comptroller, not here.
 contract Vault {
 	using SafeERC20 for IERC20;
 

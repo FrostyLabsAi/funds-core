@@ -6,8 +6,7 @@ import {Comptroller} from '../core/Comptroller.sol';
 import {IValueInterpreter} from './IValueInterpreter.sol';
 
 /// @title IComptrollerDeployer
-/// @notice What FundFactory needs from a Comptroller deployer. The deployer passes ITS CALLER
-///         through as the Comptroller's `factory` authority (see FundComponentDeployers.sol).
+/// @notice Comptroller deployer used by FundFactory; the caller becomes the Comptroller's `factory`.
 interface IComptrollerDeployer {
 	function deploy(
 		address fundOwner,

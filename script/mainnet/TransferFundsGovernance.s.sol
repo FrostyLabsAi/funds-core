@@ -45,7 +45,7 @@ abstract contract FundsGovernanceBase is Script {
 /// @notice Step 1 (deployer EOA): listing role → timelock, deployer's dropped, two-step transfers
 ///         begun. Then writes the Safe Transaction Builder batch that SCHEDULES the timelock's
 ///         acceptOwnership calls (import it in the Safe app, sign 2-of-3, execute).
-///         Run: TIMELOCK=<FROST timelock> forge script script/mainnet/TransferFundsGovernance.s.sol:StartFundsGovernance \
+///         Run: TIMELOCK=<governance timelock (DeployFundsTimelock)> forge script script/mainnet/TransferFundsGovernance.s.sol:StartFundsGovernance \
 ///              --rpc-url <base> --broadcast --private-key <deployer>
 contract StartFundsGovernance is FundsGovernanceBase {
 	function run() external {
@@ -64,7 +64,7 @@ contract StartFundsGovernance is FundsGovernanceBase {
 			abi.encodeCall(TimelockController.scheduleBatch, (targets, values, payloads, bytes32(0), SALT, timelock.getMinDelay()));
 		string memory out = string.concat(
 			'{"version":"1.0","chainId":"', vm.toString(block.chainid),
-			'","meta":{"name":"FrostyFunds governance handoff - schedule acceptOwnership","description":"Timelock accepts ownership of ValueInterpreter, FundFactory, ProtocolFeeReserve, TwapListingRegistry, VerantaPerpPositionV2Factory. Execute after the delay with FinishFundsGovernance (anyone).","createdFromSafeAddress":"',
+			'","meta":{"name":"FrostyFunds governance handoff - schedule acceptOwnership","description":"Timelock accepts ownership of ValueInterpreter, FundFactory, TwapListingRegistry, VerantaPerpPositionV2Factory (+ ProtocolFeeReserve when genesis had FROST). Execute after the delay with FinishFundsGovernance (anyone).","createdFromSafeAddress":"',
 			vm.toString(safe),
 			'"},"transactions":[{"to":"', vm.toString(address(timelock)), '","value":"0","data":"', vm.toString(schedule),
 			'","contractMethod":null,"contractInputsValues":null}]}'

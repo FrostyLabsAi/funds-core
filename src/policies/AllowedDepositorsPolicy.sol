@@ -7,11 +7,8 @@ import {EnumerableSet} from '@openzeppelin/contracts/utils/structs/EnumerableSet
 import {IPolicy} from '../interfaces/IPolicy.sol';
 
 /// @title AllowedDepositorsPolicy
-/// @notice Restricts deposits to a whitelist. The "regulated fund" building block.
-/// @dev Successor to melon-v1 UserWhitelist (melon-v1/src/fund/policies/compliance/UserWhitelist.sol),
-///      as v4's AllowedDepositRecipientsPolicy (spec/topics/policies.md). One instance per fund,
-///      owned by the fund manager. Validates on PostDepositRequest (fail fast, before escrow
-///      sits for a day) and PostBuyShares (authoritative, at execution).
+/// @notice Restricts deposits to a whitelist.
+/// @dev One instance per fund, owned by its manager. Checked at request (fail fast) and at execution.
 contract AllowedDepositorsPolicy is IPolicy, Ownable2Step {
 	using EnumerableSet for EnumerableSet.AddressSet;
 
@@ -46,8 +43,7 @@ contract AllowedDepositorsPolicy is IPolicy, Ownable2Step {
 
 	/// @inheritdoc IPolicy
 	function validate(PolicyHook, bytes calldata validationData) external view {
-		// PostDepositRequest: (depositor, assets). PostBuyShares: (depositor, assets, shares).
-		// The depositor is the first word in both encodings.
+		// the depositor is the first word of both hooks' data
 		address depositor = abi.decode(validationData[:32], (address));
 		if (!isAllowed(depositor)) revert DepositorNotAllowed(depositor);
 	}

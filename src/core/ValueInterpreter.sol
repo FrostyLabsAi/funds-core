@@ -10,21 +10,9 @@ import {IValueInterpreter} from '../interfaces/IValueInterpreter.sol';
 import {IDerivativePriceFeed} from '../interfaces/IDerivativePriceFeed.sol';
 
 /// @title ValueInterpreter
-/// @notice Singleton pricing aggregator: values any registered asset in terms of any other
-///         registered asset, exclusively via external USD oracle feeds.
-/// @dev Successor to melon-v1 KyberPriceFeed (melon-v1/src/prices/KyberPriceFeed.sol — push
-///      oracle with a trusted updater, dead pattern) using Enzyme v4's ValueInterpreter shape
-///      (spec/architecture/release.md#valueinterpreter).
-///
-///      HARD RULES enforced here (see living doc):
-///      - Prices come from registered aggregators only. Never pool spot state (Gamma, Jan 2024).
-///      - Tokenized-stock wrappers register their OWN feed — never their underlying's (depeg is real).
-///      - Staleness: each asset has a `heartbeat`; a price older than it reverts.
-///        For equity feeds this doubles as the market-hours gate: feeds stop updating when the
-///        underlying market closes, so GAV-dependent actions (deposit execution, value-based
-///        redemption) revert outside market hours BY DESIGN. In-kind redemption never touches
-///        pricing and stays available 24/7. Derivative feeds (CLMM positions etc.) come later
-///        as v4-style derivative price feeds.
+/// @notice Values any registered asset in any other, via registered USD feeds only.
+/// @dev Never reads pool spot state. Tokenized-stock wrappers get their own feed, never their
+///      underlying's. Each asset has a `heartbeat`; an older price reverts.
 contract ValueInterpreter is IValueInterpreter, Ownable2Step {
 	struct AssetInfo {
 		AggregatorV3Interface aggregator; // USD-quoted feed
@@ -39,20 +27,14 @@ contract ValueInterpreter is IValueInterpreter, Ownable2Step {
 	}
 
 	uint256 private constant RATE_PRECISION = 1e18;
-	/// @dev Bytecode cap (Gamma lesson #3: config is attack surface): no feed may ever be
-	///      allowed to serve a price older than 7 days — covers weekends + long weekends
-	///      for equities with margin, without permitting effectively-unbounded staleness.
+	/// @dev Bytecode cap: no feed may serve a price older than 7 days.
 	uint32 public constant MAX_HEARTBEAT = 7 days;
 
 	mapping(address asset => AssetInfo) private assetInfo;
 	mapping(address asset => DerivativeInfo) private derivativeInfo;
 
-	/// @dev The side-pocket class ("ZeroPriceFeed"): assets deliberately valued at ZERO.
-	///      Unpriceable moonshots (thin/new tokens with no defensible oracle) become
-	///      holdable by risky-flagged funds without ever entering GAV — gains are
-	///      recognized only on realization (sale into a priced asset). Zero cannot be
-	///      manipulated: no oracle to pump, no fake NAV, no fee crystallization on paper
-	///      gains. The trad-fund side pocket, enforced in bytecode.
+	/// @dev Side pocket: assets valued at zero (unpriceable tokens held by risky funds). Gains
+	///      count only when sold into a priced asset, so there is no oracle to manipulate.
 	mapping(address asset => bool) public isZeroPricedAsset;
 
 	event PrimitiveAdded(address indexed asset, address aggregator, uint32 heartbeat);
@@ -78,24 +60,17 @@ contract ValueInterpreter is IValueInterpreter, Ownable2Step {
 		int256 max;
 	}
 
-	/// @notice Optional per-asset sanity band. Chainlink aggregators PIN at their
-	///         min/maxAnswer instead of reverting (LUNA-class failure) — an answer at
-	///         or outside the recorded band reverts rather than mispricing GAV
-	///         (security review 2026-09-22, M-7). Unset (0,0) = no check.
+	/// @notice Optional per-asset sanity band: Chainlink pins at min/maxAnswer instead of
+	///         reverting, so an answer at or outside the band reverts. (0,0) = no check.
 	mapping(address asset => AnswerBounds) public answerBounds;
 
 	event AnswerBoundsSet(address indexed asset, int256 min, int256 max);
 
-	/// @notice Chainlink L2 Sequencer Uptime Feed (Base: 0xBCF8…6433). Chainlink's docs
-	///         require L2 consumers to check it: while the sequencer is down, feeds cannot
-	///         update and only L1-forced transactions land, so every price is suspect —
-	///         and right after it comes back, prices are still catching up. Unset (zero)
-	///         on chains without one (Sepolia testnets). answer 0 = up, 1 = down;
-	///         startedAt = when the status last changed.
+	/// @notice Chainlink L2 sequencer uptime feed (answer 0 = up); zero on chains without one.
 	AggregatorV3Interface public sequencerUptimeFeed;
 	/// @notice How long after the sequencer comes back up pricing stays refused.
 	uint32 public sequencerGracePeriod;
-	/// @dev Bytecode cap on the grace period (config is attack surface).
+	/// @dev Bytecode cap on the grace period.
 	uint32 public constant MAX_SEQUENCER_GRACE_PERIOD = 1 days;
 
 	event SequencerUptimeFeedSet(address feed, uint32 gracePeriod);
@@ -106,8 +81,7 @@ contract ValueInterpreter is IValueInterpreter, Ownable2Step {
 
 	constructor(address initialOwner) Ownable(initialOwner) {}
 
-	/// @notice Record the sanity band for an asset's feed — use the aggregator's own
-	///         min/maxAnswer or tighter. Either side may be 0 to skip that side.
+	/// @notice Set an asset's sanity band (the aggregator's min/maxAnswer or tighter); 0 skips a side.
 	function setAnswerBounds(address asset, int256 min, int256 max) external onlyOwner {
 		if (min != 0 && max != 0 && min >= max) revert BadBounds();
 		answerBounds[asset] = AnswerBounds({min: min, max: max});
@@ -149,9 +123,8 @@ contract ValueInterpreter is IValueInterpreter, Ownable2Step {
 		emit PrimitiveRemoved(asset);
 	}
 
-	/// @notice Register a derivative (vault share, LP token) priced by resolving into
-	///         primitive underlyings via `feed`. Curation is the security boundary here:
-	///         the feed trusts the derivative's own accounting (see ERC4626PriceFeed notes).
+	/// @notice Register a derivative (vault share, LP token) priced via `feed` into primitive
+	///         underlyings. The feed trusts the derivative's own accounting, so list with care.
 	function addDerivative(address asset, address feed) external onlyOwner {
 		if (asset == address(0) || feed == address(0)) revert ZeroAddress();
 		if (address(assetInfo[asset].aggregator) != address(0) || isZeroPricedAsset[asset]) {
@@ -166,9 +139,8 @@ contract ValueInterpreter is IValueInterpreter, Ownable2Step {
 		emit DerivativeAdded(asset, feed);
 	}
 
-	/// @notice Register a side-pocket asset (valued at zero until sold). Reverts if the
-	///         asset already has a real price source — an asset is exactly one of:
-	///         primitive, derivative, or zero-priced.
+	/// @notice Register a side-pocket asset (valued at zero). An asset is exactly one of
+	///         primitive, derivative or zero-priced.
 	function addZeroPricedAsset(address asset) external onlyOwner {
 		if (asset == address(0)) revert ZeroAddress();
 		if (address(assetInfo[asset].aggregator) != address(0) || address(derivativeInfo[asset].feed) != address(0)) {
@@ -193,9 +165,8 @@ contract ValueInterpreter is IValueInterpreter, Ownable2Step {
 	// ─── Pricing ─────────────────────────────────────────────────────────────────
 
 	/// @inheritdoc IValueInterpreter
-	/// @dev Base may be a primitive or a registered derivative; the QUOTE must be a
-	///      primitive (denomination assets always are) — this plus the primitives-only
-	///      rule for derivative underlyings makes pricing cycles impossible.
+	/// @dev The quote must be a primitive; with primitive-only derivative underlyings this
+	///      rules out pricing cycles.
 	function calcCanonicalAssetValue(address baseAsset, uint256 amount, address quoteAsset)
 		external
 		view
@@ -212,8 +183,7 @@ contract ValueInterpreter is IValueInterpreter, Ownable2Step {
 		value = Math.mulDiv(usdValue, 10 ** quote.assetDecimals, quoteRate);
 	}
 
-	/// @dev USD (1e18) value of `amount` of `asset` — primitive directly, derivative via
-	///      its feed's primitive underlyings (derivative-of-derivative reverts).
+	/// @dev USD (1e18) value of `amount` of `asset`; derivative-of-derivative reverts.
 	function _calcUsdValue(address asset, uint256 amount) private view returns (uint256 usdValue) {
 		if (isZeroPricedAsset[asset]) return 0;
 
@@ -264,9 +234,8 @@ contract ValueInterpreter is IValueInterpreter, Ownable2Step {
 		return (address(info.aggregator), info.heartbeat, info.assetDecimals, info.rateDecimals);
 	}
 
-	/// @dev Chainlink's L2 pattern (docs.chain.link/data-feeds/l2-sequencer-feeds): refuse
-	///      to price while the sequencer is down, and for `sequencerGracePeriod` after it
-	///      comes back. Anything but 0 counts as down (fail closed).
+	/// @dev Refuse to price while the sequencer is down and for `sequencerGracePeriod` after it
+	///      comes back. Any answer but 0 counts as down.
 	function _checkSequencer() private view {
 		AggregatorV3Interface feed = sequencerUptimeFeed;
 		if (address(feed) == address(0)) return;
@@ -275,8 +244,7 @@ contract ValueInterpreter is IValueInterpreter, Ownable2Step {
 		if (block.timestamp - startedAt <= sequencerGracePeriod) revert SequencerGracePeriodNotOver(startedAt);
 	}
 
-	/// @dev Returns the asset's USD rate scaled to 1e18, reverting on unregistered feeds,
-	///      non-positive answers, and stale prices.
+	/// @dev USD rate (1e18); reverts on unregistered feeds, non-positive answers and stale prices.
 	function _validatedRate(address asset, AssetInfo memory info) private view returns (uint256) {
 		if (address(info.aggregator) == address(0)) revert UnsupportedAsset(asset);
 

@@ -7,15 +7,11 @@ import {IIntegrationAdapter} from '../interfaces/IIntegrationAdapter.sol';
 import {FrostyCompounder} from '../yield/FrostyCompounder.sol';
 
 /// @title CompounderAdapter
-/// @notice Funds deposit into / withdraw from FrostyCompounder vaults through their
-///         normal callOnIntegration rails (mandate-gated, GAV-priced via the
-///         CompounderPriceFeed). One instance serves every compounder.
+/// @notice Deposits into / withdraws from FrostyCompounder vaults. One instance serves every compounder.
 /// @dev integrationData = abi.encode(action, compounder, a, b, c)
 ///      action 0 (Deposit):  a = amount0Desired, b = amount1Desired, c = minShares
 ///      action 1 (Withdraw): a = shares,         b = amount0Min,     c = amount1Min
-///      Deposits pull both tokens at the live pool ratio; whatever the ratio doesn't
-///      take is forwarded straight back to the fund's Vault (both tokens are already
-///      tracked assets, so refunds land clean in GAV).
+///      Whatever the pool ratio doesn't take on deposit goes back to the fund's Vault.
 contract CompounderAdapter is IIntegrationAdapter {
 	using SafeERC20 for IERC20;
 
@@ -78,17 +74,16 @@ contract CompounderAdapter is IIntegrationAdapter {
 		if (action == ACTION_DEPOSIT) {
 			token0.forceApprove(compounderAddr, a);
 			token1.forceApprove(compounderAddr, b);
-			// c = min shares, enforced BOTH here (the compounder refuses a skewed mint)
-			// and by the Comptroller's balance-delta check on the incoming shares
+			// c = min shares, also enforced by the Comptroller's balance-delta check
 			uint256 shares = compounder.deposit(a, b, 0, 0, c);
 			IERC20(compounderAddr).safeTransfer(vault, shares);
-			// The pool ratio decides what's used — refund the rest to the fund's Vault
+			// refund what the pool ratio didn't use
 			uint256 left0 = token0.balanceOf(address(this));
 			uint256 left1 = token1.balanceOf(address(this));
 			if (left0 > 0) token0.safeTransfer(vault, left0);
 			if (left1 > 0) token1.safeTransfer(vault, left1);
 		} else if (action == ACTION_WITHDRAW) {
-			// Both mins ride the Comptroller's balance-delta min-incoming checks (b, c)
+			// mins b and c are enforced by the Comptroller's min-incoming checks
 			compounder.withdraw(a, 0, 0);
 			token0.safeTransfer(vault, token0.balanceOf(address(this)));
 			token1.safeTransfer(vault, token1.balanceOf(address(this)));

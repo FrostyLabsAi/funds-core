@@ -7,14 +7,10 @@ import {EnumerableSet} from '@openzeppelin/contracts/utils/structs/EnumerableSet
 import {IPolicy} from '../interfaces/IPolicy.sol';
 
 /// @title AllowedSharesTransferRecipientsPolicy
-/// @notice Restricts SECONDARY share transfers to a recipient whitelist — the other half
-///         of the regulated-fund gate: without it, a vetted investor can simply sell
-///         shares to an unvetted wallet and the deposit whitelist means nothing.
-/// @dev Enzyme v4's AllowedSharesTransferRecipientsPolicy (spec/topics/policies.md),
-///      same shape as our AllowedDepositorsPolicy: one instance per fund, roster owned
-///      by the fund manager (the POLICY is set-once; its membership is not). Runs on
-///      PreTransferShares only — mint (deposits) and burn (redemptions) never touch it,
-///      so redemptions stay unblockable by design.
+/// @notice Restricts share transfers to a recipient whitelist, so a deposit whitelist can't be
+///         bypassed by transferring shares.
+/// @dev One instance per fund, roster owned by its manager. Mint and burn never hit it, so
+///      redemptions can't be blocked.
 contract AllowedSharesTransferRecipientsPolicy is IPolicy, Ownable2Step {
 	using EnumerableSet for EnumerableSet.AddressSet;
 
@@ -49,7 +45,7 @@ contract AllowedSharesTransferRecipientsPolicy is IPolicy, Ownable2Step {
 
 	/// @inheritdoc IPolicy
 	function validate(PolicyHook, bytes calldata validationData) external view {
-		// PreTransferShares: (from, to, amount) — the recipient is the second word
+		// (from, to, amount): the recipient is the second word
 		(, address to) = abi.decode(validationData[:64], (address, address));
 		if (!isAllowed(to)) revert TransferRecipientNotAllowed(to);
 	}

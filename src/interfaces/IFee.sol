@@ -3,11 +3,8 @@ pragma solidity 0.8.24;
 
 /// @title IFee
 /// @notice Fee plugin that settles in shares (mint to recipient / dilute holders).
-/// @dev Successor to melon-v1 IFee (melon-v1/src/fund/fees/IFee.sol).
-///      Performance fee uses Enzyme v4's continuous-accrual HWM formula
-///      (spec/fee-formulas/performance-fee.md) — settle on every share-supply change,
-///      no crystallization periods:
-///        W = max(g - hwm, 0) * TS;  F = W * rate;  feeShares = F * TS / (GAV - F)
+/// @dev Performance fee accrues continuously against the HWM (settled on every supply change):
+///      W = max(g - hwm, 0) * TS;  F = W * rate;  feeShares = F * TS / (GAV - F)
 interface IFee {
 	enum FeeHook {
 		PreBuyShares,

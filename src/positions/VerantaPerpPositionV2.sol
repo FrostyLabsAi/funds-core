@@ -18,31 +18,16 @@ import {
 } from '../interfaces/external/IVeranta.sol';
 
 /// @title VerantaPerpPositionV2
-/// @notice Successor of VerantaPerpPosition (wave 7 — retired 2026-09-23; source in git
-///         history) with a BOUNDED valuation read. V1 valued the account through Veranta's
-///         Multicall.getPositions, which scans every pair × maxTradesPerPair slot —
-///         measured on Base mainnet 2026-09-23 at ≈1.6–1.9M gas PER PAIR, ≈215M for the
-///         live 135 pairs: every NAV-dependent action of a fund holding a V1 account cost
-///         over half a block, and simulations exceeded every RPC's eth_call cap.
-///         V2 asks TradingStorage for two COUNTS per pair (open trades, open limit orders —
-///         one storage read each) and reads trade/order slots only where a count is
-///         non-zero. It still sees EVERY pair the account holds — including hedges the
-///         autopilot keeper opened through Veranta's delegation, which never pass through
-///         this contract — so nothing can go unvalued.
-/// @dev Additive over V1: LinkReferral (the protocol's Veranta referral code — fee discount
-///      for the fund; Referral linking is caller-scoped, so only this contract can do it) and
-///      TP/SL at open (OpenTrade carries tp/sl; V1 hardcoded both to 0).
-///      Everything else is V1 verbatim: actions, custody, autopilot, and the linear
-///      decomposition:
-///      a perp is reported to the ValueInterpreter as spot-equivalent legs, priced by the
-///      SAME oracles that price the fund's long leg (basis consistency for delta-neutral GAV):
+/// @notice A fund's Veranta perp account. Valuation reads two counts per pair from
+///         TradingStorage and reads slots only where a count is non-zero, so gas stays bounded
+///         while every pair is covered, including hedges the autopilot keeper opened.
+/// @dev A perp is reported as spot-equivalent legs, priced by the same oracles as the fund's spot:
 ///        short: managed USDC += collateral + coinExposure*openPrice − accruedFees;
 ///               debt[underlying] += coinExposure
 ///        long:  managed[underlying] += coinExposure;
 ///               USDC leg += collateral − coinExposure*openPrice − accruedFees (usually negative → debt)
-///      Pending market orders and resting limit orders are valued at their escrowed collateral.
-///      coinExposure is Veranta's own formula (PositionMath: scaleByLeverage then
-///      usdcToCoinAtPrice), accrued fees are getDynamicDataForPosition's rollover + funding.
+///      Pending market orders and resting limit orders count at their escrowed collateral.
+///      coinExposure and accrued fees (rollover + funding) follow Veranta's own formulas.
 contract VerantaPerpPositionV2 is IExternalPosition {
 	using SafeERC20 for IERC20;
 
@@ -57,10 +42,8 @@ contract VerantaPerpPositionV2 is IExternalPosition {
 		LinkReferral
 	}
 
-	/// @notice OpenTrade args (static tuple — same bytes as the flat abi.encode of its fields).
-	///         Prices 1e10, collateral 1e6, leverage/slippage 1e10. tp/sl are Veranta's own
-	///         full-position levels, validated and triggered by Veranta: tp 0 = the pair's
-	///         max-gain cap, sl 0 = none.
+	/// @notice OpenTrade args (a static tuple). Prices 1e10, collateral 1e6, leverage/slippage 1e10.
+	///         tp/sl are Veranta's full-position levels: tp 0 = the pair's max-gain cap, sl 0 = none.
 	struct OpenTradeArgs {
 		uint256 pairIndex;
 		uint256 collateral;
@@ -128,18 +111,14 @@ contract VerantaPerpPositionV2 is IExternalPosition {
 		verantaMulticall = multicall_;
 		tradingStorage = IVerantaTradingStorage(tradingStorage_);
 		pairStorage = pairStorage_;
-		// Collateral is pulled from the trader (this contract) by Veranta's audited
-		// TradingStorage — the standard trading approval, also required for the
-		// delegate-driven rebalances (which cannot approve anything themselves).
+		// Veranta's TradingStorage pulls collateral from this contract, including for keeper-driven rebalances
 		usdc_.forceApprove(tradingStorage_, type(uint256).max);
 	}
 
 	// ─── Manager actions (via Comptroller.callOnExternalPosition) ───────────────
 
 	/// @inheritdoc IExternalPosition
-	/// @dev Closing, cancelling (collateral refunds land HERE — Veranta pays only the trader),
-	///      removing the keeper delegate, and returning cash (only ever to the fund's vault) can
-	///      move value solely back toward the fund.
+	/// @dev Close, cancel (refunds land here), remove-delegate and return-to-vault only move value back toward the fund.
 	function isRiskReducing(bytes calldata actionData) external pure returns (bool) {
 		(uint8 rawAction,) = abi.decode(actionData, (uint8, bytes));
 		return rawAction == uint8(Action.CloseTrade) || rawAction == uint8(Action.CancelLimitOrder)
@@ -183,8 +162,7 @@ contract VerantaPerpPositionV2 is IExternalPosition {
 			usdc.safeTransfer(address(Comptroller(comptroller).vault()), amount);
 			emit ReturnedToVault(amount);
 		} else if (rawAction == uint8(Action.LinkReferral)) {
-			// The PROTOCOL's code only (factory config) — a manager cannot route the
-			// referral rebate on the fund's fees to a code of their own.
+			// the protocol's code only, so a manager can't route the rebate to a code of their own
 			IVerantaReferral referral = positionFactory.referral();
 			bytes32 code = positionFactory.referralCode();
 			if (address(referral) == address(0) || code == bytes32(0)) revert ReferralNotConfigured();
@@ -196,8 +174,7 @@ contract VerantaPerpPositionV2 is IExternalPosition {
 	}
 
 	function _openTrade(OpenTradeArgs memory a) internal {
-		// The pair must be protocol-mapped to a VI-priceable underlying — GAV must never
-		// hold a position it cannot value.
+		// the pair must map to a priceable underlying, or GAV couldn't value the position
 		address asset = positionFactory.pairAsset(a.pairIndex);
 		if (asset == address(0)) revert PairNotConfigured(a.pairIndex);
 		if (!Comptroller(comptroller).valueInterpreter().isSupportedAsset(asset)) {
@@ -244,8 +221,7 @@ contract VerantaPerpPositionV2 is IExternalPosition {
 	function _valuation() internal view returns (int256 usdcNet, address[] memory tokens, int256[] memory tokenAmts) {
 		usdcNet = int256(usdc.balanceOf(address(this)));
 
-		// Escrowed collateral of in-flight market opens (operator fills or refunds) —
-		// a per-trader list, cheap (≈45k gas measured live)
+		// escrowed collateral of in-flight market opens (a cheap per-trader list)
 		IVerantaMulticall.PendingOrder[] memory pending = verantaMulticall.getPendingOrder(address(this));
 		for (uint256 i; i < pending.length; ++i) {
 			usdcNet += int256(pending[i].orderInfo.trade.positionSizeUSDC);
@@ -261,9 +237,7 @@ contract VerantaPerpPositionV2 is IExternalPosition {
 			usdcNet += usdcDelta;
 
 			address asset = positionFactory.pairAsset(pairIndex);
-			// A pair zeroed mid-flight ("0 disables new opens") must DEGRADE, not brick
-			// fund-wide GAV: the trade-local USDC leg stays, the coin leg is dropped
-			// (security review 2026-09-22, M-8)
+			// a pair unmapped mid-flight degrades instead of bricking GAV: the USDC leg stays, the coin leg is dropped
 			if (asset == address(0) || units == 0) continue;
 			// Merge same-underlying legs (pairs sharing an asset)
 			bool merged;
@@ -292,8 +266,7 @@ contract VerantaPerpPositionV2 is IExternalPosition {
 		if (tradesLeft == 0 && ordersLeft == 0) return (0, 0, false);
 		held = true;
 
-		// Slot reads are try-wrapped like Veranta's own Multicall ("skip row that reverts on
-		// read") so an odd EMPTY slot is skipped — but every COUNTED row must be read (below)
+		// try-wrapped so an empty slot is skipped; every counted row must still be read (below)
 		for (uint256 slot; slot < maxSlots && (tradesLeft > 0 || ordersLeft > 0); ++slot) {
 			if (tradesLeft > 0) {
 				try tradingStorage.openTrades(address(this), pairIndex, slot) returns (IVerantaTradingRouter.Trade memory t) {
@@ -317,14 +290,12 @@ contract VerantaPerpPositionV2 is IExternalPosition {
 				} catch {}
 			}
 		}
-		// Every counted trade and order must have been valued: one that could not be read is
-		// refused, never silently dropped from GAV (security review 2026-09-24, M-3)
+		// a counted trade or order that couldn't be read is refused, never silently left out of GAV
 		if (tradesLeft > 0 || ordersLeft > 0) revert ValuationIncomplete(pairIndex);
 	}
 
 	/// @dev One stored trade → its USDC-leg contribution and its signed coin units.
-	///      STORED trades keep collateral in initialPosToken — positionSizeUSDC is a dummy
-	///      there (fork-proven; it is collateral only on submission/pending).
+	///      Stored trades keep collateral in initialPosToken; positionSizeUSDC is a dummy there.
 	function _valueTrade(IVerantaTradingRouter.Trade memory t, uint256 pairIndex, uint256 slot)
 		internal
 		view
@@ -385,10 +356,8 @@ contract VerantaPerpPositionV2 is IExternalPosition {
 }
 
 /// @title VerantaPerpPositionV2Factory
-/// @notice Type factory for V2 perp positions — V1's factory plus the PairStorage source
-///         of the live pair count. Protocol-owned config, shared by every deployed position:
-///         the pair→underlying mapping (which ERC20 the VI prices each Veranta pair against —
-///         managers cannot self-map) and the pinned autopilot keeper.
+/// @notice Type factory for V2 perp positions and their shared protocol config: the
+///         pair → underlying map (managers can't self-map) and the autopilot keeper.
 contract VerantaPerpPositionV2Factory is IExternalPositionTypeFactory, Ownable2Step {
 	IERC20 public immutable usdc;
 	IVerantaTradingRouter public immutable router;
@@ -399,9 +368,8 @@ contract VerantaPerpPositionV2Factory is IExternalPositionTypeFactory, Ownable2S
 	address public autopilotKeeper;
 	/// @notice Veranta pairIndex → the ERC20 whose oracle prices that pair's underlying.
 	mapping(uint256 => address) public pairAsset;
-	/// @notice Veranta Referral contract + the protocol code positions link to (LinkReferral):
-	///         the fund trades at the referred-trader fee discount; the rebate accrues to the
-	///         code owner. Unset (0) = LinkReferral reverts.
+	/// @notice Veranta Referral contract and the protocol code positions link to (a fee discount
+	///         for the fund). Unset = LinkReferral reverts.
 	IVerantaReferral public referral;
 	bytes32 public referralCode;
 

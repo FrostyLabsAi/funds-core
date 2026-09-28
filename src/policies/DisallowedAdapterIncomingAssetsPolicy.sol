@@ -4,11 +4,8 @@ pragma solidity 0.8.24;
 import {IPolicy} from '../interfaces/IPolicy.sol';
 
 /// @title DisallowedAdapterIncomingAssetsPolicy
-/// @notice Blacklist of assets a fund may never acquire through adapter trades (e.g., the
-///         protocol's riskier-price-feeds list, per spec/topics/position-pricing.md).
-/// @dev Port of melon-v1 AssetBlacklist (melon-v1/src/fund/policies/risk-management/
-///      AssetBlacklist.sol) as v4's DisallowedAdapterIncomingAssetsPolicy.
-///      Immutable set — deploy a new instance to change it.
+/// @notice Blacklist of assets a fund may never acquire through adapter trades.
+/// @dev Immutable set — deploy a new instance to change it.
 contract DisallowedAdapterIncomingAssetsPolicy is IPolicy {
 	mapping(address asset => bool) public isDisallowedAsset;
 

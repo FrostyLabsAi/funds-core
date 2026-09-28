@@ -7,19 +7,20 @@ import {FundsMainnet} from './FundsMainnet.sol';
 
 /// @title FundsGovernance
 /// @notice The FrostyFunds key migration as code — every owner moves off the deploying EOA
-///         onto the TimelockController FROST's genesis created (shared governance, founder
-///         decision 2026-09-24), the Safe stays guardian (one-way OFF switches only), and a
-///         read-only {verify} proves the EOA holds nothing.
-///         The timelock is FROST's, so by the time FrostyFunds launches the EOA has no timelock
-///         role: the acceptOwnership batch is SCHEDULED BY THE SAFE (a proposer) and executed by
-///         anyone once the delay passes (the timelock's execution is open).
+///         onto the governance TimelockController, the Safe stays guardian (one-way OFF
+///         switches only), and a read-only {verify} proves the EOA holds nothing.
+///         The timelock: FrostyFunds launches before FROST (founder decision 2026-09-28), so it is
+///         a plain OZ TimelockController (DeployFundsTimelock: Safe proposes, open execution, no
+///         admin) — the shape FROST's genesis uses, so FROST's governance can be made a proposer
+///         on it later (shared governance, founder decision 2026-09-24).
+///         The EOA holds no timelock role: the acceptOwnership batch is SCHEDULED BY THE SAFE (a
+///         proposer) and executed by anyone once the delay passes (the timelock's execution is open).
 ///           {start}     (EOA)  hand the listing role to the timelock, drop the EOA's, and begin
 ///                              every two-step ownership transfer
 ///           {acceptBatch}      the calls the timelock must make — the Safe schedules them
 ///           (the timelock delay passes; anyone executes the batch)
 ///           {verify}           owners, pending owners, guardian, listers, wiring
 library FundsGovernance {
-	uint256 internal constant OWNED = 5;
 
 	error NotHandedOff(address target, address owner);
 	error StillPending(address target, address pending);
@@ -30,20 +31,23 @@ library FundsGovernance {
 	error MandatoryPoliciesMissing(uint256 count);
 	error SequencerCheckOff();
 
-	function owned(FundsMainnet.Deployed memory d) internal pure returns (address[OWNED] memory o) {
+	/// @notice Every Ownable2Step genesis contract — the fee reserve only when genesis made one (FROST set).
+	function owned(FundsMainnet.Deployed memory d) internal pure returns (address[] memory o) {
+		bool reserve = address(d.feeReserve) != address(0);
+		o = new address[](reserve ? 5 : 4);
 		o[0] = address(d.valueInterpreter);
 		o[1] = address(d.factory);
-		o[2] = address(d.feeReserve);
-		o[3] = address(d.twapRegistry);
-		o[4] = address(d.verantaFactory);
+		o[2] = address(d.twapRegistry);
+		o[3] = address(d.verantaFactory);
+		if (reserve) o[4] = address(d.feeReserve);
 	}
 
 	/// @notice EOA step: listing role → timelock, EOA's listing role dropped, two-step transfers begun.
 	function start(FundsMainnet.Deployed memory d, address timelock, address deployer) internal {
 		d.twapRegistry.setLister(timelock, true);
 		d.twapRegistry.setLister(deployer, false);
-		address[OWNED] memory o = owned(d);
-		for (uint256 i; i < OWNED; ++i) {
+		address[] memory o = owned(d);
+		for (uint256 i; i < o.length; ++i) {
 			Ownable2Step(o[i]).transferOwnership(timelock);
 		}
 	}
@@ -54,12 +58,10 @@ library FundsGovernance {
 		pure
 		returns (address[] memory targets, uint256[] memory values, bytes[] memory payloads)
 	{
-		address[OWNED] memory o = owned(d);
-		targets = new address[](OWNED);
-		values = new uint256[](OWNED);
-		payloads = new bytes[](OWNED);
-		for (uint256 i; i < OWNED; ++i) {
-			targets[i] = o[i];
+		targets = owned(d);
+		values = new uint256[](targets.length);
+		payloads = new bytes[](targets.length);
+		for (uint256 i; i < targets.length; ++i) {
 			payloads[i] = abi.encodeCall(Ownable2Step.acceptOwnership, ());
 		}
 	}
@@ -69,8 +71,8 @@ library FundsGovernance {
 		internal
 		view
 	{
-		address[OWNED] memory o = owned(d);
-		for (uint256 i; i < OWNED; ++i) {
+		address[] memory o = owned(d);
+		for (uint256 i; i < o.length; ++i) {
 			address owner = Ownable(o[i]).owner();
 			if (owner != timelock) revert NotHandedOff(o[i], owner);
 			address pending = Ownable2Step(o[i]).pendingOwner();

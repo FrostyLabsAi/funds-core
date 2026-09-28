@@ -8,18 +8,10 @@ import {IExternalPositionTypeFactory} from '../interfaces/IExternalPositionTypeF
 import {Comptroller} from '../core/Comptroller.sol';
 
 /// @title LimitOrderPosition
-/// @notice On-chain resting limit orders for funds — the order-book venue class
-///         (melon-terminal's OasisDex/0x lane) rebuilt for a contract-custody world.
-///         Off-chain orderbooks (1inch LOP, CoW) need the maker to SIGN orders; a fund
-///         vault is a contract with deliberately no arbitrary-call or signing power, so
-///         instead the order rests here ON-CHAIN: the manager escrows inventory and
-///         commits to a fixed limit rate; any taker (arb bots, our keeper, anyone) fills
-///         at that rate or better, in whole or in part, until expiry.
-/// @dev Custody guarantees preserved: inventory sits in this position (valued into GAV
-///      the whole time via getManagedAssets — both legs are always VI-priced), proceeds
-///      accumulate here, and only the ReturnToVault action (comptroller-gated) moves
-///      funds home — always to the vault, never to an arbitrary address. Fully on-chain:
-///      no attestor, no off-chain book, testnet-testable end to end.
+/// @notice On-chain resting limit orders for a fund: the manager escrows inventory at a fixed
+///         limit rate and any taker fills it, fully or partially, until expiry.
+/// @dev Inventory and proceeds stay here (counted in GAV); only ReturnToVault moves them, and
+///      only to the fund's vault.
 contract LimitOrderPosition is IExternalPosition {
 	using SafeERC20 for IERC20;
 
@@ -40,19 +32,11 @@ contract LimitOrderPosition is IExternalPosition {
 	address public immutable comptroller;
 
 	uint256 internal constant BPS = 10_000;
-	/// @notice Max discount vs the ValueInterpreter cross-rate an exchange may impose on
-	///         the fund — enforced at placement AND at every fill (security review
-	///         2026-09-22, C-3: without it a manager could rest a sell at any price and
-	///         self-fill, draining the fund past every policy). Fills where the fund
-	///         RECEIVES more than it gives are always allowed — only the downside is
-	///         banded. 1% barely touches honest resting orders (they fill at the moment
-	///         the market crosses the limit, i.e. ~zero discount).
+	/// @notice Max discount vs the oracle cross-rate the fund may take, checked at placement and
+	///         at every fill (stops a manager self-filling a mispriced order). Premium fills always pass.
 	uint256 public constant MAX_ORACLE_DISCOUNT_BPS = 100;
-	/// @notice Fill-discount budget: fills may cost the fund at most this fraction of
-	///         the position's held value per period, linearly replenishing — the same
-	///         rate-limit philosophy as CumulativeSlippageTolerancePolicy, enforced HERE
-	///         because fills are taker-side transactions no comptroller hook ever sees.
-	///         Kills the cycle-the-band skim (place at −1%, self-fill, repeat).
+	/// @notice Fills may cost the fund at most this share of the position's held value per
+	///         period, replenishing linearly (stops repeated in-band self-fills).
 	uint256 public constant MAX_FILL_DISCOUNT_BPS_PER_PERIOD = 200;
 	uint256 public constant DISCOUNT_TOLERANCE_PERIOD = 7 days;
 
@@ -61,8 +45,7 @@ contract LimitOrderPosition is IExternalPosition {
 
 	uint256 public orderCount;
 	mapping(uint256 => Order) public orders;
-	/// @notice Per-token inventory reserved by open orders — ReturnToVault can never
-	///         strip escrow out from under a resting order.
+	/// @notice Per-token inventory reserved by open orders; ReturnToVault can't touch it.
 	mapping(address => uint256) public committed;
 
 	address[] internal heldAssets;
@@ -100,8 +83,7 @@ contract LimitOrderPosition is IExternalPosition {
 	// ─── Manager actions (via Comptroller.callOnExternalPosition) ───────────────
 
 	/// @inheritdoc IExternalPosition
-	/// @dev Cancelling keeps the inventory in this position; returning sends it only to the
-	///      fund's vault. Placing an order sets a price — it is always priced.
+	/// @dev Cancel and ReturnToVault only move value back toward the fund; placing an order is always priced.
 	function isRiskReducing(bytes calldata actionData) external pure returns (bool) {
 		(uint8 rawAction,) = abi.decode(actionData, (uint8, bytes));
 		return rawAction == uint8(Action.CancelOrder) || rawAction == uint8(Action.ReturnToVault);
@@ -139,13 +121,11 @@ contract LimitOrderPosition is IExternalPosition {
 		if (sellAmount == 0 || minBuyAmount == 0 || sellToken == buyToken || expiry <= block.timestamp) {
 			revert InvalidOrder();
 		}
-		// Both legs must be protocol-priceable — GAV must never brick on a fill
+		// both legs must be priceable, or GAV bricks on a fill
 		if (!Comptroller(comptroller).valueInterpreter().isSupportedAsset(buyToken)) {
 			revert UnsupportedAsset(buyToken);
 		}
-		// The limit rate may never underpay the fund beyond the oracle band; valuing the
-		// sell leg here also rejects unsupported sellTokens (which would brick GAV once
-		// held — review H-2's limit-order ingestion path).
+		// the rate must stay within the oracle band; valuing the sell leg also rejects unpriceable sellTokens
 		_requireWithinOracleBand(sellToken, sellAmount, buyToken, minBuyAmount);
 		if (IERC20(sellToken).balanceOf(address(this)) < committed[sellToken] + sellAmount) {
 			revert InsufficientInventory();
@@ -165,10 +145,9 @@ contract LimitOrderPosition is IExternalPosition {
 		emit OrderPlaced(orderId, sellToken, buyToken, sellAmount, minBuyAmount, expiry);
 	}
 
-	// ─── Taker side (public — anyone can fill at the limit rate or better) ──────
+	// ─── Taker side ──────────────────────────────────────────────────────────────
 
-	/// @notice Fill an order: pay `buyAmount` of the order's buyToken, receive sellToken
-	///         pro-rata at the order's fixed limit rate. Partial fills welcome.
+	/// @notice Pay `buyAmount` of the buyToken and receive sellToken pro-rata at the order's rate.
 	function fill(uint256 orderId, uint256 buyAmount) external {
 		Order storage order = orders[orderId];
 		if (order.sellRemaining == 0) revert OrderInactive(orderId);
@@ -176,18 +155,16 @@ contract LimitOrderPosition is IExternalPosition {
 
 		uint256 sellOut;
 		if (buyAmount >= order.buyRemaining) {
-			// Full fill of the remainder — taker pays exactly what is owed
+			// full fill of the remainder
 			buyAmount = order.buyRemaining;
 			sellOut = order.sellRemaining;
 		} else {
-			// Pro-rata at the fixed rate, rounded down (in the fund's favor)
+			// pro-rata, rounded down in the fund's favor
 			sellOut = (uint256(order.sellRemaining) * buyAmount) / order.buyRemaining;
 		}
 		if (sellOut == 0) revert ZeroFill();
 
-		// Re-check at fill time: a parity order placed before a large market move must
-		// not become a drain (fills price at CURRENT oracle, so fills of equity legs
-		// revert while feeds are stale — same market-hours discipline as deposits).
+		// re-check at the current oracle: an order placed before a big move must not become a drain
 		(uint256 valueOut, uint256 valueIn) = _requireWithinOracleBand(order.sellToken, sellOut, order.buyToken, buyAmount);
 		_accrueFillDiscount(valueOut, valueIn);
 
@@ -200,11 +177,8 @@ contract LimitOrderPosition is IExternalPosition {
 		emit OrderFilled(orderId, msg.sender, sellOut, buyAmount);
 	}
 
-	/// @dev What the fund receives must be worth ≥ (1 − MAX_ORACLE_DISCOUNT_BPS) of what
-	///      it gives up, both legs valued through the denomination asset (always a
-	///      primitive, so derivative legs price too). Reverts UnsupportedAsset for any
-	///      leg the ValueInterpreter can't price. Returns both leg values so fill() can
-	///      run the cumulative-discount budget on top.
+	/// @dev The fund must receive ≥ (1 − MAX_ORACLE_DISCOUNT_BPS) of what it gives, both legs valued in
+	///      the denomination asset. Returns both values for the fill-discount budget.
 	function _requireWithinOracleBand(address sellToken, uint256 sellAmount, address buyToken, uint256 buyAmount)
 		internal
 		returns (uint256 valueOut, uint256 valueIn)
@@ -217,10 +191,8 @@ contract LimitOrderPosition is IExternalPosition {
 		if (valueIn < minValueIn) revert BelowOracleBand(valueIn, minValueIn);
 	}
 
-	/// @dev Rate-limit the value fills may cost the fund: each fill's discount draws on
-	///      a budget of MAX_FILL_DISCOUNT_BPS_PER_PERIOD of the position's current held
-	///      value, replenishing linearly over DISCOUNT_TOLERANCE_PERIOD. Premium fills
-	///      (fund receives more than it gives) consume nothing.
+	/// @dev Each fill's discount draws on a budget of MAX_FILL_DISCOUNT_BPS_PER_PERIOD of the
+	///      position's held value, replenishing over DISCOUNT_TOLERANCE_PERIOD.
 	function _accrueFillDiscount(uint256 valueOut, uint256 valueIn) internal {
 		if (valueIn >= valueOut) return;
 		uint256 discount = valueOut - valueIn;
@@ -285,8 +257,7 @@ contract LimitOrderPosition is IExternalPosition {
 }
 
 /// @title LimitOrderPositionFactory
-/// @notice Type factory for the on-chain order-book venue. Stateless: no attestor, no
-///         config — every fund gets a fresh, fully on-chain-valued position.
+/// @notice Type factory for LimitOrderPosition.
 contract LimitOrderPositionFactory is IExternalPositionTypeFactory {
 	/// @inheritdoc IExternalPositionTypeFactory
 	function deployPosition(address comptroller, bytes calldata) external returns (address position) {

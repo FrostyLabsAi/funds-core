@@ -5,14 +5,11 @@ import {TwapListingRegistry} from './TwapListingRegistry.sol';
 import {TwapAggregatorAdapter} from './TwapAggregatorAdapter.sol';
 
 /// @title TwapFloorLens
-/// @notice Read-only helper for floor keepers (the FrostyFi keeper workflow): which listed
-///         assets would `pokeFloor` actually change right now? It applies the registry's own
-///         rule — an adapter that cannot answer (the pool cannot serve the window) counts as
-///         under the floor — inside a try/catch, so one unanswerable pool never reverts the
-///         whole read. Stateless and registry-agnostic: one deployment serves any registry.
+/// @notice Read-only helper for floor keepers: which listed assets would `pokeFloor` change now?
+/// @dev Applies the registry's rule (an adapter that cannot answer counts as under the floor) in a
+///      try/catch, so one unanswerable pool never reverts the read. Serves any registry.
 contract TwapFloorLens {
-	/// @notice Listed assets whose pool state disagrees with the stored 72-hour clock: under
-	///         the floor with no clock running, or back over it while one runs. In listing order.
+	/// @notice Listed assets whose pool state disagrees with the stored 72-hour clock, in listing order.
 	function assetsNeedingPoke(TwapListingRegistry registry) external view returns (address[] memory due) {
 		address[] memory assets = registry.getListedAssets();
 		due = new address[](assets.length);

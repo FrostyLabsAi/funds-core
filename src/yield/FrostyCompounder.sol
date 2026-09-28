@@ -10,31 +10,20 @@ import {ReentrancyGuard} from '@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {IUniswapV3NonfungiblePositionManager} from '../interfaces/external/IUniswapV3NonfungiblePositionManager.sol';
 
 /// @title FrostyCompounder
-/// @notice The protocol's revenue engine on LP yields (Beefy model): one shared
-///         full-range concentrated-liquidity position per vault; anyone can
-///         `compound()` — trading fees are harvested, the protocol takes
-///         `perfFeeBps` OF THE HARVEST ONLY (never principal), and the rest is
-///         folded back into the position so every holder's share value grows.
-///         Deposits/withdrawals are dual-token and proportional.
-///
-/// @dev SAFETY MODEL — no oracle, no swaps, no price surface:
-///      · shares track POOL LIQUIDITY UNITS pro-rata: deposits mint
-///        `added × supply / liquidityBefore`, exits remove
-///        `positionLiquidity × shares / supply` — compounded liquidity therefore
-///        accrues to every holder (fork-proven: the 1:1 shortcut orphaned yield),
-///        and fairness rides the pool's own liquidity math, unmanipulable;
-///      · the vault never swaps: deposits and compounds add both tokens at the
-///        live pool ratio (a manipulated ratio changes the token MIX pulled, which
-///        depositors bound with min-amounts, never the share count);
-///      · `_compound()` runs before every deposit and withdrawal, so pending fees
-///        always belong to the holders who earned them;
-///      · works unchanged against Uniswap v3 (Sepolia demo, this deploy) and, with
-///        a gauge adapter for AERO emissions, Aerodrome Slipstream on mainnet
-///        (same NPM ABI shape) — that variant is the mainnet follow-up.
+/// @notice One shared full-range LP position per vault. Anyone can `compound()`: fees are
+///         harvested, `perfFeeBps` of the harvest (never principal) goes to the treasury, and the
+///         rest is added back so every holder's share value grows. Deposits/withdrawals are dual-token.
+/// @dev No oracle and no swaps:
+///      - shares track pool liquidity pro-rata (mint `added × supply / liquidityBefore`, exit
+///        `liquidity × shares / supply`), so compounded liquidity accrues to every holder;
+///      - tokens are added at the live pool ratio; a manipulated ratio only changes the token mix,
+///        which depositors bound with min-amounts;
+///      - `_compound()` runs before every deposit and withdrawal, so pending fees stay with the
+///        holders who earned them.
 contract FrostyCompounder is ERC20, Ownable2Step, ReentrancyGuard {
 	using SafeERC20 for IERC20;
 
-	uint16 public constant MAX_PERF_FEE_BPS = 3000; // hard protocol promise: ≤30% of yield
+	uint16 public constant MAX_PERF_FEE_BPS = 3000; // ≤30% of yield
 
 	IUniswapV3NonfungiblePositionManager public immutable positionManager;
 	IERC20 public immutable token0;
@@ -86,20 +75,15 @@ contract FrostyCompounder is ERC20, Ownable2Step, ReentrancyGuard {
 		token1_.forceApprove(address(positionManager_), type(uint256).max);
 	}
 
-	/// @dev Donation-inflation defense (security review 2026-09-22, H-4): the first
-	///      deposit seeds this many liquidity-unit shares to an unredeemable sink so a
-	///      1-share supply can never exist, and `minShares` lets every depositor bound
-	///      the shares they accept (the ratio-based amount mins can't — a donation
-	///      skews liquidityBefore, not the used amounts). 1e6 liquidity units is dust at
-	///      real full-range scale (~1e15 for a 10k/10k position) but a 1e6× granularity
-	///      floor against rounding theft.
+	/// @dev Donation-inflation defense: the first deposit seeds this many shares to an unredeemable
+	///      sink, and `minShares` lets each depositor bound the shares received (a donation skews
+	///      liquidityBefore, which the amount mins can't catch). 1e6 liquidity units is dust at real scale.
 	uint256 public constant MIN_BOOTSTRAP_SHARES = 1e6;
 	address public constant BOOTSTRAP_SHARES_SINK = 0x000000000000000000000000000000000000dEaD;
 
-	/// @notice Add both tokens at the live pool ratio. Shares minted = liquidity units
-	///         added. Unused amounts (the pool takes the ratio it needs) are refunded.
-	///         `amount0Min/amount1Min` bound the USED amounts against ratio movement;
-	///         `minShares` bounds the SHARES received (donation/ratio-skew defense).
+	/// @notice Add both tokens at the live pool ratio; unused amounts are refunded. Shares are minted
+	///         pro-rata to the liquidity added. `amount0Min/amount1Min` bound the used amounts;
+	///         `minShares` bounds the shares received.
 	function deposit(
 		uint256 amount0Desired,
 		uint256 amount1Desired,
@@ -166,8 +150,7 @@ contract FrostyCompounder is ERC20, Ownable2Step, ReentrancyGuard {
 		emit Deposited(msg.sender, shares, used0, used1);
 	}
 
-	/// @notice Burn shares for the proportional slice of the position — pending fees
-	///         are compounded first, so exits always include the yield earned so far.
+	/// @notice Burn shares for the proportional slice of the position; pending fees are compounded first.
 	function withdraw(uint256 shares, uint256 amount0Min, uint256 amount1Min)
 		external
 		nonReentrant
@@ -199,9 +182,8 @@ contract FrostyCompounder is ERC20, Ownable2Step, ReentrancyGuard {
 		emit Withdrawn(msg.sender, shares, amount0, amount1);
 	}
 
-	/// @notice Harvest trading fees, take the protocol's cut OF THE YIELD, fold the
-	///         rest back into the shared position. Public — compounding is a favor to
-	///         every holder, and more callers just means fresher share value.
+	/// @notice Harvest fees, take the protocol's cut of the yield, add the rest back to the
+	///         position. Anyone may call it.
 	function compound() external nonReentrant {
 		_compound();
 	}
@@ -256,8 +238,7 @@ contract FrostyCompounder is ERC20, Ownable2Step, ReentrancyGuard {
 
 	// ─── Views ───────────────────────────────────────────────────────────────────
 
-	/// @notice The shared position's current liquidity + uncompounded fees — share
-	///         value = liquidity / totalSupply (1 share = 1 liquidity unit forever).
+	/// @notice The shared position's liquidity and uncompounded fees; share value = liquidity / totalSupply.
 	function positionState()
 		external
 		view
@@ -267,7 +248,7 @@ contract FrostyCompounder is ERC20, Ownable2Step, ReentrancyGuard {
 		(,,,,,,, liquidity,,, pendingFees0, pendingFees1) = positionManager.positions(tokenId);
 	}
 
-	// ─── Protocol controls (fee switch — capped, yield-only by construction) ─────
+	// ─── Protocol controls ───────────────────────────────────────────────────────
 
 	function setPerfFee(uint16 bps) external onlyOwner {
 		if (bps > MAX_PERF_FEE_BPS) revert FeeTooHigh();

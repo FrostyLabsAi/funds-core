@@ -7,9 +7,8 @@ import {AggregatorV3Interface} from '../interfaces/AggregatorV3Interface.sol';
 import {TickMath} from '../libraries/TickMath.sol';
 import {LiquidityAmounts} from '../libraries/LiquidityAmounts.sol';
 
-/// @notice The oracle surface Uniswap v3 AND Aerodrome Slipstream pools share (both verified
-///         live on Base 2026-09-24: `observe(uint32[])` and a slot0 whose first two words are
-///         (sqrtPriceX96, tick) — the rest of slot0 differs, so it is read raw).
+/// @notice The oracle surface Uniswap v3 and Aerodrome Slipstream pools share. slot0 differs
+///         beyond (sqrtPriceX96, tick), so it is read raw.
 interface IConcentratedPoolOracle {
 	function token0() external view returns (address);
 	function token1() external view returns (address);
@@ -23,35 +22,20 @@ interface IConcentratedPoolOracle {
 }
 
 /// @title TwapAggregatorAdapter
-/// @notice Prices ONE asset from its concentrated-liquidity pool's own oracle — the
-///         time-weighted average over `window` — composed with a Chainlink feed for the pool's
-///         other token, exposed as an AggregatorV3 feed so the ValueInterpreter prices it
-///         through the ordinary `addPrimitive` path (like PythAggregatorAdapter).
-///         The fourth price tier: Chainlink → Pyth/RedStone → TWAP → side pocket
-///         (docs/design/twap-oracle.md).
-/// @dev Guards that REVERT (a revert pauses NAV-dependent actions of funds holding the asset
-///      until it clears; in-kind redemption never prices and stays open):
-///      1. WINDOW ≥ 30 min — holding a pool off-price for the whole window costs the
-///         attacker every arbitrage in it.
-///      2. SPOT vs TWAP within `maxDeviationBps` — a pool pushed off-price, or a real move
-///         the average has not caught up to, pauses pricing for minutes instead of dealing
-///         at a stale mark; it clears as the average converges.
-///      3. QUOTE LEG: Chainlink answer > 0 and within `quoteHeartbeat`.
-///      4. OBSERVATIONS must cover the full window (young pool / low cardinality reverts).
-///      The LIQUIDITY FLOOR does NOT revert (founder decision 2026-09-24): under the floor the
-///      price stays the market price and `isBelowFloor()` reports it — the registry starts a
-///      72-hour clock, the manager is warned, and after 72h the exposure policy pauses NEW
-///      deposits until the fund exits. Safe to keep pricing because the exposure caps bound
-///      how much of NAV a thin pool can move. Depth is the USD held within ±10% of the TWAP
-///      price, the LOWER of (a) the window's HARMONIC-MEAN in-range liquidity spread over the
-///      band (a liquidity pull drags it down) and (b) what the pool's CURRENT liquidity actually
-///      holds inside the band, summed segment by segment across initialized ticks. (a) alone
-///      let a tight range around spot read as band-wide depth — $4k read as +$33k on a Base
-///      fork (security review 2026-09-24, M-1); (b) alone is instantaneous. Faking depth now
-///      takes holding liquidity for the window AND real liquidity across the band at the
-///      moment of the check (residual: supplied within that same transaction).
-///      Answers carry 18 decimals (the VI reads `decimals()`), so sub-cent tokens keep
-///      precision; `updatedAt` is the read's own timestamp — the price IS computed now.
+/// @notice Prices one asset from its concentrated-liquidity pool's time-weighted average over
+///         `window`, times a Chainlink feed for the pool's other token, exposed as an
+///         AggregatorV3 feed (18 decimals, so sub-cent tokens keep precision).
+/// @dev Reverting guards (a revert pauses NAV-dependent actions of funds holding the asset;
+///      in-kind redemption never prices):
+///      1. window ≥ 30 min — holding a pool off-price that long costs every arbitrage in it;
+///      2. spot within `maxDeviationBps` of the TWAP;
+///      3. quote feed answer > 0 and within `quoteHeartbeat`;
+///      4. observations cover the full window.
+///      The liquidity floor does not revert: `isBelowFloor()` reports it, the registry runs a
+///      72-hour clock, and the exposure caps bound what a thin pool can move. Depth = USD within
+///      ±10% of the price, the lower of the window's harmonic-mean liquidity over the band and
+///      what current liquidity actually holds in the band, so a tight range around spot cannot
+///      pose as band-wide depth. `updatedAt` is the read's own timestamp.
 contract TwapAggregatorAdapter is AggregatorV3Interface {
 	uint32 public constant MIN_WINDOW = 30 minutes;
 	uint16 public constant MAX_DEVIATION_BPS = 2_000;
@@ -131,8 +115,7 @@ contract TwapAggregatorAdapter is AggregatorV3Interface {
 		return ANSWER_DECIMALS;
 	}
 
-	/// @notice USD per whole `asset`, 18 decimals — the reverting guards enforced (the
-	///         liquidity floor is reported by `isBelowFloor`, not enforced here).
+	/// @notice USD per whole `asset` (18 decimals), reverting guards applied.
 	/// @inheritdoc AggregatorV3Interface
 	function latestRoundData()
 		external
@@ -155,9 +138,8 @@ contract TwapAggregatorAdapter is AggregatorV3Interface {
 		updatedAt = block.timestamp;
 	}
 
-	/// @notice The window's ±10% depth in USD (18 decimals), guards NOT applied — the
-	///         liquidity figure exposure caps are measured against. Reverts only if the
-	///         pool cannot serve the window or the quote feed is unusable.
+	/// @notice The ±10% depth in USD (18 decimals) that exposure caps are measured against;
+	///         price guards not applied.
 	function poolDepthUsd() external view returns (uint256) {
 		return _depthUsd();
 	}
@@ -167,14 +149,14 @@ contract TwapAggregatorAdapter is AggregatorV3Interface {
 		return _depthUsd() < minLiquidityUsd * 1e18;
 	}
 
-	/// @notice The USD the pool's CURRENT liquidity actually holds inside ±10% of spot
-	///         (segment by segment across initialized ticks — no uniform-liquidity assumption).
+	/// @notice USD the pool's current liquidity holds within ±10% of spot, summed across
+	///         initialized ticks.
 	function spotBandDepthUsd() external view returns (uint256) {
 		(int24 meanTick,) = _consult();
 		return _spotBandDepthUsd18(meanTick, _quoteUsd18());
 	}
 
-	/// @dev min(window-weighted depth, actual current band depth) — see the contract notes (M-1)
+	/// @dev min(window-weighted depth, current band depth)
 	function _depthUsd() internal view returns (uint256) {
 		(int24 meanTick, uint128 meanLiquidity) = _consult();
 		uint256 quoteUsd18 = _quoteUsd18();
@@ -192,9 +174,8 @@ contract TwapAggregatorAdapter is AggregatorV3Interface {
 		uint256 amount1;
 	}
 
-	/// @dev Walks the initialized ticks inside [spot − 10%, spot + 10%] (Uniswap v3 and
-	///      Slipstream share tickBitmap / ticks().liquidityNet / tickSpacing) outward from the
-	///      current price, summing each segment's token amounts at its own active liquidity.
+	/// @dev Walks the initialized ticks within ±10% of spot outward from the current price,
+	///      summing each segment's token amounts at its active liquidity.
 	function _spotBandDepthUsd18(int24 meanTick, uint256 quoteUsd18) internal view returns (uint256) {
 		(bool ok, bytes memory data) = address(pool).staticcall(abi.encodeWithSignature('slot0()'));
 		if (!ok || data.length < 64) revert ObservationWindowUnavailable();
@@ -278,8 +259,8 @@ contract TwapAggregatorAdapter is AggregatorV3Interface {
 		if (tick < 0 && tick % spacing != 0) compressed--;
 	}
 
-	/// @notice Arithmetic-mean tick and harmonic-mean liquidity over `window`
-	///         (Uniswap OracleLibrary.consult semantics, rounding the tick toward −∞).
+	/// @notice Arithmetic-mean tick (rounded toward −∞) and harmonic-mean liquidity over `window`.
+	/// @dev Semantics of Uniswap OracleLibrary.consult.
 	function consult() external view returns (int24 meanTick, uint128 harmonicMeanLiquidity) {
 		return _consult();
 	}
@@ -340,7 +321,7 @@ contract TwapAggregatorAdapter is AggregatorV3Interface {
 	}
 
 	/// @dev `baseAmount` of one pool token → the other token at `tick` (raw units).
-	///      Uniswap OracleLibrary.getQuoteAtTick, on OZ mulDiv.
+	///      Adapted from Uniswap OracleLibrary.getQuoteAtTick.
 	function _convertAtTick(int24 tick, uint128 baseAmount, bool baseIsToken0) internal pure returns (uint256) {
 		uint160 sqrtRatioX96 = TickMath.getSqrtRatioAtTick(tick);
 		if (sqrtRatioX96 <= type(uint128).max) {

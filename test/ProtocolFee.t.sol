@@ -12,11 +12,9 @@ import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {ProtocolFeeReserve} from '../src/core/ProtocolFeeReserve.sol';
 import {MockERC20, MockAggregator} from './utils/Mocks.sol';
 
-/// @notice Protocol AUM fee + FROST-burn buyback (founder decision 2026-09-22, Enzyme v4
-///         ProtocolFeeTracker/ProtocolFeeReserve port): factory-set bps/yr of share
-///         supply minted to the protocol recipient at every fee settlement, with an
-///         optional manager-triggered buyback that burns FROST worth HALF the shares'
-///         value and destroys the shares.
+/// @notice Protocol AUM fee + FROST-burn buyback: factory-set bps/yr of share supply minted
+///         to the protocol recipient at every fee settlement, with an optional manager-triggered
+///         buyback that burns FROST worth HALF the shares' value and destroys the shares.
 contract ProtocolFeeTest is Test {
 	uint256 internal constant SECONDS_IN_YEAR = 31_557_600;
 	address internal constant DEAD = 0x000000000000000000000000000000000000dEaD;

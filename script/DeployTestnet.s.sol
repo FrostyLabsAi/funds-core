@@ -70,10 +70,8 @@ contract DeployTestnet is Script {
 		interpreter.addZeroPricedAsset(address(moonDemo));
 	}
 
-	/// @dev Protocol AUM fee (25 bps/yr, Enzyme-precedented) paid to the ProtocolFeeReserve,
-	///      which prices the 50% FROST-burn buyback. FROST_TOKEN env = the real token
-	///      (mainnet: also register its VI feed); default is a mintable mock + $0.50 feed
-	///      so the buyback path is exercisable on testnet.
+	/// @dev Protocol AUM fee (25 bps/yr) to the ProtocolFeeReserve, which prices the 50%
+	///      FROST-burn buyback. FROST_TOKEN env = the real token; default is a mock + $0.50 feed.
 	function _deployProtocolFee() internal {
 		frostAddress = vm.envOr('FROST_TOKEN', address(0));
 		if (frostAddress == address(0)) {

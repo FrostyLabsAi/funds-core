@@ -12,6 +12,7 @@ import {AggregatorV3Interface} from '../../src/interfaces/AggregatorV3Interface.
 import {IVerantaMulticall} from '../../src/interfaces/external/IVeranta.sol';
 import {VerantaPerpPositionV2} from '../../src/positions/VerantaPerpPositionV2.sol';
 import {TwapListingRegistry} from '../../src/pricing/TwapListingRegistry.sol';
+import {ProtocolFeeReserve} from '../../src/core/ProtocolFeeReserve.sol';
 import {MockERC20} from '../utils/Mocks.sol';
 import {FundsMainnet} from '../../script/mainnet/FundsMainnet.sol';
 import {FundsGovernance} from '../../script/mainnet/FundsGovernance.sol';
@@ -216,5 +217,145 @@ contract FundsMainnetGenesisForkTest is Test {
 		(, int256 answer,,,) = AggregatorV3Interface(feed).latestRoundData();
 		uint256 expected = uint256(answer) / 100; // 8-dp USD → 6-dp USDC (USDC itself ≈ $1)
 		assertApproxEqRel(d.valueInterpreter.calcCanonicalAssetValue(asset, unit, FundsMainnet.USDC), expected, 0.01e18);
+	}
+}
+
+/// @notice THE SAME GENESIS WITHOUT FROST (founder decision 2026-09-28: FrostyFunds launches
+///         first): no fee reserve, protocol fee off, the handoff moves the four remaining owners
+///         — then FROST arrives and governance turns the fee on with ONE timelock batch
+///         (`settleFees()` on every live fund, then `setProtocolFee`). A fund left out of that
+///         batch is charged for the whole time the fee was off, which is why the batch must
+///         name every fund.
+///         Run: BASE_MAINNET_RPC=<url> forge test --match-contract FundsMainnetGenesisNoFrostForkTest -vv
+contract FundsMainnetGenesisNoFrostForkTest is Test {
+	address internal constant SAFE = 0xB0f37bE90a8BD82D991Bf694F960C67198778B8B; // live 2-of-3 on Base
+	uint16 internal constant FEE_BPS = 25;
+	uint256 internal constant YEAR = 365 days;
+
+	bool internal forked;
+	address internal deployer = makeAddr('deployer');
+	address internal keeper = makeAddr('autopilotKeeper');
+	address internal manager = makeAddr('manager');
+	address internal alice = makeAddr('alice');
+	TimelockController internal timelock;
+	FundsMainnet.Deployed internal d;
+
+	function setUp() public {
+		string memory rpc = vm.envOr('BASE_MAINNET_RPC', string(''));
+		if (bytes(rpc).length == 0) return;
+		vm.createSelectFork(rpc);
+		forked = true;
+
+		// DeployFundsTimelock's shape: Safe proposes/cancels, anyone executes, no admin
+		address[] memory proposers = new address[](1);
+		proposers[0] = SAFE;
+		address[] memory executors = new address[](1);
+		executors[0] = address(0);
+		timelock = new TimelockController(2 days, proposers, executors, address(0));
+
+		vm.startPrank(deployer);
+		d = FundsMainnet.deploy(_config(address(0), 0));
+		vm.stopPrank();
+	}
+
+	function test_fork_noFrost_noReserveAndTheFeeIsOff() public {
+		vm.skip(!forked);
+		assertEq(address(d.feeReserve), address(0));
+		assertEq(d.factory.protocolFeeBps(), 0);
+		assertEq(d.factory.protocolFeeRecipient(), address(0));
+		assertEq(FundsGovernance.owned(d).length, 4);
+	}
+
+	function test_fork_noFrost_aFeeWithoutFrostIsRefused() public {
+		vm.skip(!forked);
+		vm.expectRevert(FundsMainnet.BadConfig.selector);
+		this.deployExternal(_config(address(0), FEE_BPS));
+	}
+
+	function test_fork_noFrost_handoffThenTheFeeTurnsOnWithoutBackCharging() public {
+		vm.skip(!forked);
+		Comptroller settled = _fundWithDeposit('Settled In The Batch', 'frIN', 10_000e6);
+		Comptroller leftOut = _fundWithDeposit('Left Out Of The Batch', 'frOUT', 10_000e6);
+
+		// handoff — four owners, no reserve
+		vm.startPrank(deployer);
+		FundsGovernance.start(d, address(timelock), deployer);
+		vm.stopPrank();
+		(address[] memory targets, uint256[] memory values, bytes[] memory payloads) = FundsGovernance.acceptBatch(d);
+		assertEq(targets.length, 4);
+		vm.prank(SAFE);
+		timelock.scheduleBatch(targets, values, payloads, bytes32(0), keccak256('handoff'), 2 days);
+		skip(2 days);
+		timelock.executeBatch(targets, values, payloads, bytes32(0), keccak256('handoff'));
+		FundsGovernance.verify(d, address(timelock), SAFE, deployer, keeper);
+
+		// half a year with the fee off — nobody touches either fund
+		skip(180 days);
+
+		// FROST launches; its reserve is owned by the timelock from the start
+		MockERC20 frost = new MockERC20('FROST stand-in', 'FROST', 18);
+		ProtocolFeeReserve reserve = new ProtocolFeeReserve(address(frost), address(timelock));
+
+		// ONE batch: settle every live fund (only `settled` here, on purpose), then turn the fee on
+		address[] memory t = new address[](2);
+		bytes[] memory p = new bytes[](2);
+		t[0] = address(settled);
+		p[0] = abi.encodeCall(Comptroller.settleFees, ());
+		t[1] = address(d.factory);
+		p[1] = abi.encodeCall(FundFactory.setProtocolFee, (FEE_BPS, address(reserve)));
+		vm.prank(SAFE);
+		timelock.scheduleBatch(t, new uint256[](2), p, bytes32(0), keccak256('fee on'), 2 days);
+		skip(2 days);
+		timelock.executeBatch(t, new uint256[](2), p, bytes32(0), keccak256('fee on'));
+		assertEq(d.factory.protocolFeeBps(), FEE_BPS);
+		assertEq(d.factory.protocolFeeRecipient(), address(reserve));
+
+		// 30 days with the fee on, then both funds settle
+		skip(30 days);
+		settled.settleFees();
+		leftOut.settleFees();
+
+		uint256 settledFee = IERC20(address(settled.shares())).balanceOf(address(reserve));
+		uint256 leftOutFee = IERC20(address(leftOut.shares())).balanceOf(address(reserve));
+		uint256 supply = 10_000e18; // $10k at the $1 bootstrap price (bootstrap shares included)
+		// the batched fund pays for the 30 days the fee was on — nothing more
+		assertApproxEqRel(settledFee, (supply * FEE_BPS * 30 days) / (YEAR * 10_000), 0.01e18);
+		// the fund left out pays for everything since its deposit (2 + 180 + 2 + 30 days)
+		assertApproxEqRel(leftOutFee, (supply * FEE_BPS * 214 days) / (YEAR * 10_000), 0.01e18);
+	}
+
+	/// @dev external so a config revert can be expected (library calls are inlined)
+	function deployExternal(FundsMainnet.Config memory cfg) external returns (FundsMainnet.Deployed memory) {
+		return FundsMainnet.deploy(cfg);
+	}
+
+	function _config(address frost, uint16 feeBps) internal view returns (FundsMainnet.Config memory) {
+		return FundsMainnet.Config({deployer: deployer, safe: SAFE, frost: frost, autopilotKeeper: keeper, protocolFeeBps: feeBps});
+	}
+
+	function _fundWithDeposit(string memory name, string memory symbol, uint256 amount) internal returns (Comptroller fund) {
+		fund = Comptroller(
+			d.factory.createFund(
+				FundFactory.FundConfig({
+					name: name,
+					symbol: symbol,
+					denominationAsset: IERC20(FundsMainnet.USDC),
+					fundOwner: manager,
+					mgmtScaledPerSecondRate: 0,
+					perfFeeBps: 0,
+					sharesActionTimelock: 0,
+					minRequestDuration: 1 minutes,
+					executionWindow: 1 days,
+					allowRiskyAssets: false
+				})
+			)
+		);
+		deal(FundsMainnet.USDC, alice, amount);
+		vm.startPrank(alice);
+		IERC20(FundsMainnet.USDC).approve(address(fund), amount);
+		fund.requestDeposit(amount);
+		vm.stopPrank();
+		skip(1 minutes);
+		fund.executeDepositRequest(alice);
 	}
 }

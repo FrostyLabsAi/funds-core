@@ -3,13 +3,8 @@ pragma solidity 0.8.24;
 
 /// @title IIntegrationAdapter
 /// @notice Venue adapter for fund trading, invoked only via Comptroller.callOnIntegration.
-/// @dev Successor to melon-v1 ExchangeAdapter (melon-v1/src/exchanges/ExchangeAdapter.sol),
-///      shaped by Enzyme v4's IntegrationManager adapter model
-///      (spec/architecture/release.md#integrationmanager).
-///      Flow: the Comptroller transfers spend assets to the adapter, calls executeAction,
-///      and verifies the vault received at least minIncomingAmounts of each incoming asset
-///      (measured by balance delta — the adapter's own claims are never trusted for
-///      accounting). Adapters are protocol-curated via the FundFactory registry.
+/// @dev The Comptroller sends spend assets to the adapter, calls executeAction, then checks the
+///      vault's balance deltas against minIncomingAmounts (the adapter is never trusted for accounting).
 interface IIntegrationAdapter {
 	/// @notice Describe the asset flows of an action before execution.
 	function parseAssetsForAction(bytes calldata integrationData)

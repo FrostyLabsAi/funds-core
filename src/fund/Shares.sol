@@ -8,10 +8,8 @@ interface ISharesTransferValidator {
 }
 
 /// @title Shares
-/// @notice Fund share token. Mint/burn only by the fund's Comptroller; transfers are validated
-///         by the Comptroller (sharesActionTimelock + PreTransferShares policies).
-/// @dev Successor to melon-v1 Shares (melon-v1/src/fund/shares/Shares.sol). 18 decimals,
-///      per spec/topics/fund-holdings.md#shares.
+/// @notice Fund share token (18 decimals). Only the fund's Comptroller mints and burns;
+///         transfers are validated by it (sharesActionTimelock + PreTransferShares policies).
 contract Shares is ERC20 {
 	address public immutable factory;
 	address public comptroller;
@@ -35,9 +33,7 @@ contract Shares is ERC20 {
 		comptroller = comptroller_;
 	}
 
-	/// @dev Reconfiguration support: the factory swaps in a fund's new Comptroller
-	///      (spec/topics/creation-migration-reconfiguration.md). The old Comptroller loses
-	///      all mint/burn rights atomically.
+	/// @dev Reconfiguration: the factory swaps in the new Comptroller; the old one loses mint/burn rights.
 	function migrateComptroller(address newComptroller) external {
 		if (msg.sender != factory) revert OnlyFactory();
 		if (newComptroller == address(0)) revert ZeroAddress();

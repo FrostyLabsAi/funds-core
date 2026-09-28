@@ -8,21 +8,14 @@ import {Ownable2Step} from '@openzeppelin/contracts/access/Ownable2Step.sol';
 import {IProtocolFeeReserve} from '../interfaces/IProtocolFeeReserve.sol';
 
 /// @title ProtocolFeeReserve
-/// @notice Receives protocol AUM-fee shares (set as the FundFactory's protocol-fee
-///         recipient) and prices their buyback: a fund manager burns FROST worth HALF the
-///         shares' market value and the shares are burned, un-diluting the fund. Protocol
-///         revenue arrives as FROST destruction; the reserve never has to sell fund shares.
-/// @dev Port of Enzyme v4's ProtocolFeeReserve (protocol/contracts/persistent/
-///      protocol-fee-reserve/ProtocolFeeReserveLib.sol; the 50% MLN-burn discount).
-///      Deliberately near-stateless: valuation and the actual share-burn/FROST-transfer
-///      happen in the calling Comptroller, which alone has mint/burn/custody authority
-///      over its own fund. A direct call here by a non-fund contract can only emit a
-///      meaningless event — it moves no shares and no FROST. Same trust shape as
-///      Enzyme's `buyBackSharesViaTrustedVaultProxy`.
+/// @notice Receives the protocol AUM-fee shares and prices their buyback: a fund burns FROST
+///         worth half the shares' value and the shares are burned, un-diluting the fund.
+/// @dev Near-stateless: valuation and the actual burns happen in the calling Comptroller, so a
+///      direct call from anything else only emits an event — it moves no shares and no FROST.
 contract ProtocolFeeReserve is Ownable2Step, IProtocolFeeReserve {
 	using SafeERC20 for IERC20;
 
-	/// @notice Burn amount = value / divisor: a 50% discount, matching Enzyme.
+	/// @notice Burn amount = value / divisor (a 50% discount).
 	uint256 public constant BUYBACK_DISCOUNT_DIVISOR = 2;
 
 	/// @notice The asset burned in buybacks (FROST).
@@ -49,8 +42,7 @@ contract ProtocolFeeReserve is Ownable2Step, IProtocolFeeReserve {
 		emit SharesBoughtBack(msg.sender, sharesAmount, burnAssetValue, amountToBurn);
 	}
 
-	/// @notice Treasury operations on accrued fee shares (or any token sent here):
-	///         transfer out to redeem via the fund, sell, or distribute. Owner only.
+	/// @notice Owner moves accrued fee shares (or any token sent here) out.
 	function withdrawToken(address token, address to, uint256 amount) external onlyOwner {
 		if (to == address(0)) revert ZeroAddress();
 		IERC20(token).safeTransfer(to, amount);

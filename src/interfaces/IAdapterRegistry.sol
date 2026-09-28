@@ -6,8 +6,7 @@ interface IAdapterRegistry {
 	function isAdapterRegistered(address adapter) external view returns (bool);
 }
 
-/// @notice The Comptroller's view of the FundFactory's protocol AUM-fee configuration
-///         (live-read at every fee settlement; the factory bytecode-caps the rate).
+/// @notice The Comptroller's view of the FundFactory's protocol AUM-fee config, read at every settlement.
 interface IProtocolFeeConfig {
 	function getProtocolFeeConfig() external view returns (uint256 feeBps, address recipient);
 }

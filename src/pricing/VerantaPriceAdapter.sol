@@ -5,13 +5,11 @@ import {AggregatorV3Interface} from '../interfaces/AggregatorV3Interface.sol';
 import {VerantaPriceStore} from './VerantaPriceStore.sol';
 
 /// @title VerantaPriceAdapter
-/// @notice One Veranta pair's price from a VerantaPriceStore, exposed as a Chainlink AggregatorV3
-///         feed (8 decimals) — registered as a VI primitive on the pair's PriceMarker, it values a
-///         fund's perp leg at the price Veranta settles it at.
-/// @dev STALENESS mirrors RedstoneAggregatorAdapter: `updatedAt` is the feed's own update time
-///      (the VI heartbeat gates it), and `maxPushAge` bounds how old a stored print may be before
-///      reads revert — relaying is permissionless, so a 24/7 pair must not be readable at a print
-///      someone chose not to refresh (1h for crypto; closed-market pairs get a weekend-long age).
+/// @notice One Veranta pair's price from a VerantaPriceStore exposed as a Chainlink AggregatorV3
+///         feed (8 decimals); registered on the pair's PriceMarker, it values a perp leg at
+///         Veranta's settlement price.
+/// @dev `maxPushAge` bounds the stored print's age: relaying is permissionless, so a pair must not
+///      stay readable at a print nobody refreshed (1h crypto; closed markets get a weekend).
 contract VerantaPriceAdapter is AggregatorV3Interface {
 	uint8 internal constant DECIMALS = 8;
 

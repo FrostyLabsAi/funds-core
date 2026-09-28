@@ -6,12 +6,8 @@ import {IPolicy} from '../interfaces/IPolicy.sol';
 import {Comptroller} from '../core/Comptroller.sol';
 
 /// @title MaxPositionsPolicy
-/// @notice After any adapter trade, the fund may hold at most N distinct non-denomination
-///         assets (nonzero vault balance). The last of melon's six risk-profile policies
-///         (melon-v1 MaxPositions) ported — completes 1:1 ruleset parity.
-/// @dev Immutable bound — deploy a new instance to change it. The calling fund is
-///      msg.sender (its Comptroller). External positions are counted separately as one
-///      position each (a hedge account is a position like any other).
+/// @notice After any adapter trade, the fund may hold at most N distinct non-denomination assets.
+/// @dev Immutable bound — deploy a new instance to change it. Each external position counts as one.
 contract MaxPositionsPolicy is IPolicy {
 	uint256 public immutable maxPositions;
 

@@ -4,11 +4,8 @@ pragma solidity 0.8.24;
 import {IPolicy} from '../interfaces/IPolicy.sol';
 
 /// @title AllowedExternalPositionTypesPolicy
-/// @notice Restricts which external position types a fund may create. The primary use is a
-///         fund committing to investors that it uses NO external positions (empty list) or
-///         only specific ones (e.g., only HyperliquidPerp), per v4's
-///         AllowedExternalPositionTypesPolicy (spec/topics/policies.md).
-/// @dev Immutable set, fixed at deployment — deploy a new instance to change it.
+/// @notice Restricts which external position types a fund may create (an empty list = none).
+/// @dev Immutable set — deploy a new instance to change it.
 contract AllowedExternalPositionTypesPolicy is IPolicy {
 	mapping(uint256 typeId => bool) public isAllowedType;
 

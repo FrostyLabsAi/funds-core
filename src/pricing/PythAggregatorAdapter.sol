@@ -5,29 +5,13 @@ import {AggregatorV3Interface} from '../interfaces/AggregatorV3Interface.sol';
 import {IPyth} from '../interfaces/external/IPyth.sol';
 
 /// @title PythAggregatorAdapter
-/// @notice One Pyth Core price id, exposed as a Chainlink AggregatorV3 feed — so the
-///         ValueInterpreter prices Pyth-covered assets (oil, indexes, FX, long-tail equities)
-///         through the exact same `addPrimitive` path as Chainlink, with ZERO protocol changes.
-///         Chainlink stays primary wherever both exist (B20 equities, crypto majors, XAU/XAG);
-///         these adapters fill the rest of the 120-pair Veranta universe.
-/// @dev Design decisions (all fork-verified against the real Base deployment):
-///      - STALENESS is two-layered: the VI's per-asset heartbeat stays the market-hours
-///        gate (`updatedAt` = Pyth publishTime), and the adapter's own `maxPushAge`
-///        additionally bounds how OLD a stored push may be (security review 2026-09-22,
-///        H-3: `updatePriceFeeds` is permissionless and Hermes serves history, so a wide
-///        heartbeat alone lets an actor pick any print inside it around GAV actions —
-///        the keeper must push fresher than maxPushAge before GAV-dependent calls). Any
-///        other consumer of this adapter MUST check `updatedAt`, per AggregatorV3
-///        convention.
-///      - CONFIDENCE is guarded here (AggregatorV3 has no conf channel): a read where
-///        Pyth's confidence interval exceeds `maxConfBps` of price reverts — chaotic
-///        prints block GAV rather than mispricing it. In-kind redemption never prices.
-///      - EXPONENTS VARY per feed (ETH/USD -8, TSLA/USD and EUR/USD -5 — live-read) so
-///        every answer is normalized to 8 decimals, the Chainlink USD convention.
-///      - Pyth is a PULL oracle: the stored price is only as fresh as the last permissionless
-///        `updatePriceFeeds` push. Long-tail feeds on Base sit stale for months (TSLA ~78d at
-///        adapter-authoring time) — the keeper pushes Hermes payloads before GAV-dependent
-///        actions on Pyth-priced assets. Until pushed, reads correctly revert as stale.
+/// @notice One Pyth Core price id exposed as a Chainlink AggregatorV3 feed (8 decimals), so the
+///         ValueInterpreter prices Pyth-covered assets through the same `addPrimitive` path.
+/// @dev - `updatedAt` = Pyth publishTime (the VI heartbeat gates it); `maxPushAge` also bounds the
+///        stored push's age, because pushes are permissionless and Hermes serves history — without
+///        it an actor could pick an old print around GAV actions. The keeper pushes before those.
+///      - Reads revert when Pyth's confidence interval exceeds `maxConfBps` of price.
+///      - Exponents vary per feed; every answer is normalized to 8 decimals.
 contract PythAggregatorAdapter is AggregatorV3Interface {
 	uint256 private constant BPS_DENOM = 10_000;
 	int32 private constant TARGET_EXPO = -8;
@@ -37,8 +21,8 @@ contract PythAggregatorAdapter is AggregatorV3Interface {
 	bytes32 public immutable priceId;
 	/// @notice Max Pyth confidence interval as bps of price before reads revert.
 	uint16 public immutable maxConfBps;
-	/// @notice Max age of the stored Pyth push before reads revert — the anti-cherry-pick
-	///         bound; keep it far tighter than the VI heartbeat.
+	/// @notice Max age of the stored Pyth push before reads revert; keep it far tighter than the
+	///         VI heartbeat.
 	uint32 public immutable maxPushAge;
 	string public description;
 

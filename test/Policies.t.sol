@@ -16,8 +16,8 @@ import {MaxPositionsPolicy} from '../src/policies/MaxPositionsPolicy.sol';
 import {UnrestrictedMandatePolicy} from '../src/policies/UnrestrictedMandatePolicy.sol';
 import {MockERC20, MockAggregator} from './utils/Mocks.sol';
 
-/// @notice Policies are SET-ONCE (melon model): every test registers its ruleset at
-///         creation via createFund(config, policies) — there is no post-launch path.
+/// @notice Policies are set once: every test registers its ruleset at creation via
+///         createFund(config, policies) — there is no post-launch path.
 contract PoliciesTest is Test {
 	FundFactory internal factory;
 	ValueInterpreter internal interpreter;

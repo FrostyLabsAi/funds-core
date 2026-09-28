@@ -2,9 +2,7 @@
 pragma solidity 0.8.24;
 
 /// @notice Aerodrome Slipstream CLGauge (subset used by SlipstreamLPPosition).
-/// @dev Verified against aerodrome-finance/slipstream gauge. Staking a position surrenders
-///      its trading fees to veAERO voters in exchange for AERO emissions (see living doc,
-///      Slipstream fee mechanics).
+/// @dev Staking a position gives its trading fees to veAERO voters in exchange for AERO emissions.
 interface ICLGauge {
 	function deposit(uint256 tokenId) external;
 

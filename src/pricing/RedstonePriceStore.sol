@@ -4,25 +4,18 @@ pragma solidity 0.8.24;
 import {ECDSA} from '@openzeppelin/contracts/utils/cryptography/ECDSA.sol';
 
 /// @title RedstonePriceStore
-/// @notice On-chain store for RedStone signed price packages (pull oracle, like Pyth Core):
-///         anyone may submit a feed's packages; the store verifies each signature against
-///         the data service's fixed signer set, requires `threshold` distinct signers on one
-///         shared timestamp, and stores the MEDIAN. RedstoneAggregatorAdapter exposes a
-///         stored feed as an AggregatorV3 for the ValueInterpreter.
-/// @dev Our own implementation of the published package format — no RedStone code. The
-///      format was verified 2026-09-24 by recovering the signer of every one of 4,794 live
-///      redstone-primary-prod price packages (gateway JSON):
+/// @notice Store for RedStone signed price packages: anyone submits a feed's packages; the store
+///         verifies each signature against a fixed signer set, requires `threshold` distinct
+///         signers on one timestamp, and stores the median.
+/// @dev Own implementation of the package format (no RedStone code):
 ///        signed bytes = feedId (bytes32, utf8 right-padded) ‖ value (uint256, 8 decimals)
 ///                       ‖ timestampMs (6 bytes) ‖ valueByteSize = 32 (4 bytes) ‖ count = 1 (3 bytes)
-///        signer = ecrecover(keccak256(signed bytes), sig) — raw hash, no EIP-191 prefix.
-///      Signer set + threshold are CONSTRUCTOR-FIXED (config is attack surface): if the data
-///      service rotates signers, deploy a new store and re-point the adapters.
-///      Anti-cherry-pick (security review 2026-09-22, H-3 — same lesson as the Pyth adapter):
-///      a submission must be NEWER than what is stored (no rewinding) and at most
-///      MAX_PACKAGE_AGE old on arrival (no reaching back into gateway history); the adapter's
-///      maxPushAge then bounds how long a stored print may be read.
+///        signer = ecrecover(keccak256(signed bytes), sig), no EIP-191 prefix.
+///      Signers and threshold are fixed at construction; on rotation, deploy a new store.
+///      A submission must be newer than the stored one and at most MAX_PACKAGE_AGE old, so no one
+///      can rewind the price or reach back into gateway history.
 contract RedstonePriceStore {
-	/// @dev RedStone's own consumer defaults (RedstoneDefaultsLib): 3 min delay, 1 min ahead
+	/// @dev RedStone's own consumer defaults: 3 min old, 1 min ahead
 	uint256 public constant MAX_PACKAGE_AGE = 3 minutes;
 	uint256 public constant MAX_PACKAGE_AHEAD = 1 minutes;
 	uint256 private constant MAX_SIGNERS = 32;
@@ -65,7 +58,7 @@ contract RedstonePriceStore {
 	}
 
 	/// @notice Store one feed's price from its signed packages (one value + signature per signer,
-	///         all on the same timestamp — the gateway serves them that way).
+	///         all on the same timestamp).
 	function update(bytes32 feedId, uint64 timestampMs, uint256[] calldata values, bytes[] calldata signatures) public {
 		if (values.length != signatures.length) revert LengthMismatch();
 		if (values.length < threshold) revert NotEnoughSigners(values.length, threshold);
@@ -123,8 +116,7 @@ contract RedstonePriceStore {
 		return keccak256(abi.encodePacked(feedId, value, uint48(timestampMs), uint32(32), uint24(1)));
 	}
 
-	/// @dev median of a small array (insertion sort); even count averages the middle two,
-	///      matching RedStone's own aggregation
+	/// @dev Median via insertion sort; an even count averages the middle two (as RedStone does)
 	function _median(uint256[] memory a) internal pure returns (uint256) {
 		for (uint256 i = 1; i < a.length; ++i) {
 			uint256 key = a[i];

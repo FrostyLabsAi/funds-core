@@ -307,7 +307,7 @@ contract FundFlowsTest is Test {
 		assertEq(frozen.balanceOf(address(comptroller.vault())), 100e18); // untouched
 		assertEq(frozen.balanceOf(alice), 0);
 
-		// Holdings views (melon-v1 Accounting ports)
+		// Holdings views
 		(address[] memory assets, uint256[] memory balances) = comptroller.getFundHoldings();
 		assertEq(assets.length, 2);
 		assertEq(balances[0], 500e6);

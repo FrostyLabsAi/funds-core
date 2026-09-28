@@ -2,21 +2,15 @@
 pragma solidity 0.8.24;
 
 /// @title Veranta (ex-Avantis) v2 external interfaces
-/// @notice Transcribed from the VERIFIED proxies on Base mainnet (checked 2026-09-14):
-///         TradingRouter `0x44914408af82bC9983bbb330e3578E1105e11d4e` (impl TradingRouter),
-///         Multicall     `0xA7cFc43872F4D7B0E6141ee8c36f1F7FEe5d099e` (impl Multicall),
-///         TradingStorage `0x8a311D7048c35985aa31C131B9A13e03a5f7422d` — USDC collateral is
-///         pulled from the trader via allowance to TradingStorage.
-/// @dev Struct member names may differ from Veranta's source (ABI layout is what matters);
-///      notably their `block` members are renamed `blockNumber` here. Scales: USDC 1e6,
-///      prices/leverage/slippage/coinExposure 1e10.
+/// @notice From the verified Base proxies: TradingRouter `0x44914408af82bC9983bbb330e3578E1105e11d4e`,
+///         Multicall `0xA7cFc43872F4D7B0E6141ee8c36f1F7FEe5d099e`, TradingStorage
+///         `0x8a311D7048c35985aa31C131B9A13e03a5f7422d` (USDC collateral is pulled via allowance to it).
+/// @dev Struct member names may differ from Veranta's (ABI layout is what matters; `block` is
+///      `blockNumber` here). Scales: USDC 1e6; prices/leverage/slippage/coinExposure 1e10.
 interface IVerantaTradingRouter {
-	/// @dev FIELD SEMANTICS differ between submission and storage (fork-proven vs live
-	///      trades 2026-09-15; their own source comments initialPosToken "collateral" and
-	///      positionSizeUSDC "dummy"): on SUBMISSION (openTrade) collateral goes in
-	///      positionSizeUSDC; once STORED (openTrades / Multicall rows) collateral lives in
-	///      initialPosToken and positionSizeUSDC holds a dummy. Pending market orders keep
-	///      the submitted form (storePendingMarketOpenOrder stores the struct verbatim).
+	/// @dev Field meaning differs by stage: on submission (openTrade) collateral is in
+	///      positionSizeUSDC; once stored (openTrades / Multicall rows) it is in initialPosToken
+	///      and positionSizeUSDC is a dummy. Pending market orders keep the submitted form.
 	struct Trade {
 		address trader;
 		uint256 pairIndex;
@@ -44,13 +38,10 @@ interface IVerantaTradingRouter {
 	function cancelOpenLimitOrder(uint256 _pairIndex, uint256 _index) external;
 	function cancelPendingMarketOrder(uint256 _order) external;
 
-	/// @dev SINGLE-TX margin change (fork-proven): the caller supplies the Pyth payload and
-	///      the aggregator fulfills inline — no operator round-trip. _type 0=DEPOSIT
-	///      1=WITHDRAW; msg.value must cover pyth.getUpdateFee(priceUpdateData) (0 wei on
-	///      Base today — read it, never hardcode); _priceSourcing 0=PYTH_CORE. An empty
-	///      payload works when the stored Pyth price is <30s old. DEPOSIT pulls USDC from
-	///      the trader and credits collateral minus a small venue fee (~3bps observed);
-	///      WITHDRAW pays the trader only. Delegatable via delegatedAction.
+	/// @dev Single-tx margin change; the caller supplies the Pyth payload. _type 0=DEPOSIT 1=WITHDRAW;
+	///      msg.value covers pyth.getUpdateFee (read it, never hardcode); _priceSourcing 0=PYTH_CORE.
+	///      An empty payload works when the stored Pyth price is <30s old. DEPOSIT pulls USDC and
+	///      credits collateral minus a small venue fee; WITHDRAW pays the trader only. Delegatable.
 	function updateMargin(
 		uint256 _pairIndex,
 		uint256 _index,
@@ -136,11 +127,9 @@ interface IVerantaMulticall {
 		returns (uint256 liquidationPrice, uint256 rolloverFee, int256 unrealisedFundingFee);
 }
 
-/// @notice Veranta TradingStorage per-trader reads (verified source: Sourcify exact match,
-///         Multicall impl 0x8b44d59d2db7b2e191b1388b78465756cab91159 → ITradingStorage).
-///         The cheap path: two count reads per pair, slot reads only where non-zero —
-///         instead of Multicall.getPositions, which scans every pair × maxTradesPerPair
-///         slot (≈1.6–1.9M gas per pair, ≈215M for 135 pairs on Base 2026-09-23).
+/// @notice Veranta TradingStorage per-trader reads (verified via Multicall impl
+///         0x8b44d59d2db7b2e191b1388b78465756cab91159). Two count reads per pair and slot reads only
+///         where non-zero, instead of Multicall.getPositions (~1.6–1.9M gas per pair).
 interface IVerantaTradingStorage {
 	function openTradesCount(address trader, uint256 pairIndex) external view returns (uint256);
 	function openLimitOrdersCount(address trader, uint256 pairIndex) external view returns (uint256);
@@ -161,9 +150,8 @@ interface IVerantaPairStorage {
 	function pairsCount() external view returns (uint256);
 }
 
-/// @notice Veranta Referral (Base 0x1A110bBA13A1f16cCa4b79758BD39290f29De82D; selectors read
-///         from impl 0xe0c63b398d3aae03f0b9e0512384fb14a967053f 2026-09-23). Linking is
-///         caller-scoped: the trader itself must call — a delegate cannot.
+/// @notice Veranta Referral (Base 0x1A110bBA13A1f16cCa4b79758BD39290f29De82D). Linking is
+///         caller-scoped: the trader itself must call; a delegate cannot.
 interface IVerantaReferral {
 	function setTraderReferralCodeByUser(bytes32 code) external;
 	function traderReferralCodes(address trader) external view returns (bytes32);

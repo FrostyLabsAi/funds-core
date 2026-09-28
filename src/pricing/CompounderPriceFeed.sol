@@ -10,16 +10,11 @@ import {LiquidityAmounts} from '../libraries/LiquidityAmounts.sol';
 import {FrostyCompounder} from '../yield/FrostyCompounder.sol';
 
 /// @title CompounderPriceFeed
-/// @notice Derivative feed making FrostyCompounder shares FUND-INVESTABLE: `amount`
-///         shares resolve into the pro-rata slice of the shared position (liquidity
-///         decomposed at the ORACLE-fair price — same manipulation-resistant math as
-///         UniswapV3LPPosition — plus uncompounded fees), which the ValueInterpreter
-///         then prices via its primitive feeds. One instance serves every compounder.
-/// @dev The pool's spot sqrtPrice is never consulted — a manipulated pool cannot move
-///      fund GAV. The perf fee needs no modeling here: it only ever touches harvests,
-///      and pending fees are included gross (the fee bites at compound(), which is a
-///      value TRANSFER out of the position — GAV sees it when it happens, pro-rata,
-///      conservatively small between keeper passes).
+/// @notice Derivative feed for FrostyCompounder shares: a share amount resolves to its pro-rata
+///         slice of the position (liquidity split at the oracle-fair price) plus uncompounded fees.
+///         One instance serves every compounder.
+/// @dev The pool's spot price is never read, so a manipulated pool cannot move GAV. Pending fees
+///      are counted gross; the compounder's perf fee is taken at compound().
 contract CompounderPriceFeed is IDerivativePriceFeed {
 	uint256 private constant Q96 = 0x1000000000000000000000000;
 
@@ -80,8 +75,7 @@ contract CompounderPriceFeed is IDerivativePriceFeed {
 		return ok && ret.length == 96;
 	}
 
-	/// @dev Ported from UniswapV3LPPosition._fairSqrtPriceX96 (frosty-core PriceOracle
-	///      lineage) — oracle USD rates → the pool sqrtPrice the market SHOULD have.
+	/// @dev Oracle USD rates → the sqrtPrice the pool should have (same math as UniswapV3LPPosition).
 	function _fairSqrtPriceX96(uint256 rate0, uint256 rate1, uint256 scale0, uint256 scale1)
 		private
 		pure

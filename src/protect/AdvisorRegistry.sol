@@ -1,18 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
-/// @title AdvisorRegistry
-/// @notice Per-trader advisory preferences for Protect Mode — the trailing-stop
-///         advisor telemetry the keeper sends alongside protection. The advisor
-///         endpoint and payment wallet stay keeper-side (ops config); traders control
-///         whether advice runs for them, how often, and the per-call fee they accept:
-///           unset (updatedAt == 0) → keeper default policy applies;
-///           enabled == false       → no advisory for this trader;
-///           maxFeeMicroUsdc        → cap for PAID x402 advice (USDC 6dp);
-///                                    0 = free transports only, never pay.
-///         Holds no funds and no permissions — same trust model as ProtectRegistry:
-///         the keeper reads it, and the worst a wrong config can do is send or stop
-///         sending advice.
 interface IAdvisableTrader {
 	function comptroller() external view returns (address);
 }
@@ -21,6 +9,11 @@ interface IAdvisorComptroller {
 	function fundOwner() external view returns (address);
 }
 
+/// @title AdvisorRegistry
+/// @notice Per-trader preferences for Protect Mode advice: whether it runs, how often, and the max
+///         fee accepted for paid x402 advice (USDC 6dp; 0 = free only). Unset (updatedAt == 0) =
+///         keeper default.
+/// @dev Holds no funds and no permissions; the keeper only reads it.
 contract AdvisorRegistry {
 	struct Config {
 		bool enabled;
@@ -44,9 +37,8 @@ contract AdvisorRegistry {
 		_configure(msg.sender, enabled, intervalSeconds, maxFeeMicroUsdc);
 	}
 
-	/// @notice FUND flavor: the fund MANAGER sets advisory preferences for the fund's
-	///         own Veranta position (the registered trader). Auth = the position's
-	///         comptroller names msg.sender as fundOwner — same gate as ProtectRegistry.
+	/// @notice Fund flavor: the fund's manager sets preferences for the fund's Veranta position
+	///         (the position's comptroller must name msg.sender as fundOwner).
 	function configureFor(address trader, bool enabled, uint32 intervalSeconds, uint32 maxFeeMicroUsdc) external {
 		_requireFundOwner(trader);
 		_configure(trader, enabled, intervalSeconds, maxFeeMicroUsdc);
@@ -57,7 +49,7 @@ contract AdvisorRegistry {
 		_disable(msg.sender);
 	}
 
-	/// @notice Fund flavor of {disable} — manager-gated like {configureFor}.
+	/// @notice Fund flavor of {disable}, manager-gated like {configureFor}.
 	function disableFor(address trader) external {
 		_requireFundOwner(trader);
 		_disable(trader);

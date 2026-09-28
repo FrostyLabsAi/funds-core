@@ -17,19 +17,12 @@ import {TickMath} from '../libraries/TickMath.sol';
 import {LiquidityAmounts} from '../libraries/LiquidityAmounts.sol';
 
 /// @title SlipstreamLPPosition
-/// @notice External position holding ONE Aerodrome Slipstream CL position NFT — the LP leg
-///         of the delta-neutral strategy. Dual-mode per the living doc:
-///         - UNSTAKED: earns pool fees net of the `unstakedFee` skim (collected to the vault)
-///         - STAKED in the CLGauge: fees go to veAERO voters, AERO emissions accrue instead
-///           (claimed to the vault, where AERO is tracked and priced like any asset)
-/// @dev VALUATION IS THE POINT OF THIS CONTRACT (Gamma lesson #1). The position is split
-///      into token amounts at the FAIR sqrt price implied by the ValueInterpreter's oracle
-///      rates — never the pool's live sqrtPriceX96. `liquidity`/`tickLower`/`tickUpper`
-///      belong to the position; the prices are external; a flash loan that skews the pool
-///      moves this valuation by exactly zero. Ported from frosty-core PriceOracle
-///      (getUniV3PositionValue/_fairSqrtPriceX96), the same math that survived that repo's
-///      audit tooling. Uncollected fees (tokensOwed) and idle balances held here are
-///      included; unclaimed AERO is NOT (conservative; it counts once claimed to the vault).
+/// @notice External position holding one Aerodrome Slipstream CL position NFT, either
+///         unstaked (earns pool fees minus the `unstakedFee` skim) or staked in the pool's
+///         gauge (earns AERO instead; fees go to veAERO voters).
+/// @dev Liquidity is valued at the oracle-fair sqrt price, never the pool's spot price, so a
+///      flash loan that skews the pool can't move it. Uncollected fees and idle balances count;
+///      unclaimed AERO doesn't until it's claimed to the vault.
 contract SlipstreamLPPosition is IExternalPosition, IERC721Receiver {
 	using SafeERC20 for IERC20;
 
@@ -109,9 +102,7 @@ contract SlipstreamLPPosition is IExternalPosition, IERC721Receiver {
 	// ─── IExternalPosition ───────────────────────────────────────────────────────
 
 	/// @inheritdoc IExternalPosition
-	/// @dev Principal split at the ORACLE-implied sqrt price + uncollected tokensOwed +
-	///      idle balances held by this contract. Reverts (via calcUsdRate) on stale feeds —
-	///      the standard market-hours gate.
+	/// @dev Reverts (via calcUsdRate) while a token's feed is stale.
 	function getManagedAssets() external view returns (address[] memory assets, uint256[] memory amounts) {
 		assets = new address[](2);
 		assets[0] = address(token0);
@@ -149,18 +140,15 @@ contract SlipstreamLPPosition is IExternalPosition, IERC721Receiver {
 		amounts = new uint256[](0);
 	}
 
-	/// @notice Aerodrome's CLGauge returns a staked NFT with `safeTransferFrom` on withdraw —
-	///         without this hook Unstake reverts and a staked LP is locked in the gauge forever
-	///         (fork-proven 2026-09-27; mock gauges used a plain transfer and hid it). Only this
-	///         position's own NFT, from its own position manager, is accepted.
+	/// @notice The gauge returns a staked NFT with `safeTransferFrom`, so Unstake needs this hook.
+	///         Only this position's own NFT from its own position manager is accepted.
 	function onERC721Received(address, address, uint256 tokenId_, bytes calldata) external view returns (bytes4) {
 		if (msg.sender != address(positionManager) || tokenId_ != tokenId) revert UnexpectedNft(msg.sender, tokenId_);
 		return IERC721Receiver.onERC721Received.selector;
 	}
 
 	/// @inheritdoc IExternalPosition
-	/// @dev Never: removing liquidity pays out at the pool's live price (sandwichable), so every
-	///      LP action stays priced by the Comptroller's loss measurement.
+	/// @dev Never: removing liquidity pays at the pool's live (sandwichable) price, so every LP action stays priced.
 	function isRiskReducing(bytes calldata) external pure returns (bool) {
 		return false;
 	}
@@ -261,7 +249,7 @@ contract SlipstreamLPPosition is IExternalPosition, IERC721Receiver {
 		emit LiquidityDecreased(liquidity);
 	}
 
-	/// @dev Collects fees + decreased principal STRAIGHT to the vault (never parked here).
+	/// @dev Collects fees and decreased principal straight to the vault.
 	function _collect() private {
 		uint256 activeTokenId = _requireActive();
 		if (staked) revert PositionIsStaked();
@@ -303,7 +291,7 @@ contract SlipstreamLPPosition is IExternalPosition, IERC721Receiver {
 		emit PositionUnstaked(activeTokenId);
 	}
 
-	/// @dev AERO lands here, then goes straight to the vault where it is tracked + priced.
+	/// @dev AERO lands here, then goes straight to the vault.
 	function _claimRewards() private {
 		uint256 activeTokenId = _requireActive();
 		if (address(gauge) == address(0)) revert StakingDisabled();
@@ -330,12 +318,10 @@ contract SlipstreamLPPosition is IExternalPosition, IERC721Receiver {
 		if (activeTokenId == 0) revert NoActivePosition();
 	}
 
-	// ─── Fair pricing (ported from frosty-core PriceOracle._fairSqrtPriceX96) ────
+	// ─── Fair pricing ────────────────────────────────────────────────────────────
 
-	/// @dev The Q64.96 sqrt price implied by oracle rates — where the pool would sit if it
-	///      agreed with the oracles. `ratioX96` is raw-token1-per-raw-token0 scaled by 2^96;
-	///      the two-branch sqrt keeps precision without overflow. Clamped into Uniswap's
-	///      representable range.
+	/// @dev Q64.96 sqrt price implied by the oracle rates (raw token1 per raw token0), clamped
+	///      to the representable range; the two-branch sqrt avoids overflow.
 	function _fairSqrtPriceX96(uint256 rate0, uint256 rate1) private view returns (uint160) {
 		uint256 ratioX96 = Math.mulDiv(Math.mulDiv(rate0, Q96, rate1), scale1, scale0);
 
@@ -350,8 +336,7 @@ contract SlipstreamLPPosition is IExternalPosition, IERC721Receiver {
 
 /// @title SlipstreamLPPositionFactory
 /// @notice Type factory for Slipstream LP positions.
-///         initArgs = abi.encode(token0, token1, tickSpacing, gauge) — gauge may be
-///         address(0) to disable staking (unstaked-mode-only position).
+///         initArgs = abi.encode(token0, token1, tickSpacing, gauge); gauge = address(0) disables staking.
 contract SlipstreamLPPositionFactory is IExternalPositionTypeFactory {
 	ISlipstreamNonfungiblePositionManager public immutable positionManager;
 
@@ -378,18 +363,14 @@ contract SlipstreamLPPositionFactory is IExternalPositionTypeFactory {
 	error UnsupportedAsset(address asset);
 	error GaugeNotPoolGauge(address gauge, address pool);
 
-	/// @dev Staking hands the position NFT to `gauge` — it must be Aerodrome's own gauge for this
-	///      exact pool, never a manager's choice (a fake gauge keeps the NFT on `deposit`;
-	///      fork-proven 2026-09-27). address(0) = staking disabled.
+	/// @dev Staking hands the NFT to `gauge`, so it must be the pool's own gauge (a fake one would keep the NFT).
 	function _requirePoolGauge(address token0, address token1, int24 tickSpacing, address gauge) internal view {
 		if (gauge == address(0)) return;
 		address pool = ISlipstreamPoolLookup(positionManager.factory()).getPool(token0, token1, tickSpacing);
 		if (pool == address(0) || ISlipstreamPoolGauge(pool).gauge() != gauge) revert GaugeNotPoolGauge(gauge, pool);
 	}
 
-	/// @dev Anything the position will ever report in getManagedAssets must be
-	///      protocol-priceable — an unpriceable token0/token1 bricks calcGav fund-wide
-	///      the moment 1 wei lands in the position (security review 2026-09-22, H-2).
+	/// @dev Both tokens must be priceable: an unpriceable one would brick the fund's calcGav.
 	function _requireSupported(address comptroller, address token0, address token1) internal view {
 		IValueInterpreter interpreter = Comptroller(comptroller).valueInterpreter();
 		if (!interpreter.isSupportedAsset(token0)) revert UnsupportedAsset(token0);

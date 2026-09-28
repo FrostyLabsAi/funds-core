@@ -7,11 +7,8 @@ import {IPolicy} from '../interfaces/IPolicy.sol';
 import {Comptroller} from '../core/Comptroller.sol';
 
 /// @title MaxConcentrationPolicy
-/// @notice After any adapter trade, no single non-denomination asset may exceed a fixed
-///         fraction of the fund's GAV.
-/// @dev Port of melon-v1 MaxConcentration (melon-v1/src/fund/policies/risk-management/
-///      MaxConcentration.sol) on the PostCallOnIntegration hook. Immutable bound — deploy a
-///      new instance to change it. The calling fund is msg.sender (its Comptroller).
+/// @notice After any adapter trade, no single non-denomination asset may exceed a fixed share of GAV.
+/// @dev Immutable bound — deploy a new instance to change it. msg.sender is the fund's Comptroller.
 contract MaxConcentrationPolicy is IPolicy {
 	uint256 public constant BPS = 10_000;
 

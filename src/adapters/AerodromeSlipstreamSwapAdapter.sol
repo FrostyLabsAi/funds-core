@@ -7,11 +7,9 @@ import {IIntegrationAdapter} from '../interfaces/IIntegrationAdapter.sol';
 import {ISlipstreamSwapRouter} from '../interfaces/external/ISlipstreamSwapRouter.sol';
 
 /// @title AerodromeSlipstreamSwapAdapter
-/// @notice Single-hop exactIn swaps on Aerodrome Slipstream pools (Base) — where the deepest
-///         tokenized-stock liquidity lives.
+/// @notice Single-hop exactIn swaps on Aerodrome Slipstream pools.
 /// @dev integrationData = abi.encode(tokenIn, tokenOut, tickSpacing, amountIn, minAmountOut).
-///      SWAPS ONLY. Slipstream LP positions (dual-mode: unstaked-with-skim vs staked-for-
-///      emissions, see living doc) are NFTs and land as an External Position type, not here.
+///      Swaps only; Slipstream LP positions are an external position type.
 contract AerodromeSlipstreamSwapAdapter is IIntegrationAdapter {
 	using SafeERC20 for IERC20;
 

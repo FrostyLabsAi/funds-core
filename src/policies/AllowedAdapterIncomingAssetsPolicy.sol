@@ -4,11 +4,8 @@ pragma solidity 0.8.24;
 import {IPolicy} from '../interfaces/IPolicy.sol';
 
 /// @title AllowedAdapterIncomingAssetsPolicy
-/// @notice Whitelist of assets a fund may ACQUIRE through adapter trades — the fund's
-///         investable-universe commitment to depositors.
-/// @dev Port of melon-v1 AssetWhitelist (melon-v1/src/fund/policies/risk-management/
-///      AssetWhitelist.sol) as v4's AllowedAdapterIncomingAssetsPolicy
-///      (spec/topics/policies.md). Immutable set — deploy a new instance to change it.
+/// @notice Whitelist of assets a fund may acquire through adapter trades.
+/// @dev Immutable set — deploy a new instance to change it.
 contract AllowedAdapterIncomingAssetsPolicy is IPolicy {
 	mapping(address asset => bool) public isAllowedAsset;
 

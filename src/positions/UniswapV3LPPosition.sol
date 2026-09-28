@@ -15,12 +15,9 @@ import {TickMath} from '../libraries/TickMath.sol';
 import {LiquidityAmounts} from '../libraries/LiquidityAmounts.sol';
 
 /// @title UniswapV3LPPosition
-/// @notice External position holding ONE Uniswap v3 LP NFT. The fee-keyed twin of
-///         SlipstreamLPPosition, minus the gauge machinery (Uniswap has no gauges —
-///         positions always earn pool fees; 100% of them, no unstaked-fee skim).
-/// @dev Valuation identical to SlipstreamLPPosition: liquidity split at the ORACLE-fair
-///      sqrt price (frosty-core PriceOracle math) — never pool spot state (Gamma lesson #1).
-///      Uncollected tokensOwed + idle balances held here are included in managed assets.
+/// @notice External position holding one Uniswap v3 LP NFT.
+/// @dev Liquidity is valued at the oracle-fair sqrt price, never the pool's spot price.
+///      Uncollected tokensOwed and idle balances count as managed assets.
 contract UniswapV3LPPosition is IExternalPosition {
 	using SafeERC20 for IERC20;
 
@@ -124,8 +121,7 @@ contract UniswapV3LPPosition is IExternalPosition {
 	}
 
 	/// @inheritdoc IExternalPosition
-	/// @dev Never: removing liquidity pays out at the pool's live price (sandwichable), so every
-	///      LP action stays priced by the Comptroller's loss measurement.
+	/// @dev Never: removing liquidity pays at the pool's live (sandwichable) price, so every LP action stays priced.
 	function isRiskReducing(bytes calldata) external pure returns (bool) {
 		return false;
 	}
@@ -218,7 +214,7 @@ contract UniswapV3LPPosition is IExternalPosition {
 		emit LiquidityDecreased(liquidity);
 	}
 
-	/// @dev Collects fees + decreased principal STRAIGHT to the vault (never parked here).
+	/// @dev Collects fees and decreased principal straight to the vault.
 	function _collect() private {
 		uint256 activeTokenId = _requireActive();
 
@@ -253,7 +249,7 @@ contract UniswapV3LPPosition is IExternalPosition {
 		if (activeTokenId == 0) revert NoActivePosition();
 	}
 
-	// ─── Fair pricing (ported from frosty-core PriceOracle._fairSqrtPriceX96) ────
+	// ─── Fair pricing ────────────────────────────────────────────────────────────
 
 	function _fairSqrtPriceX96(uint256 rate0, uint256 rate1) private view returns (uint160) {
 		uint256 ratioX96 = Math.mulDiv(Math.mulDiv(rate0, Q96, rate1), scale1, scale0);
@@ -290,9 +286,7 @@ contract UniswapV3LPPositionFactory is IExternalPositionTypeFactory {
 
 	error UnsupportedAsset(address asset);
 
-	/// @dev Anything the position will ever report in getManagedAssets must be
-	///      protocol-priceable — an unpriceable token0/token1 bricks calcGav fund-wide
-	///      the moment 1 wei lands in the position (security review 2026-09-22, H-2).
+	/// @dev Both tokens must be priceable: an unpriceable one would brick the fund's calcGav.
 	function _requireSupported(address comptroller, address token0, address token1) internal view {
 		IValueInterpreter interpreter = Comptroller(comptroller).valueInterpreter();
 		if (!interpreter.isSupportedAsset(token0)) revert UnsupportedAsset(token0);

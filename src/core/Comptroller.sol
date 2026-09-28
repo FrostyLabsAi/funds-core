@@ -19,30 +19,14 @@ import {IExternalPositionTypeFactory} from '../interfaces/IExternalPositionTypeF
 import {MathHelpers} from '../libraries/MathHelpers.sol';
 
 /// @title Comptroller
-/// @notice Per-fund logic + config hub: deposits, redemptions, GAV/share price, fees, policies,
-///         tracked assets, and external positions.
-/// @dev Absorbs melon-v1's Participation (request/execute), Accounting (GAV/tracked assets),
-///      and FeeManager (share-dilution fees) spokes into Enzyme v4's per-fund-Comptroller shape
-///      (spec/architecture/release.md). References inline.
-///
-///      Deposit flow (melon-v1 Participation.sol:117-262 → ERC-7540 style):
-///        requestDeposit(escrow) → wait ≥ minRequestDuration → executeDepositRequest
-///        (anyone; keeper in practice) → shares minted at CURRENT share price.
-///      Async by construction — no atomic deposit→withdraw (Gamma lesson #2). Equity feed
-///      heartbeats gate execution to market hours (see ValueInterpreter).
-///
-///      Redemptions (spec/topics/fund-holdings.md#redemptions):
-///        - redeemSharesForDenominationAsset: canonical, value-inclusive of external positions.
-///        - redeemSharesInKind: guaranteed 24/7 exit, prorata tracked assets, FORFEITS
-///          external-position value, settles management fee only (no pricing dependency).
-///
-///      Fees (settled before every share-supply change):
-///        - Management: continuous compounding via scaledPerSecondRate, to fundOwner
-///          (spec/fee-formulas/managementfee.md).
-///        - Performance: continuous HWM accrual, no crystallization, to fundOwner
-///          (spec/fee-formulas/performance-fee.md).
-///        - Protocol: factory-set bps/yr AUM fee to the protocol recipient, with an
-///          optional FROST-burn buyback at 50% (Enzyme v4 protocol-fee port).
+/// @notice Per-fund logic: deposits, redemptions, GAV/share price, fees, policies, tracked
+///         assets and external positions.
+/// @dev Deposits are async: request (escrow) → wait ≥ minRequestDuration → anyone executes at
+///      the current share price, so deposit→withdraw is never atomic.
+///      Redemptions: for the denomination asset (includes external positions), or in kind
+///      (tracked assets pro rata, forfeits external positions, needs no prices).
+///      Fees settle before every share-supply change: management (compounding) and performance
+///      (continuous HWM) to fundOwner; the protocol AUM fee to the factory's recipient.
 contract Comptroller is ReentrancyGuard {
 	using SafeERC20 for IERC20;
 	using EnumerableSet for EnumerableSet.AddressSet;
@@ -60,32 +44,25 @@ contract Comptroller is ReentrancyGuard {
 	uint256 public constant SHARES_UNIT = 1e18;
 	uint256 public constant BPS = 10_000;
 	uint256 private constant RATE_SCALE = 1e27;
-	uint256 private constant SECONDS_IN_YEAR = 31_557_600; // 365.25 days, per Enzyme v4
+	uint256 private constant SECONDS_IN_YEAR = 31_557_600; // 365.25 days
 
-	// Bytecode-capped risk params (Gamma lesson #3: config is attack surface).
+	// Bytecode-capped risk params.
 	uint256 public constant MAX_PERF_FEE_BPS = 3_000; // 30%
 	/// @dev ≈10% annual management fee, expressed as a per-second compounding rate.
 	uint256 public constant MAX_MGMT_SCALED_PER_SECOND_RATE = 1_000_000_003_400_000_000_000_000_000;
 	uint256 public constant MAX_SHARES_ACTION_TIMELOCK = 30 days;
-	// 1 minute floor: enough to guarantee request→execute is never atomic (the Gamma
-	// lesson) while letting managers offer near-instant deposits; conservative funds
-	// simply configure longer.
+	// 1-minute floor keeps request→execute non-atomic.
 	uint256 public constant MIN_REQUEST_DURATION_FLOOR = 1 minutes;
 	uint256 public constant MAX_REQUEST_DURATION = 7 days;
-	// Execution-window bounds (M-5, founder decision 2026-09-22): a matured request is
-	// executable only for the fund's configured window, then expires (cancel reclaims).
-	// Short windows structurally kill the "sit on the matured request and pick your
-	// moment" free option with NO keeper dependency; equity funds configure longer
-	// windows to span closed markets.
+	// A matured request is executable only within the fund's window, then expires (cancel
+	// reclaims). Short windows remove the "wait and pick your moment" free option.
 	uint256 public constant MIN_EXECUTION_WINDOW = 15 minutes;
 	uint256 public constant MAX_EXECUTION_WINDOW = 7 days;
-	uint256 public constant MAX_TRACKED_ASSETS = 20; // melon-v1 Accounting MAX_OWNED_ASSETS
+	uint256 public constant MAX_TRACKED_ASSETS = 20;
 	uint256 public constant MAX_EXTERNAL_POSITIONS = 10;
-	/// @dev Donation-inflation defense (security review 2026-09-22, C-1): the bootstrap
-	///      deposit seeds this many shares to an unredeemable sink, so total supply can
-	///      never be dusted back below it and share-price inflation against later
-	///      depositors stops paying. 1e18 = exactly one whole denomination token at the
-	///      bootstrap price, whatever the denomination's decimals.
+	/// @dev Donation-inflation defense: the bootstrap deposit mints this many shares to an
+	///      unredeemable sink, so supply can never be dusted below it. 1e18 = one whole
+	///      denomination token at the bootstrap price.
 	uint256 public constant MIN_BOOTSTRAP_SHARES = 1e18;
 	address public constant BOOTSTRAP_SHARES_SINK = 0x000000000000000000000000000000000000dEaD;
 
@@ -97,9 +74,8 @@ contract Comptroller is ReentrancyGuard {
 	uint256 public immutable minRequestDuration;
 	/// @notice How long a MATURED deposit request stays executable before it expires.
 	uint256 public immutable executionWindow;
-	/// @notice Creation-time disclosure, enforced: only true-flagged ("degen") funds can
-	///         acquire zero-priced side-pocket assets. Immutable for this Comptroller —
-	///         changing it requires reconfiguration and its 2-day investor exit window.
+	/// @notice Only true-flagged ("degen") funds may hold zero-priced side-pocket assets.
+	///         Changing it requires a reconfiguration.
 	bool public immutable allowRiskyAssets;
 	uint256 public immutable defaultSharePrice; // 10^denominationAsset.decimals()
 	FeeConfig public feeConfig;
@@ -111,9 +87,7 @@ contract Comptroller is ReentrancyGuard {
 	mapping(address holder => uint256) public lastDepositTimestamp;
 	mapping(IPolicy.PolicyHook hook => address[]) private policies;
 
-	/// @dev Deposit gates (melon-v1 Hub.shutDownFund successor + frosty-core guardian lane).
-	///      Redemptions and request cancellation are NEVER gated — exiting is an investor
-	///      guarantee under every state below.
+	/// @dev Deposit gates. Redemptions and request cancellation are never gated.
 	bool public shutDown; // one-way, fundOwner: fund is winding down
 	bool public ownerDepositsPaused; // toggle, fundOwner: subscriptions closed
 	bool public guardianDepositsPaused; // set via factory: guardian pauses instantly, only factory owner unpauses
@@ -241,13 +215,9 @@ contract Comptroller is ReentrancyGuard {
 		emit FundInitialized(address(shares_), address(vault_));
 	}
 
-	/// @dev Reconfiguration variant: adopt an existing fund's Shares + Vault, carrying over
-	///      (1) the HWM — a manager can NEVER reset it (and re-earn old performance) by
-	///      reconfiguring — and (2) the tracked-asset set, so vault holdings never become
-	///      silent residue across a migration (Gamma lesson #4). Policies do NOT carry
-	///      (investor-restricting hooks stay frozen: shares supply is already nonzero).
-	///      External positions must be wound down before reconfiguring — their comptroller
-	///      reference is immutable (enforced by the factory).
+	/// @dev Reconfiguration: adopt an existing fund's Shares + Vault, carrying over the HWM (a
+	///      manager can never reset it) and the tracked assets. The factory re-attaches policies;
+	///      external positions must be wound down first (their comptroller is immutable).
 	function initializeForMigration(Shares shares_, Vault vault_, Comptroller oldComptroller) external {
 		if (msg.sender != factory) revert OnlyFactory();
 		if (address(shares) != address(0)) revert AlreadyInitialized();
@@ -293,9 +263,8 @@ contract Comptroller is ReentrancyGuard {
 		emit DepositRequestCancelled(msg.sender, request.assets);
 	}
 
-	/// @notice Execute a matured request at current share price. Callable by anyone (keeper).
-	/// @dev Reverts outside market hours for funds holding equity assets (stale feeds), which
-	///      is the intended weekend NAV-gaming defense.
+	/// @notice Execute a matured request at the current share price. Callable by anyone (keeper).
+	/// @dev Reverts if any held asset's price is stale.
 	function executeDepositRequest(address depositor) external nonReentrant whenDepositsAllowed {
 		DepositRequest memory request = depositRequests[depositor];
 		if (request.requestedAt == 0) revert NoRequest();
@@ -308,10 +277,7 @@ contract Comptroller is ReentrancyGuard {
 		uint256 sharesToMint = Math.mulDiv(request.assets, SHARES_UNIT, sharePrice);
 		if (sharesToMint == 0) revert ZeroAmount();
 
-		// Bootstrap seeds MIN_BOOTSTRAP_SHARES to the sink — nobody can ever redeem them,
-		// so supply stays above the floor for the fund's whole life and dusting the supply
-		// to re-run donation inflation is impossible. The first depositor pays the seed
-		// (one denomination token) and must cover more than it.
+		// First deposit seeds MIN_BOOTSTRAP_SHARES to the unredeemable sink (paid by the depositor).
 		if (shares.totalSupply() == 0) {
 			if (sharesToMint <= MIN_BOOTSTRAP_SHARES) revert BootstrapDepositTooSmall();
 			shares.mint(BOOTSTRAP_SHARES_SINK, MIN_BOOTSTRAP_SHARES);
@@ -329,9 +295,8 @@ contract Comptroller is ReentrancyGuard {
 
 	// ─── Redemptions ─────────────────────────────────────────────────────────────
 
-	/// @notice Canonical redemption: burns shares, pays denomination asset at current share
-	///         price — value-INCLUSIVE of external positions. Requires the vault to hold
-	///         sufficient denomination asset (keeper maintains epoch liquidity).
+	/// @notice Burn shares for the denomination asset at the current share price (includes
+	///         external positions). The vault must hold enough of the denomination asset.
 	function redeemSharesForDenominationAsset(uint256 sharesAmount) external nonReentrant {
 		_checkTimelockAndBalance(msg.sender, sharesAmount);
 
@@ -347,20 +312,14 @@ contract Comptroller is ReentrancyGuard {
 		emit SharesRedeemedForDenominationAsset(msg.sender, sharesAmount, assetsOwed);
 	}
 
-	/// @notice Guaranteed exit: prorata slice of every tracked asset. Runs with NO pricing
-	///         dependency (works when markets are closed / feeds stale) and NO policies
-	///         (always-available, per spec/topics/fund-holdings.md). Settles management fee
-	///         only; performance fee is skipped (needs GAV). FORFEITS external-position value.
+	/// @notice Guaranteed exit: a pro-rata slice of every tracked asset. Needs no prices and runs
+	///         no policies; skips the performance fee and forfeits external-position value.
 	function redeemSharesInKind(uint256 sharesAmount) external nonReentrant {
 		_redeemSharesInKind(sharesAmount, new address[](0));
 	}
 
-	/// @notice In-kind exit that SKIPS (forfeits) selected assets — the escape hatch when a
-	///         tracked asset's transfers are broken (paused token, frozen wrapper). The
-	///         guaranteed exit must never be blockable by one bad asset.
-	/// @dev Port of melon-v1 Participation.redeemWithConstraints
-	///      (melon-v1/src/fund/participation/Participation.sol:296). Skipped value stays in
-	///      the vault for remaining holders.
+	/// @notice In-kind exit that forfeits `assetsToSkip` (e.g. a paused token), so one broken
+	///         asset can't block the exit. Skipped value stays with the remaining holders.
 	function redeemSharesInKindWithSkips(uint256 sharesAmount, address[] calldata assetsToSkip)
 		external
 		nonReentrant
@@ -405,9 +364,8 @@ contract Comptroller is ReentrancyGuard {
 
 	// ─── Valuation ───────────────────────────────────────────────────────────────
 
-	/// @notice GAV in denomination-asset units: tracked assets (vault balances) + external
-	///         positions (managed − debt, floored at zero per position), priced ONLY via
-	///         the ValueInterpreter. Deposit escrow held by this contract is NOT fund value.
+	/// @notice GAV in denomination units: tracked vault balances + external positions (managed −
+	///         debt, floored at zero each). Deposit escrow is not fund value.
 	function calcGav() public returns (uint256 gav) {
 		uint256 assetCount = trackedAssets.length();
 		for (uint256 i; i < assetCount; ++i) {
@@ -423,9 +381,8 @@ contract Comptroller is ReentrancyGuard {
 		}
 	}
 
-	/// @notice Value of the vault's holding of a single asset, in denomination units.
-	/// @dev Port of melon-v1 Accounting.calcAssetGAV. Untracked assets are valued too, but
-	///      only TRACKED assets count in calcGav.
+	/// @notice Value of the vault's holding of one asset, in denomination units.
+	/// @dev Values untracked assets too; only tracked ones count in calcGav.
 	function calcAssetGav(address asset) external returns (uint256) {
 		uint256 balance = IERC20(asset).balanceOf(address(vault));
 		if (balance == 0) return 0;
@@ -433,7 +390,6 @@ contract Comptroller is ReentrancyGuard {
 	}
 
 	/// @notice All tracked assets with their current vault balances.
-	/// @dev Port of melon-v1 Accounting.getFundHoldings.
 	function getFundHoldings() external view returns (address[] memory assets, uint256[] memory balances) {
 		uint256 assetCount = trackedAssets.length();
 		assets = new address[](assetCount);
@@ -474,17 +430,10 @@ contract Comptroller is ReentrancyGuard {
 
 	// ─── Trading: callOnIntegration ──────────────────────────────────────────────
 
-	/// @notice Trade fund assets through a protocol-registered adapter.
-	/// @dev Successor to melon-v1 Trading.sol via Enzyme v4's IntegrationManager
-	///      (spec/architecture/release.md#integrationmanager). Safety model:
-	///      - adapter must be on the factory's curated registry (the protocol-level
-	///        AllowedAdapters list; per-fund policies can restrict further)
-	///      - incoming amounts are measured as VAULT BALANCE DELTAS, never adapter claims
-	///      - incoming assets are auto-tracked (no silent residue, Gamma lesson #4)
-	///      - PostCallOnIntegration policies (MaxConcentration, CumulativeSlippageTolerance)
-	///        run on the measured result
-	///      Deliberately NOT gated by pause/shutdown: a winding-down fund must still trade
-	///      to unwind into the denomination asset for redemptions.
+	/// @notice Trade fund assets through a factory-registered adapter.
+	/// @dev Incoming amounts are measured as vault balance deltas (never adapter claims), incoming
+	///      assets are auto-tracked, and PostCallOnIntegration policies run on the result.
+	///      Not gated by pause/shutdown: a winding-down fund must still unwind.
 	function callOnIntegration(address adapter, bytes calldata integrationData) external onlyFundOwner nonReentrant {
 		if (!IAdapterRegistry(factory).isAdapterRegistered(adapter)) revert AdapterNotRegistered(adapter);
 
@@ -526,8 +475,7 @@ contract Comptroller is ReentrancyGuard {
 
 	// ─── Shutdown / pause lane ───────────────────────────────────────────────────
 
-	/// @notice Permanently shut the fund down (wind-down): blocks new deposits and new
-	///         positions forever. Redemptions stay open. One-way, per melon-v1 Hub.shutDownFund.
+	/// @notice Permanently shut the fund down: no new deposits or positions; redemptions stay open.
 	function shutDownFund() external onlyFundOwner {
 		if (shutDown) revert AlreadyShutDown();
 		shutDown = true;
@@ -540,9 +488,8 @@ contract Comptroller is ReentrancyGuard {
 		emit OwnerDepositsPauseSet(paused);
 	}
 
-	/// @notice Emergency lane, callable only through the factory: the guardian pauses
-	///         instantly; ONLY the factory owner (governance) can unpause (frosty-core
-	///         one-way discipline — halting is instant, loosening is privileged).
+	/// @notice Emergency lane via the factory: the guardian pauses instantly; only the factory
+	///         owner (governance) unpauses.
 	function setGuardianDepositsPaused(bool paused) external {
 		if (msg.sender != factory) revert OnlyFactory();
 		guardianDepositsPaused = paused;
@@ -551,21 +498,15 @@ contract Comptroller is ReentrancyGuard {
 
 	// ─── Fees ────────────────────────────────────────────────────────────────────
 
-	/// @notice Settle accrued fees without a deposit/redeem action. Callable by anyone
-	///         (melon-v1 Accounting.triggerRewardAllFees successor). Requires valid pricing
-	///         for the performance fee, so it reverts while equity feeds are stale — keepers
-	///         call it during market hours.
+	/// @notice Settle accrued fees without a deposit/redeem. Callable by anyone; needs valid prices.
 	function settleFees() external nonReentrant returns (uint256 grossSharePrice) {
 		grossSharePrice = _settleFeesAndGetSharePrice();
 		emit FeesSettled(msg.sender, grossSharePrice);
 	}
 
-	/// @dev Settles management then performance fee (order per spec/fee-formulas), then
-	///      returns the resulting gross share price used for the current action. Only the
-	///      empty-fund bootstrap may price at defaultSharePrice: zero priced GAV with
-	///      supply outstanding (fully side-pocketed / wiped fund) REVERTS instead —
-	///      minting or value-redeeming at the default price there expropriates existing
-	///      holders (security review 2026-09-22, C-2). The in-kind exit stays open.
+	/// @dev Settles management, performance, then protocol fee; returns the gross share price.
+	///      Zero GAV with supply outstanding reverts (pricing at the default would expropriate
+	///      holders); the in-kind exit stays open.
 	function _settleFeesAndGetSharePrice() private returns (uint256 sharePrice) {
 		_settleManagementFee();
 
@@ -579,13 +520,12 @@ contract Comptroller is ReentrancyGuard {
 		if (gav == 0) revert ZeroGavWithSupply();
 
 		_settlePerformanceFee(gav, totalSupply);
-		// After the manager's fees (Enzyme v4 ordering), before pricing the action.
+		// After the manager's fees, before pricing the action.
 		_settleProtocolFee();
 		return Math.mulDiv(gav, SHARES_UNIT, shares.totalSupply());
 	}
 
-	/// @dev spec/fee-formulas/managementfee.md:
-	///      sharesDue = (rpow(scaledPerSecondRate, dt, 1e27) - 1e27) * totalSupply / 1e27
+	/// @dev sharesDue = (rpow(scaledPerSecondRate, dt, 1e27) - 1e27) * totalSupply / 1e27
 	function _settleManagementFee() private {
 		uint256 rate = feeConfig.mgmtScaledPerSecondRate;
 		uint256 elapsed = block.timestamp - lastMgmtFeeSettled;
@@ -602,9 +542,8 @@ contract Comptroller is ReentrancyGuard {
 		emit ManagementFeeSettled(sharesDue);
 	}
 
-	/// @dev spec/fee-formulas/performance-fee.md (continuous accrual, no crystallization):
-	///      g = GAV/TS; W = max(g - hwm, 0)*TS; F = W*rate; feeShares = F*TS/(GAV - F);
-	///      hwm' = GAV/TS' when fee paid.
+	/// @dev Continuous accrual, no crystallization: g = GAV/TS; W = max(g - hwm, 0)*TS;
+	///      F = W*rate; feeShares = F*TS/(GAV - F); hwm' = GAV/TS' when paid.
 	function _settlePerformanceFee(uint256 gav, uint256 totalSupply) private {
 		uint256 rate = feeConfig.perfFeeBps;
 		if (rate == 0) return;
@@ -627,11 +566,9 @@ contract Comptroller is ReentrancyGuard {
 		emit PerformanceFeeSettled(feeShares, newHwm);
 	}
 
-	/// @dev Protocol AUM fee (founder decision 2026-09-22, Enzyme v4 ProtocolFeeTracker
-	///      port): factory-set bps/yr of share supply, minted to the factory's recipient.
-	///      Straight-dilution mint, same convention as the management fee. The rate is
-	///      live-read but bounded by the factory's bytecode cap (1%/yr); the clock always
-	///      advances, so enabling the fee later never back-charges dormant history.
+	/// @dev Protocol AUM fee: factory-set bps/yr of share supply, minted to the factory's
+	///      recipient (rate read live, capped at 1%/yr by the factory). The clock advances only
+	///      when this fund settles, so a fee turned on later charges since the last settlement.
 	function _settleProtocolFee() private {
 		uint256 elapsed = block.timestamp - lastProtocolFeeSettled;
 		if (elapsed == 0) return;
@@ -650,12 +587,8 @@ contract Comptroller is ReentrancyGuard {
 		emit ProtocolFeeSettled(recipient, sharesDue);
 	}
 
-	/// @notice Execution half of the protocol-fee buyback (orchestrated + guarded by the
-	///         factory's buyBackProtocolFeeShares, which lives there for EIP-170 room):
-	///         burns the reserve's fee shares and destroys the burn asset (FROST) from
-	///         the vault. The dead-address destination is hardcoded HERE so the factory
-	///         can direct value to nobody — bought-back value accrues pro-rata to ALL
-	///         holders via the supply reduction. Enzyme v4 MLN-buyback port.
+	/// @notice Protocol-fee buyback, called by the factory: burns the reserve's fee shares and
+	///         sends the burn asset (FROST) from the vault to the dead address (hardcoded here).
 	function executeProtocolFeeBuyBack(
 		address recipient,
 		address burnAsset,
@@ -685,16 +618,14 @@ contract Comptroller is ReentrancyGuard {
 		emit TrackedAssetAdded(asset);
 	}
 
-	/// @dev No silent residue (Gamma lesson #4): an asset with a non-zero vault balance is
-	///      fund value and cannot be untracked.
+	/// @dev An asset with a non-zero vault balance is fund value and cannot be untracked.
 	function removeTrackedAsset(address asset) external onlyFundOwner {
 		if (asset == address(denominationAsset)) revert CannotRemoveDenominationAsset();
 		if (IERC20(asset).balanceOf(address(vault)) != 0) revert NonZeroBalanceRemoval(asset);
 		if (trackedAssets.remove(asset)) emit TrackedAssetRemoved(asset);
 	}
 
-	/// @notice Deploy and activate an external position of a protocol-registered type
-	///         (spec/topics/external-positions.md lifecycle: CreateExternalPosition).
+	/// @notice Deploy and activate an external position of a factory-registered type.
 	function createExternalPosition(uint256 typeId, bytes calldata initArgs)
 		external
 		onlyFundOwner
@@ -714,17 +645,10 @@ contract Comptroller is ReentrancyGuard {
 		emit ExternalPositionCreated(typeId, position);
 	}
 
-	/// @notice Interact with an active external position: optionally move vault assets to it,
-	///         then forward the action (spec lifecycle: CallOnExternalPosition).
-	/// @param assetsToReceive Assets expected to arrive at the vault from this action —
-	///        auto-tracked so returned value is never silent residue.
-	/// @dev Policies receive the MEASURED value this call lost — position value plus
-	///      vault flows, before vs after — never the stated arrays, which can lie by
-	///      omission (security review 2026-09-22, H-1). This makes the call require
-	///      pricing (stale feeds block EP management, same market-hours discipline as
-	///      deposits). Venue-side losses BETWEEN calls remain the documented
-	///      manager-trust boundary of external positions until a GAV-fraction outflow
-	///      cap exists.
+	/// @notice Act on an active external position, optionally moving vault assets to it first.
+	/// @param assetsToReceive Assets expected back in the vault; auto-tracked.
+	/// @dev Policies get the measured value lost (position value + vault flows, before vs after),
+	///      never the stated arrays. Venue-side losses between calls are outside this check.
 	function callOnExternalPosition(
 		address position,
 		address[] calldata assetsToTransfer,
@@ -735,11 +659,8 @@ contract Comptroller is ReentrancyGuard {
 		if (!externalPositions.contains(position)) revert NotActiveExternalPosition(position);
 		if (assetsToTransfer.length != amountsToTransfer.length) revert ArrayLengthMismatch();
 
-		// A RISK-REDUCING action (the position type vouches it can only move value back toward
-		// the fund — e.g. closing a perp) with nothing leaving the vault is not priced: a
-		// down or stale oracle must never stop a manager from cutting risk (security review
-		// 2026-09-24, H-1). Everything else: value going in (position + transfers) vs value
-		// coming out (position + vault receipts).
+		// A risk-reducing action (e.g. closing a perp) with nothing leaving the vault skips
+		// pricing, so a stale oracle never stops a manager from cutting risk.
 		bool unpriced = assetsToTransfer.length == 0 && IExternalPosition(position).isRiskReducing(actionData);
 		uint256 beforeValue = unpriced
 			? 0
@@ -776,8 +697,8 @@ contract Comptroller is ReentrancyGuard {
 		}
 	}
 
-	/// @dev Values what the vault actually received (balance deltas) and auto-tracks it;
-	///      duplicate entries are skipped — counting one delta twice would hide losses.
+	/// @dev Values what the vault actually received and auto-tracks it; duplicates are skipped
+	///      (counting a delta twice would hide losses).
 	function _receivedValue(address[] calldata assets, uint256[] memory balancesBefore, bool priced)
 		private
 		returns (uint256 value)
@@ -800,10 +721,8 @@ contract Comptroller is ReentrancyGuard {
 		}
 	}
 
-	/// @notice Deactivate an external position. Only allowed once its value is dust
-	///         (≤ 1 denomination unit) — a manager can never hide significant value by
-	///         untracking a position (v4 OnlyRemoveDustExternalPositionPolicy, enforced
-	///         in-protocol; spec/topics/policies.md).
+	/// @notice Deactivate an external position once its value is dust (≤ 1 denomination unit),
+	///         so value can never be hidden by untracking it.
 	function removeExternalPosition(address position) external onlyFundOwner nonReentrant {
 		if (!externalPositions.contains(position)) revert NotActiveExternalPosition(position);
 
@@ -826,20 +745,11 @@ contract Comptroller is ReentrancyGuard {
 
 	// ─── Policies ────────────────────────────────────────────────────────────────
 
-	/// @notice Add a policy. Investor-restricting hooks (share transfers, value redemptions)
-	///         can only be configured before the fund has depositors — an immutable guarantee
-	///         to investors (spec/architecture/release.md#policymanager).
-	/// @dev SET-ONCE like melon: only the factory registers policies — atomically at
-	///      creation (createFund-with-ruleset) and when carrying the ruleset across a
-	///      reconfiguration. Managers can never add, change, or remove rules after
-	///      launch; the ruleset is the fund's permanent public commitment. (Policies
-	///      with internal member lists, e.g. the depositor whitelist, still maintain
-	///      their own membership — the POLICY SET itself is frozen.)
+	/// @notice Add a policy. Only the factory can, at creation and when carrying the ruleset
+	///         across a reconfiguration; managers never change the rule set.
 	function addPolicy(IPolicy.PolicyHook hook, address policy) external {
 		if (msg.sender != factory) revert OnlyFactory();
-		// A policy may only attach to hooks it implements: stock policies on foreign
-		// hooks either brick the action on decode (a set-once redemption rug kit) or
-		// silently no-op (security review 2026-09-22, M-3)
+		// A policy may only attach to hooks it implements (else it bricks or silently no-ops).
 		IPolicy.PolicyHook[] memory implemented = IPolicy(policy).implementedHooks();
 		bool matched;
 		for (uint256 i; i < implemented.length; ++i) {

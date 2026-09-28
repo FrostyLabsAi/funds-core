@@ -25,39 +25,25 @@ interface ISlipstreamPoolFactory {
 }
 
 /// @title TwapListingRegistry
-/// @notice Lists long-tail assets on the TWAP price tier (docs/design/twap-oracle.md). A
-///         listing is a CHECKED fact, not an owner's say-so about an address:
-///         - the pool is resolved from the canonical factory (Uniswap v3 / Aerodrome
-///           Slipstream `getPool`), never a caller-supplied address;
-///         - the quote side is on an allow-list, each with its Chainlink feed;
-///         - the asset must not already have a price in the ValueInterpreter (a higher tier
-///           — Chainlink / Pyth — always wins);
-///         - the adapter is deployed HERE with the protocol-fixed parameters (30-min window,
-///           5% spot deviation, $50k ±10% harmonic-mean depth) and must price right now,
-///           every guard passing, with the pool over the $50k floor.
-///         After listing, the price keeps flowing even if the pool thins out; what changes is
-///         the 72-HOUR CLOCK (founder decision 2026-09-24): `pokeFloor` — callable by anyone,
-///         confirmed on-chain — starts it when the pool drops under the floor and clears it
-///         when the pool recovers. Past 72h the asset is DELISTED: the terminal stops offering
-///         it and the exposure policy pauses NEW deposits into funds still holding it (exits
-///         and redemptions stay open; selling the position lifts the pause).
-/// @dev Owner-listed at launch (founder decision 2026-09-23): `listers` holds the owner's
-///      chosen addresses; a FROST-bond / community-vote module becomes a lister later.
-///      This registry does NOT write to the ValueInterpreter — `addPrimitive` stays with
-///      the VI owner (one Safe batch: list here, then vi.addPrimitive(asset, adapterOf(asset),
-///      heartbeat)). Permissionless listing needs a narrow VI lister role, which ships with
-///      that phase as a new VI version, so the deployed VI is untouched now.
+/// @notice Lists long-tail assets on the TWAP price tier. A listing is checked, not trusted:
+///         - the pool comes from the canonical factory (Uniswap v3 / Slipstream `getPool`);
+///         - the quote token is allow-listed with its Chainlink feed;
+///         - the asset has no price in the ValueInterpreter yet (a higher tier always wins);
+///         - the adapter is deployed here with fixed parameters and must price now, over the floor.
+///         `pokeFloor` (anyone) starts a 72-hour clock when the pool drops under the floor and clears
+///         it on recovery. Past 72h the asset is delisted: the exposure policy pauses new deposits
+///         into funds holding it; exits and redemptions stay open.
+/// @dev Does not write to the ValueInterpreter: the VI owner adds the primitive after listing
+///      (vi.addPrimitive(asset, adapterOf(asset), heartbeat)).
 contract TwapListingRegistry is Ownable2Step {
-	/// @notice Protocol-fixed adapter parameters — not the lister's choice.
+	/// @notice Fixed adapter parameters, not the lister's choice.
 	uint32 public constant WINDOW = 30 minutes;
 	uint16 public constant MAX_DEVIATION_BPS = 500;
 	uint256 public constant MIN_DEPTH_USD = 50_000;
 	/// @notice How long a pool may stay under the floor before its asset is delisted.
 	uint256 public constant DELIST_GRACE = 72 hours;
 
-	/// @dev Aerodrome runs TWO live Slipstream deployments on Base with liquidity split between
-	///      them (verified 2026-09-24: AERO/USDC on the original, WETH/USDC + cbBTC/USDC deepest
-	///      on the newer "gauges v3" one) — both are canonical, so both are listable.
+	/// @dev Aerodrome runs two Slipstream deployments with liquidity split between them; both are listable.
 	enum Venue {
 		UniswapV3,
 		Slipstream,
@@ -124,8 +110,7 @@ contract TwapListingRegistry is Ownable2Step {
 
 	// ─── owner config ───────────────────────────────────────────────────────────
 
-	/// @notice Allow a quote token (USDC, WETH, cbBTC…) with its Chainlink USD feed;
-	///         feed = 0 disallows it for NEW listings.
+	/// @notice Allow a quote token with its Chainlink USD feed; feed = 0 disallows it for new listings.
 	function setQuote(address quote, AggregatorV3Interface feed, uint32 heartbeat) external onlyOwner {
 		if (quote == address(0)) revert ZeroAddress();
 		quotes[quote] = Quote(feed, heartbeat);
@@ -175,10 +160,8 @@ contract TwapListingRegistry is Ownable2Step {
 		emit Listed(asset, address(adapter), pool, quote, venue);
 	}
 
-	/// @notice Start or clear `asset`'s 72-hour clock from the pool's state RIGHT NOW. Anyone
-	///         may call it (the keeper does, every pass; a manager whose pool recovered can clear
-	///         it) — the chain, not the caller, decides. A pool that can no longer serve the
-	///         window counts as under the floor.
+	/// @notice Start or clear `asset`'s 72-hour clock from the pool's current state. Anyone may call
+	///         it; a pool that can no longer serve the window counts as under the floor.
 	/// @return below whether the pool is under the floor now
 	function pokeFloor(address asset) external returns (bool below) {
 		Listing storage l = listings[asset];
@@ -210,8 +193,8 @@ contract TwapListingRegistry is Ownable2Step {
 		return since != 0 && block.timestamp >= since + DELIST_GRACE;
 	}
 
-	/// @notice True while the VI prices `asset` through this registry's adapter — the
-	///         definition of a TWAP-tier holding the exposure policy caps.
+	/// @notice True while the VI prices `asset` through this registry's adapter (what the
+	///         exposure policy caps).
 	function isTwapPriced(address asset) public view returns (bool) {
 		Listing storage l = listings[asset];
 		if (address(l.adapter) == address(0)) return false;

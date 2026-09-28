@@ -2,13 +2,9 @@
 pragma solidity 0.8.24;
 
 /// @title IExternalPosition
-/// @notice A non-ERC20 fund holding that lives outside the Vault and reports its value
-///         as virtual managed (+) and debt (-) asset positions, aggregated into GAV by
-///         the ValueInterpreter.
-/// @dev Pattern per Enzyme v4 external positions (spec/topics/external-positions.md).
-///      First planned implementation: HyperliquidPerpPosition (the delta-neutral hedge leg).
-///      Funds holding external positions must use specific-assets redemption as the canonical
-///      exit — in-kind redemption forfeits external-position value (spec/topics/fund-holdings.md).
+/// @notice A fund holding outside the Vault that reports its value as managed (+) and debt (-)
+///         assets, aggregated into GAV.
+/// @dev In-kind redemption forfeits external-position value.
 interface IExternalPosition {
 	/// @notice Assets this position manages (positive value).
 	function getManagedAssets() external returns (address[] memory assets, uint256[] memory amounts);
@@ -16,14 +12,11 @@ interface IExternalPosition {
 	/// @notice Assets this position owes (negative value).
 	function getDebtAssets() external returns (address[] memory assets, uint256[] memory amounts);
 
-	/// @notice Entry point for position actions. MUST only be callable via the owning fund's
-	///         Comptroller so every interaction passes policy hooks.
+	/// @notice Entry point for position actions; only the owning Comptroller may call it (policy hooks).
 	function receiveCallFromFund(bytes calldata actionData) external;
 
-	/// @notice True only for an action that can move value solely back toward the fund (e.g.
-	///         closing a perp, cancelling an order, returning cash to the vault). The Comptroller
-	///         runs such an action — when nothing leaves the vault with it — WITHOUT pricing
-	///         the position, so a down or stale oracle never stops a manager from cutting risk
-	///         (security review 2026-09-24, H-1). Answer false for anything else.
+	/// @notice True only for an action that moves value solely back toward the fund (close,
+	///         cancel, return to vault). Such actions run unpriced, so a stale oracle never
+	///         blocks cutting risk. False for anything else.
 	function isRiskReducing(bytes calldata actionData) external view returns (bool);
 }

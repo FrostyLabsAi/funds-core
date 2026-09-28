@@ -5,15 +5,11 @@ import {AggregatorV3Interface} from '../interfaces/AggregatorV3Interface.sol';
 import {RedstonePriceStore} from './RedstonePriceStore.sol';
 
 /// @title RedstoneAggregatorAdapter
-/// @notice One RedStone feed from a RedstonePriceStore, exposed as a Chainlink AggregatorV3
-///         feed — so the ValueInterpreter prices RedStone-covered assets through the same
-///         `addPrimitive` path as Chainlink and Pyth, with no protocol changes.
-///         Order of preference per asset: Chainlink → RedStone / Pyth → TWAP → side pocket.
-/// @dev STALENESS is two-layered, exactly like PythAggregatorAdapter: the VI's per-asset
-///      heartbeat stays the market-hours gate (`updatedAt` = package time), and `maxPushAge`
-///      bounds how old a stored print may be before reads revert (H-3: submissions are
-///      permissionless, so a wide heartbeat alone would let an actor choose the print around
-///      GAV actions — the keeper pushes fresher than maxPushAge before they happen).
+/// @notice One RedStone feed from a RedstonePriceStore exposed as a Chainlink AggregatorV3 feed,
+///         so the ValueInterpreter prices it through the same `addPrimitive` path.
+/// @dev `updatedAt` = package time (the VI heartbeat gates it); `maxPushAge` bounds the stored
+///      print's age, because submissions are permissionless and an actor could otherwise choose
+///      the print around GAV actions.
 contract RedstoneAggregatorAdapter is AggregatorV3Interface {
 	RedstonePriceStore public immutable store;
 	bytes32 public immutable dataFeedId;
@@ -33,7 +29,7 @@ contract RedstoneAggregatorAdapter is AggregatorV3Interface {
 	}
 
 	/// @inheritdoc AggregatorV3Interface
-	/// @dev RedStone numeric values carry 8 decimals — the Chainlink USD convention
+	/// @dev RedStone numeric values carry 8 decimals
 	function decimals() external pure returns (uint8) {
 		return 8;
 	}
