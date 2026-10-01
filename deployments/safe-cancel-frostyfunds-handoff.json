@@ -1,0 +1,18 @@
+{
+  "version": "1.0",
+  "chainId": "8453",
+  "meta": {
+    "name": "FrostyFunds governance handoff - CANCEL the scheduled acceptOwnership",
+    "description": "Cancels timelock operation 0xaa2216e65411cac6e7304b5e234f0274ff9ebc880c095fba7a24088a1e70888a (the batch that would make the timelock accept ownership of the ValueInterpreter, FundFactory, TwapListingRegistry and VerantaPerpPositionV2Factory). The deployer keeps ownership; re-run StartFundsGovernance + a new Safe schedule before opening to the public.",
+    "createdFromSafeAddress": "0xB0f37bE90a8BD82D991Bf694F960C67198778B8B"
+  },
+  "transactions": [
+    {
+      "to": "0xd50AF6A924f23AC6944fB8eBc981E006B07D83Ba",
+      "value": "0",
+      "data": "0xc4d252f5aa2216e65411cac6e7304b5e234f0274ff9ebc880c095fba7a24088a1e70888a",
+      "contractMethod": null,
+      "contractInputsValues": null
+    }
+  ]
+}

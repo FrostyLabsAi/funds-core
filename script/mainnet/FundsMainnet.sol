@@ -55,7 +55,7 @@ library FundsMainnet {
 	address internal constant EURC = 0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42;
 
 	address internal constant CL_USDC_USD = 0x7e860098F58bBFC8648a4311b374B1D669a2bc6B;
-	address internal constant CL_ETH_USD = 0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70;
+	address internal constant CL_ETH_USD = 0x50015f8b17fb2C290Dde41fDc246ed0dcEE93a8b;
 	address internal constant CL_CBBTC_USD = 0x07DA0E54543a844a80ABE69c8A12F22B3aA59f9D;
 	address internal constant CL_AERO_USD = 0x4EC5970fC728C5f65ba413992CD5fF6FD70fcfF0;
 	address internal constant CL_EURC_USD = 0xDAe398520e2B67cd3f27aeF9Cf14D93D927f8250;
