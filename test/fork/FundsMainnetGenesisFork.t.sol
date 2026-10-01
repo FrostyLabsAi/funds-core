@@ -5,6 +5,7 @@ import {Test} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {IERC4626} from '@openzeppelin/contracts/interfaces/IERC4626.sol';
 import {Ownable} from '@openzeppelin/contracts/access/Ownable.sol';
+import {Ownable2Step} from '@openzeppelin/contracts/access/Ownable2Step.sol';
 import {TimelockController} from '@openzeppelin/contracts/governance/TimelockController.sol';
 import {FundFactory} from '../../src/core/FundFactory.sol';
 import {Comptroller} from '../../src/core/Comptroller.sol';
@@ -12,10 +13,13 @@ import {AggregatorV3Interface} from '../../src/interfaces/AggregatorV3Interface.
 import {IVerantaMulticall} from '../../src/interfaces/external/IVeranta.sol';
 import {VerantaPerpPositionV2} from '../../src/positions/VerantaPerpPositionV2.sol';
 import {TwapListingRegistry} from '../../src/pricing/TwapListingRegistry.sol';
+import {ValueInterpreter} from '../../src/core/ValueInterpreter.sol';
+import {PriceListingModule} from '../../src/pricing/PriceListingModule.sol';
 import {ProtocolFeeReserve} from '../../src/core/ProtocolFeeReserve.sol';
 import {MockERC20} from '../utils/Mocks.sol';
 import {FundsMainnet} from '../../script/mainnet/FundsMainnet.sol';
 import {FundsGovernance} from '../../script/mainnet/FundsGovernance.sol';
+import {TwapListingV2} from '../../script/mainnet/TwapListingV2.sol';
 
 /// @notice THE MAINNET GENESIS REHEARSAL, on a Base fork against every real venue:
 ///         deploy exactly what DeployFundsMainnet ships → price the genesis assets → a fund
@@ -36,6 +40,8 @@ contract FundsMainnetGenesisForkTest is Test {
 	address internal alice = makeAddr('alice');
 	TimelockController internal timelock;
 	FundsMainnet.Deployed internal d;
+	/// @dev TWAP listing v2 not deployed: the handoff as genesis shipped it
+	FundsGovernance.TwapV2 internal noTwapV2;
 
 	function setUp() public {
 		string memory rpc = vm.envOr('BASE_MAINNET_RPC', string(''));
@@ -140,9 +146,9 @@ contract FundsMainnetGenesisForkTest is Test {
 		Comptroller fund = _fundWithDeposit(1_000e6);
 
 		vm.startPrank(deployer);
-		FundsGovernance.start(d, address(timelock), deployer);
+		FundsGovernance.start(d, noTwapV2, address(timelock), deployer);
 		vm.stopPrank();
-		(address[] memory targets, uint256[] memory values, bytes[] memory payloads) = FundsGovernance.acceptBatch(d);
+		(address[] memory targets, uint256[] memory values, bytes[] memory payloads) = FundsGovernance.acceptBatch(d, noTwapV2);
 		bytes32 salt = keccak256('frostyfunds-genesis');
 		vm.prank(SAFE);
 		timelock.scheduleBatch(targets, values, payloads, bytes32(0), salt, 2 days);
@@ -153,7 +159,7 @@ contract FundsMainnetGenesisForkTest is Test {
 		skip(2 days);
 		timelock.executeBatch(targets, values, payloads, bytes32(0), salt);
 
-		FundsGovernance.verify(d, address(timelock), SAFE, deployer, keeper);
+		FundsGovernance.verify(d, noTwapV2, address(timelock), SAFE, deployer, keeper);
 
 		// the deployer is powerless everywhere
 		vm.startPrank(deployer);
@@ -180,7 +186,134 @@ contract FundsMainnetGenesisForkTest is Test {
 		assertFalse(fund.guardianDepositsPaused());
 	}
 
+	/// @notice TWAP listing v2 wired first (the module owns the VI), then the handoff: the MODULE and
+	///         registry v2 move to the timelock in the VI's place, and the deployer holds nothing.
+	function test_fork_handoffWithTwapV2() public {
+		vm.skip(!forked);
+		address twapKeeper = makeAddr('twapKeeper');
+
+		// a v2 whose module does not own the VI (a v2 deploy that died mid-broadcast) is refused before anything moves
+		FundsGovernance.TwapV2 memory halfWired = noTwapV2;
+		halfWired.module = PriceListingModule(makeAddr('moduleWithoutTheVi'));
+		vm.expectRevert(abi.encodeWithSelector(FundsGovernance.ModuleNotViOwner.selector, deployer));
+		this.startExternal(halfWired);
+
+		// exactly what DeployTwapListingV2 broadcasts, on this genesis, with a non-deployer keeper
+		vm.startPrank(deployer);
+		TwapListingV2.Deployed memory t = TwapListingV2.deploy(
+			TwapListingV2.Config({
+				deployer: deployer,
+				valueInterpreter: d.valueInterpreter,
+				factory: d.factory,
+				twapPolicyV1: address(d.twapPolicy),
+				keeper: twapKeeper
+			})
+		);
+		FundsGovernance.TwapV2 memory v2 = FundsGovernance.TwapV2({module: t.module, registry: t.registry, policy: address(t.policy)});
+		FundsGovernance.start(d, v2, address(timelock), deployer);
+		vm.stopPrank();
+
+		// module, registry v2, factory, v1 registry, Veranta factory, fee reserve — never the VI
+		(address[] memory targets, uint256[] memory values, bytes[] memory payloads) = FundsGovernance.acceptBatch(d, v2);
+		assertEq(targets.length, 6);
+		for (uint256 i; i < targets.length; ++i) {
+			assertTrue(targets[i] != address(d.valueInterpreter));
+		}
+		vm.prank(SAFE);
+		timelock.scheduleBatch(targets, values, payloads, bytes32(0), keccak256('frostyfunds-twap-v2'), 2 days);
+		skip(2 days);
+		timelock.executeBatch(targets, values, payloads, bytes32(0), keccak256('frostyfunds-twap-v2'));
+
+		FundsGovernance.verify(d, v2, address(timelock), SAFE, deployer, keeper);
+		assertEq(d.valueInterpreter.owner(), address(t.module));
+		assertTrue(t.module.keepers(twapKeeper)); // the auto-lister keeps its role through the handoff
+
+		// the deployer is powerless over the module, registry v2 and the VI
+		vm.startPrank(deployer);
+		vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, deployer));
+		t.module.execute(abi.encodeCall(ValueInterpreter.setAnswerBounds, (FundsMainnet.USDC, 1, 10e8)));
+		vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, deployer));
+		t.module.setKeeper(deployer, true);
+		vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, deployer));
+		t.registry.setLister(deployer, true);
+		vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, deployer));
+		d.valueInterpreter.addPrimitive(address(1), address(2), 1 hours);
+		vm.stopPrank();
+
+		// the timelock reaches VI admin through the module
+		vm.prank(address(timelock));
+		t.module.execute(abi.encodeCall(ValueInterpreter.setAnswerBounds, (FundsMainnet.USDC, 1, 10e8)));
+		(int256 min, int256 max) = d.valueInterpreter.answerBounds(FundsMainnet.USDC);
+		assertEq(min, 1);
+		assertEq(max, 10e8);
+
+		_assertVerifyCatchesTwapV2Regressions(v2, address(d.twapPolicy));
+	}
+
 	// ─── helpers ─────────────────────────────────────────────────────────────────
+
+	/// @dev external so a revert can be expected (library calls are inlined)
+	function verifyExternal(FundsGovernance.TwapV2 memory v2) external view {
+		FundsGovernance.verify(d, v2, address(timelock), SAFE, deployer, keeper);
+	}
+
+	/// @dev external so a revert can be expected (library calls are inlined)
+	function startExternal(FundsGovernance.TwapV2 memory v2) external {
+		FundsGovernance.start(d, v2, address(timelock), deployer);
+	}
+
+	/// @dev Each v2 check in {FundsGovernance.verify} fires on its own regression (each undone after),
+	///      and a verify that ignores v2 is refused once the module owns the VI.
+	function _assertVerifyCatchesTwapV2Regressions(FundsGovernance.TwapV2 memory v2, address twapPolicyV1) internal {
+		vm.expectRevert(
+			abi.encodeWithSelector(FundsGovernance.NotHandedOff.selector, address(d.valueInterpreter), address(v2.module))
+		);
+		this.verifyExternal(noTwapV2);
+
+		vm.startPrank(address(timelock));
+		v2.module.setKeeper(deployer, true);
+		vm.expectRevert(FundsGovernance.DeployerIsModuleKeeper.selector);
+		this.verifyExternal(v2);
+		v2.module.setKeeper(deployer, false);
+
+		v2.registry.setLister(deployer, true);
+		vm.expectRevert(FundsGovernance.DeployerStillV2Lister.selector);
+		this.verifyExternal(v2);
+		v2.registry.setLister(deployer, false);
+
+		v2.registry.setLister(address(v2.module), false);
+		vm.expectRevert(FundsGovernance.ModuleNotLister.selector);
+		this.verifyExternal(v2);
+		v2.registry.setLister(address(v2.module), true);
+
+		// the VI handed on by the module: caught while pending, and once accepted — then handed back
+		address stranger = makeAddr('stranger');
+		v2.module.execute(abi.encodeCall(Ownable2Step.transferOwnership, (stranger)));
+		vm.expectRevert(
+			abi.encodeWithSelector(FundsGovernance.StillPending.selector, address(d.valueInterpreter), stranger)
+		);
+		this.verifyExternal(v2);
+		vm.stopPrank();
+		vm.startPrank(stranger);
+		d.valueInterpreter.acceptOwnership();
+		vm.expectRevert(abi.encodeWithSelector(FundsGovernance.ModuleNotViOwner.selector, stranger));
+		this.verifyExternal(v2);
+		d.valueInterpreter.transferOwnership(address(v2.module));
+		vm.stopPrank();
+		vm.startPrank(address(timelock));
+		v2.module.execute(abi.encodeCall(Ownable2Step.acceptOwnership, ()));
+
+		FundFactory.PolicyReg[] memory mandatory = d.factory.getMandatoryPolicies();
+		mandatory[2].policy = twapPolicyV1;
+		d.factory.setMandatoryPolicies(mandatory);
+		vm.expectRevert(abi.encodeWithSelector(FundsGovernance.MandatoryPolicyNotV2.selector, uint256(2), twapPolicyV1));
+		this.verifyExternal(v2);
+		mandatory[2].policy = v2.policy;
+		d.factory.setMandatoryPolicies(mandatory);
+		vm.stopPrank();
+
+		this.verifyExternal(v2);
+	}
 
 	function _fundWithDeposit(uint256 amount) internal returns (Comptroller fund) {
 		fund = Comptroller(
@@ -239,6 +372,8 @@ contract FundsMainnetGenesisNoFrostForkTest is Test {
 	address internal alice = makeAddr('alice');
 	TimelockController internal timelock;
 	FundsMainnet.Deployed internal d;
+	/// @dev TWAP listing v2 not deployed: the handoff as genesis shipped it
+	FundsGovernance.TwapV2 internal noTwapV2;
 
 	function setUp() public {
 		string memory rpc = vm.envOr('BASE_MAINNET_RPC', string(''));
@@ -263,7 +398,7 @@ contract FundsMainnetGenesisNoFrostForkTest is Test {
 		assertEq(address(d.feeReserve), address(0));
 		assertEq(d.factory.protocolFeeBps(), 0);
 		assertEq(d.factory.protocolFeeRecipient(), address(0));
-		assertEq(FundsGovernance.owned(d).length, 4);
+		assertEq(FundsGovernance.owned(d, noTwapV2).length, 4);
 	}
 
 	function test_fork_noFrost_aFeeWithoutFrostIsRefused() public {
@@ -279,15 +414,15 @@ contract FundsMainnetGenesisNoFrostForkTest is Test {
 
 		// handoff — four owners, no reserve
 		vm.startPrank(deployer);
-		FundsGovernance.start(d, address(timelock), deployer);
+		FundsGovernance.start(d, noTwapV2, address(timelock), deployer);
 		vm.stopPrank();
-		(address[] memory targets, uint256[] memory values, bytes[] memory payloads) = FundsGovernance.acceptBatch(d);
+		(address[] memory targets, uint256[] memory values, bytes[] memory payloads) = FundsGovernance.acceptBatch(d, noTwapV2);
 		assertEq(targets.length, 4);
 		vm.prank(SAFE);
 		timelock.scheduleBatch(targets, values, payloads, bytes32(0), keccak256('handoff'), 2 days);
 		skip(2 days);
 		timelock.executeBatch(targets, values, payloads, bytes32(0), keccak256('handoff'));
-		FundsGovernance.verify(d, address(timelock), SAFE, deployer, keeper);
+		FundsGovernance.verify(d, noTwapV2, address(timelock), SAFE, deployer, keeper);
 
 		// half a year with the fee off — nobody touches either fund
 		skip(180 days);

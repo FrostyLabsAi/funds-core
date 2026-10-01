@@ -43,7 +43,7 @@ contract ScriptedPool {
 	}
 
 	function slot0() external view returns (uint160, int24, uint16, uint16, uint16, bool) {
-		return (TickMath.getSqrtRatioAtTick(spotTick), spotTick, 0, 1, 1, true);
+		return (TickMath.getSqrtRatioAtTick(spotTick), spotTick, 0, 900, 900, true);
 	}
 
 	// Flat liquidity profile (no initialized ticks): the band minimum equals the current
