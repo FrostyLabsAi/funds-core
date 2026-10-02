@@ -39,7 +39,7 @@ library FundsGovernance {
 	struct TwapV2 {
 		PriceListingModule module;
 		TwapListingRegistryV2 registry;
-		address policy; // TwapExposurePolicyV2 — every mandatory entry
+		address policy; // the TWAP exposure policy every mandatory entry names: V2, or V3 once DeployTwapPolicyV3 ran
 	}
 
 	/// @notice Fee compounders + re-pointed position types (CompoundersMainnet.Deployed); `factory` zero = not deployed.

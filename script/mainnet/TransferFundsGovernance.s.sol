@@ -25,6 +25,9 @@ abstract contract FundsGovernanceBase is Script {
 	string internal constant TWAP_V2_FILE = 'deployments/base-mainnet-twap-v2.json';
 	/// @dev What DeployCompoundersMainnet writes; absent = not deployed.
 	string internal constant COMPOUNDERS_FILE = 'deployments/base-mainnet-compounders.json';
+	/// @dev What DeployTwapPolicyV3 writes; present = every mandatory entry must name its policy.
+	///      TWAP_POLICY_V3_FILE (env) overrides the path, for the anvil rehearsal.
+	string internal constant TWAP_POLICY_V3_FILE = 'deployments/base-mainnet-twap-policy-v3.json';
 
 	function _file() internal view returns (string memory) {
 		return vm.envOr('DEPLOYMENTS_FILE', string('deployments/base-mainnet.json'));
@@ -58,7 +61,13 @@ abstract contract FundsGovernanceBase is Script {
 		console2.log('TWAP v2: found', TWAP_V2_FILE);
 		console2.log('  PriceListingModule (owns the ValueInterpreter)', address(v2.module));
 		console2.log('  TwapListingRegistryV2', address(v2.registry));
-		console2.log('  TwapExposurePolicyV2', v2.policy);
+		string memory v3File = vm.envOr('TWAP_POLICY_V3_FILE', string(TWAP_POLICY_V3_FILE));
+		if (vm.exists(v3File)) {
+			v2.policy = vm.parseJsonAddress(vm.readFile(v3File), '.policy');
+			console2.log('  TwapExposurePolicyV3 (every mandatory entry)', v2.policy);
+		} else {
+			console2.log('  TwapExposurePolicyV2', v2.policy);
+		}
 	}
 
 	/// @dev The fee compounders from COMPOUNDERS_FILE when it exists; otherwise the zero struct
