@@ -9,6 +9,8 @@ import {MockERC20} from '../utils/Mocks.sol';
 import {VerantaFundingFixture as Fx} from '../utils/VerantaFundingFixture.sol';
 import {FundsMainnet} from '../../script/mainnet/FundsMainnet.sol';
 import {VerantaListing, IVerantaPairCatalog} from '../../script/mainnet/VerantaListing.sol';
+import {TwapListingV2} from '../../script/mainnet/TwapListingV2.sol';
+import {PriceListingModule} from '../../src/pricing/PriceListingModule.sol';
 
 /// @notice The Veranta listing batch on the genesis deployment, against Veranta's LIVE pair
 ///         catalog on Base mainnet: every listed, Lazer-priced pair that genesis left unmapped
@@ -24,6 +26,7 @@ contract VerantaListingForkTest is Test {
 	address internal deployer = makeAddr('deployer');
 	FundsMainnet.Deployed internal d;
 	VerantaPriceStore internal store;
+	PriceListingModule internal module;
 
 	function setUp() public {
 		string memory rpc = vm.envOr('BASE_MAINNET_RPC', string(''));
@@ -38,13 +41,28 @@ contract VerantaListingForkTest is Test {
 		store = new VerantaPriceStore(
 			IPythLazerVerifier(VerantaListing.PYTH_LAZER_VERIFIER), IVerantaLazerPairs(FundsMainnet.VERANTA_PAIR_STORAGE)
 		);
+		// as on mainnet since 2026-10-01: TWAP listing v2 hands the VI to its PriceListingModule
+		module = _deployTwapV2();
 		vm.stopPrank();
+		assertEq(d.valueInterpreter.owner(), address(module), 'the module owns the VI');
+	}
+
+	function _deployTwapV2() internal returns (PriceListingModule) {
+		return TwapListingV2.deploy(
+			TwapListingV2.Config({
+				deployer: deployer,
+				valueInterpreter: d.valueInterpreter,
+				factory: d.factory,
+				twapPolicyV1: address(d.twapPolicy),
+				keeper: address(0)
+			})
+		).module;
 	}
 
 	function test_fork_listsEveryUnmappedLazerPair_withTheRightMaxAge() public {
 		vm.skip(!forked);
 		vm.startPrank(deployer);
-		uint256 listed = VerantaListing.listAll(store, d.valueInterpreter, d.verantaFactory);
+		uint256 listed = VerantaListing.listAll(store, module, d.verantaFactory);
 		vm.stopPrank();
 
 		uint256 expected;
@@ -78,7 +96,7 @@ contract VerantaListingForkTest is Test {
 	function test_fork_afterARelay_theViPricesListedMarkersAtVerantasPrice() public {
 		vm.skip(!forked);
 		vm.startPrank(deployer);
-		VerantaListing.listAll(store, d.valueInterpreter, d.verantaFactory);
+		VerantaListing.listAll(store, module, d.verantaFactory);
 		vm.stopPrank();
 		store.relayFunding{value: 1 ether}(Fx.calldata_());
 
@@ -97,8 +115,8 @@ contract VerantaListingForkTest is Test {
 	function test_fork_listingTwiceIsANoOp() public {
 		vm.skip(!forked);
 		vm.startPrank(deployer);
-		VerantaListing.listAll(store, d.valueInterpreter, d.verantaFactory);
-		assertEq(VerantaListing.listAll(store, d.valueInterpreter, d.verantaFactory), 0, 'already-mapped pairs are skipped');
+		VerantaListing.listAll(store, module, d.verantaFactory);
+		assertEq(VerantaListing.listAll(store, module, d.verantaFactory), 0, 'already-mapped pairs are skipped');
 		vm.stopPrank();
 	}
 }

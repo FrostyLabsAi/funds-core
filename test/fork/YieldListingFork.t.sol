@@ -10,6 +10,8 @@ import {MockERC20} from '../utils/Mocks.sol';
 import {VerantaFundingFixture as Fx} from '../utils/VerantaFundingFixture.sol';
 import {FundsMainnet} from '../../script/mainnet/FundsMainnet.sol';
 import {YieldListing} from '../../script/mainnet/YieldListing.sol';
+import {TwapListingV2} from '../../script/mainnet/TwapListingV2.sol';
+import {PriceListingModule} from '../../src/pricing/PriceListingModule.sol';
 
 /// @notice The yield listing batch on the genesis deployment against the REAL vaults on Base:
 ///         Aave V3 static aTokens and Morpho MetaMorpho vaults become VI derivatives, and a
@@ -27,6 +29,7 @@ contract YieldListingForkTest is Test {
 	address internal alice = makeAddr('alice');
 	FundsMainnet.Deployed internal d;
 	address internal feed;
+	PriceListingModule internal module;
 
 	function setUp() public {
 		string memory rpc = vm.envOr('BASE_MAINNET_RPC', string(''));
@@ -39,12 +42,23 @@ contract YieldListingForkTest is Test {
 			FundsMainnet.Config({deployer: deployer, safe: SAFE, frost: address(frostStandIn), autopilotKeeper: makeAddr('keeper'), protocolFeeBps: 25})
 		);
 		feed = address(new ERC4626PriceFeed());
+		// as on mainnet since 2026-10-01: TWAP listing v2 hands the VI to its PriceListingModule
+		module = TwapListingV2.deploy(
+			TwapListingV2.Config({
+				deployer: deployer,
+				valueInterpreter: d.valueInterpreter,
+				factory: d.factory,
+				twapPolicyV1: address(d.twapPolicy),
+				keeper: address(0)
+			})
+		).module;
 		vm.stopPrank();
+		assertEq(d.valueInterpreter.owner(), address(module), 'the module owns the VI');
 	}
 
 	function _list() internal returns (uint256 listed) {
 		vm.startPrank(deployer);
-		listed = YieldListing.listAll(d.valueInterpreter, feed, YieldListing.nonStockVaults());
+		listed = YieldListing.listAll(module, feed, YieldListing.nonStockVaults());
 		vm.stopPrank();
 	}
 
@@ -90,7 +104,7 @@ contract YieldListingForkTest is Test {
 
 	function listExternal(address[] memory vaults) external {
 		vm.startPrank(deployer);
-		YieldListing.listAll(d.valueInterpreter, feed, vaults);
+		YieldListing.listAll(module, feed, vaults);
 		vm.stopPrank();
 	}
 
