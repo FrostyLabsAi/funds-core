@@ -20,15 +20,38 @@ import {TickMath} from '../../src/libraries/TickMath.sol';
 import {TwapAggregatorAdapter, IConcentratedPoolOracle} from '../../src/pricing/TwapAggregatorAdapter.sol';
 import {IUniswapV3PoolFactory, ISlipstreamPoolFactory} from '../../src/pricing/TwapListingRegistry.sol';
 import {TwapAggregatorAdapterV2} from '../../src/pricing/TwapAggregatorAdapterV2.sol';
-import {TwapListingRegistryV2} from '../../src/pricing/TwapListingRegistryV2.sol';
+import {
+	TwapListingRegistryV2, IUniswapV2Factory, IAerodromeBasicFactory
+} from '../../src/pricing/TwapListingRegistryV2.sol';
 import {PriceListingModule} from '../../src/pricing/PriceListingModule.sol';
 import {TwapExposurePolicyV2} from '../../src/policies/TwapExposurePolicyV2.sol';
 import {FundsMainnet} from '../../script/mainnet/FundsMainnet.sol';
 import {TwapListingV2} from '../../script/mainnet/TwapListingV2.sol';
+import {ITwapPriceAdapter} from '../../src/interfaces/ITwapPriceAdapter.sol';
+import {UniswapV2TwapAdapter} from '../../src/pricing/UniswapV2TwapAdapter.sol';
+import {UniswapV2ObservationRecorder, IUniswapV2Pair} from '../../src/pricing/UniswapV2ObservationRecorder.sol';
+import {AerodromeBasicTwapAdapter, IAerodromeBasicPool} from '../../src/pricing/AerodromeBasicTwapAdapter.sol';
+import {IUniswapV2Router02} from '../../src/interfaces/external/IUniswapV2Router02.sol';
+import {IAerodromeRouter} from '../../src/interfaces/external/IAerodromeRouter.sol';
 
 /// @notice The Uniswap v3 pool's fee (the NPM keys pools by it).
 interface IUniswapV3PoolFee {
 	function fee() external view returns (uint24);
+}
+
+/// @notice Router02 0x4752…aD24's 0.3%-fee x·y=k quote (verified Basescan source; as in
+///         test/fork/V2SwapAdaptersFork.t.sol).
+interface IUniswapV2RouterQuote {
+	function getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut) external pure returns (uint256);
+}
+
+/// @notice B18 (0xA0c8…25Cb, verified source; test/fork/V2SwapAdaptersFork.t.sol): transfers to or
+///         from a listed pair pay buyFeeRate / sellFeeRate of RATE_UNIT.
+interface IB18Tax {
+	function buyFeeRate() external view returns (uint256);
+	function sellFeeRate() external view returns (uint256);
+	function RATE_UNIT() external view returns (uint256);
+	function swapPairList(address) external view returns (bool);
 }
 
 /// @notice The oracle-ring surface a keeper uses on a young pool (Uniswap v3 and Slipstream alike).
@@ -46,18 +69,41 @@ interface IOracleRing {
 ///         genesis deployer (read from deployments/base-mainnet.json) with a test keeper, then every
 ///         test drives real pools, real routers, the real Uniswap NonfungiblePositionManager and
 ///         real Chainlink feeds. No mocks; `deal` only funds balances.
+///         The rule split (v2b): the QUOTE RESERVE (USDC/WETH/cbBTC the pool holds × its feed,
+///         ≥ $25k) gates listing and the delist clock; the ±10% quote-side BAND sizes the caps, the
+///         recorded depth and the repoint margin. Under-floor scenarios push RESERVES under $25k with
+///         real sells (selling the asset pays quote out of the pool).
+///         F2 / Ruling 23: the floor is two-part — the band must also hold MIN_BAND_DEPTH_USD
+///         ($1,282, what a full-range pool at the $25k reserve floor has within −10%). A real pool
+///         with a big balance and no bids (CHECK) is refused, and a real rug that removes the
+///         liquidity without collecting it (VIRTUAL's quiet 1% pool) starts the clock.
 ///         Proven here: keepers list real tokens (strangers and governance can't); one-sided junk
-///         is refused; WETH-quoted and Slipstream-3 listings price and trade; repoints need a 25%
-///         deeper pool unless the current one is under the floor; flash (same-transaction)
-///         liquidity can neither clear a delist clock nor lift a fund's cap; governance keeps
-///         every VI admin call; caps bind on quote-side depth; the lens pages real listings.
-///         Deviations from the task brief, both forced by live state (block 52008523, measured
-///         with this registry's own adapter parameters):
-///         - BRETT's Slipstream ts200 WETH pool 0x4e82…Ba02 holds $32,294 of WETH within ±10%, under
-///           the $50k floor, so it cannot list; LCAP on the same venue and spacing ($159,682) is used.
+///         is refused on its reserve; WETH-, cbBTC- and Slipstream-3 listings price and trade;
+///         Uniswap v2 (after the keeper's recorder snapshot) and Aerodrome basic listings price and
+///         the live fund trades them through the new swap adapters; an Aerodrome sAMM pool is never
+///         listed; a thin band lists and caps a fund at 10% of it; repoints need a 25% deeper band
+///         unless the current reserve is under the floor; flash (same-transaction) liquidity can
+///         neither clear a delist clock nor lift a fund's cap; governance keeps every VI admin
+///         call; caps bind on quote-side depth; the lens pages and flags real listings on all three
+///         pool kinds; a transfer-taxed token lists on-chain (refusing it is keeper policy).
+///         Deviations from the task brief, each forced by live state (measured with this
+///         registry's own adapter parameters; block 52008523 for the v2 constants, 52014634 for the
+///         v2b ones):
 ///         - TRX's Slipstream-3 ts100 USDC pool 0xf041…7Cb5 holds $5.67M USDC but $36 of it within
 ///           ±10%; USDL (Slipstream-3 USDC ts50, $345,107; all three of its pools are on Slip3) is used.
-///         Run: BASE_MAINNET_RPC=<url> [BASE_FORK_BLOCK=52008523] forge test --match-path test/fork/TwapListingV2Fork.t.sol -j 1 -vv
+///         - The WETH-quoted example stays LCAP: under v2 BRETT's thin band ($32k) could not list.
+///           Under the rule split it lists on its reserve, which test_fork_thinBandListsWithTinyCap shows.
+///         - Under-floor repoint: MORPHO can no longer show it. Selling into its WETH 0.3% pool until
+///           the reserve crosses $25k leaves ~$4k in band, while its only other qualifying pools
+///           (USDC 1% $55k band, Slipstream WETH ts200 $68k) are far over 1.25× that, and its
+///           Aerodrome / Uniswap v2 pools are empty. LCAP is used: its Slipstream USDC ts200 pool
+///           keeps $12.3k in band when its reserve crosses $25k, and its Aerodrome vAMM USDC pool
+///           ($101k reserve, $5.2k band) qualifies without being 25% deeper.
+///         - VIRTUAL's USDC 0.3% pool keeps ~$24.8k of USDC that sells can't reach (a 130,000-tick
+///           push still leaves $24,822), so it can't be put far under the floor; the dump scenarios
+///           sell into VIRTUAL's Slipstream WETH ts200 pool instead (20,000 ticks leave $4,006), and
+///           the lens test dumps LCAP's Slipstream WETH pool.
+///         Run: BASE_MAINNET_RPC=<url> [BASE_FORK_BLOCK=52014634] forge test --match-path test/fork/TwapListingV2Fork.t.sol -j 1 -vv
 contract TwapListingV2ForkTest is Test {
 	string internal constant GENESIS_FILE = 'deployments/base-mainnet.json';
 
@@ -65,6 +111,8 @@ contract TwapListingV2ForkTest is Test {
 	TwapListingRegistryV2.Venue internal constant SLIP = TwapListingRegistryV2.Venue.Slipstream;
 	TwapListingRegistryV2.Venue internal constant SLIP2 = TwapListingRegistryV2.Venue.Slipstream2;
 	TwapListingRegistryV2.Venue internal constant SLIP3 = TwapListingRegistryV2.Venue.Slipstream3;
+	TwapListingRegistryV2.Venue internal constant UNIV2 = TwapListingRegistryV2.Venue.UniswapV2;
+	TwapListingRegistryV2.Venue internal constant AERO = TwapListingRegistryV2.Venue.AerodromeBasic;
 
 	// ─── Base mainnet, each read with `cast` at block 52008523 ──────────────────
 	address internal constant USDC = FundsMainnet.USDC;
@@ -80,8 +128,8 @@ contract TwapListingV2ForkTest is Test {
 	// Oracle rings (slot0 observationCardinality / next, raw word 4, cast at block 52008523):
 	// VIRTUAL_USDC_3000 600/600, VIRTUAL_WETH_SLIP_200 10000/10000, VIRTUAL_WETH_UNI_500 10000/10000,
 	// VIRTUAL_WETH_SLIP_100 900/900, VIRTUAL_WETH_SLIP2_50 360/360, LCAP_WETH_SLIP_200 360/360,
-	// LCAP_USDC_SLIP_200 360/360, MORPHO_WETH_3000 301/301, MORPHO_USDC_10000 360/360,
-	// VVV_USDC_3000 360/360, USDT_USDC_UNI_100 1000/1000 — all over MIN_OBSERVATION_CARDINALITY (300).
+	// LCAP_USDC_SLIP_200 360/360, VVV_USDC_3000 360/360, USDT_USDC_UNI_100 1000/1000; at block 52014634:
+	// BRETT_WETH_SLIP_200 5000, ZEN_CBBTC_SLIP_200 500 — all over MIN_OBSERVATION_CARDINALITY (300).
 	// LUMIA_POOL 1/1 and USDL_USDC_SLIP3_50 1/1: listed only after `_prepareOracle`, as the keeper would.
 	uint16 internal constant ORACLE_RING = 300;
 
@@ -107,10 +155,17 @@ contract TwapListingV2ForkTest is Test {
 
 	/// @dev name "CF Large Cap Index", symbol "LCAP", unpriced in the live VI
 	address internal constant LCAP = 0x4dA9A0f397dB1397902070f93a4D6ddBC0E0E6e8;
-	/// @dev Slipstream getPool(LCAP, WETH, 200): $159,682 of WETH within ±10%
+	/// @dev Slipstream getPool(LCAP, WETH, 200): $159,682 of WETH within ±10%; LCAP is token1. At
+	///      block 52014634: $305,346 WETH reserve, $158,986 band; UNDER_FLOOR_TICKS of real sells leave $3.
 	address internal constant LCAP_WETH_SLIP_200 = 0x3a88eF38879EFb900c2D7b6199d21C139cEf5Fa7;
-	/// @dev Slipstream getPool(LCAP, USDC, 200): an independent market (spot $7.368 vs the WETH pool's $7.379)
+	/// @dev Slipstream getPool(LCAP, USDC, 200): an independent market (spot $7.368 vs the WETH pool's
+	///      $7.379); LCAP is token0. At block 52014634: $98,485 USDC reserve, $44,913 band; real sells
+	///      of 2,023 ticks take the reserve just under the floor ($24,985) with $12,346 still in band.
 	address internal constant LCAP_USDC_SLIP_200 = 0xC8C15670050541255f9b797C008047682524861F;
+	/// @dev Aerodrome basic getPool(LCAP, USDC, false), volatile, at block 52014634: $100,962 USDC
+	///      reserve, $5,181 band (5.13% of it) — qualifies, yet thinner than LCAP_USDC_SLIP_200's band
+	///      even after that pool slips under the floor
+	address internal constant LCAP_USDC_AERO = 0x48D1036b0308884c163cde60AD5fBf87112Ac52f;
 
 	/// @dev name "USDL Stablecoin", 18 dp, unpriced; its only pools are on Slipstream-3 (USDC ts50, WETH ts10, WETH ts500)
 	address internal constant USDL = 0x78E8CF657742e10eaC8F64007615AA741fC76414;
@@ -129,37 +184,101 @@ contract TwapListingV2ForkTest is Test {
 	address internal constant NVDAC = 0xb20000000000000000000078ee7ce2fE4908108C;
 	address internal constant CL_NVDA = 0x04689a41629776563E6822F76f2e57D148d28513;
 
-	/// @dev symbol "MORPHO", 18 dp, unpriced in the live VI
-	address internal constant MORPHO = 0xBAa5CC21fd487B8Fcc2F632f3F4E8D37262a0842;
-	/// @dev Uniswap getPool(MORPHO, WETH, 3000): $90,138 of WETH within ±10%; MORPHO is token1.
-	///      Real sells of +99 ticks leave it just under the floor ($49,722).
-	address internal constant MORPHO_WETH_3000 = 0x2F42Df4aF5312B492E9d7F7b2110D9c7bf2D9e4F;
-	/// @dev Uniswap getPool(MORPHO, USDC, 10000), spacing 200: $55,440 — qualifies, yet under
-	///      1.25× a pool that just slipped under $50k
-	address internal constant MORPHO_USDC_10000 = 0x2043B296fFC6b2d3bf4A3F3167d2Afb3B0FBdbEE;
-	/// @dev "MORPHO / USD", 8 dp; answered $2.4791 vs the USDC pool's TWAP $2.4963
-	address internal constant CL_MORPHO_USD = 0xe95e258bb6615d47515Fc849f8542dA651f12bF6;
-
 	/// @dev name "Venice Token", symbol "VVV", 18 dp, unpriced in the live VI
 	address internal constant VVV = 0xacfE6019Ed1A7Dc6f7B508C02d1b04ec88cC21bf;
 	/// @dev Uniswap getPool(VVV, USDC, 3000): $104,538 of USDC within ±10% (v1 two-sided: $235,027);
-	///      USDC is token0. Far from both the $50k floor and the $250k large-pool line, so the
-	///      10% cap applies at any nearby block (VIRTUAL's USDC pool sits at the $250k line).
+	///      USDC is token0. Far from the $250k large-pool line, so the 10% cap applies at any nearby
+	///      block (VIRTUAL's USDC pool sits at the $250k line). At block 52014634: $285,310 USDC
+	///      reserve, $102,358 band; real sells of 8,369 ticks take the reserve just under the floor
+	///      ($24,998).
 	address internal constant VVV_USDC_3000 = 0x67A11022B7B6ed66f81233F6C8Ed6e48F7826530;
 
-	// ─── sizing, measured at block 52008523 ─────────────────────────────────────
-	/// @dev Real sells that move VIRTUAL_USDC_3000's spot this many ticks down (~977k VIRTUAL)
-	///      leave $102 of USDC within ±10% (5,000 ticks still leave $13,975).
-	int24 internal constant UNDER_FLOOR_TICKS = 10_000;
+	// ─── v2b: Uniswap v2, Aerodrome basic, cbBTC, taxed (cast + this registry's adapters, block 52014634) ──
+	/// @dev symbol "AGNT", 18 dp, unpriced; Uniswap v2 getPair(AGNT, USDC), AGNT token0: $500,857 USDC
+	///      reserve (test/UniswapV2TwapAdapterFork.t.sol)
+	address internal constant AGNT = 0x7484a9fB40b16c4DFE9195Da399e808aa45E9BB9;
+	address internal constant AGNT_USDC_V2 = 0x378551Ab1B395B1E12a49aE3914DD8066860770D;
+	/// @dev symbol "AWE", 18 dp, unpriced; Aerodrome basic getPool(AWE, USDC, false), volatile, AWE token0:
+	///      $211,473 USDC reserve (test/AerodromeBasicTwapAdapterFork.t.sol)
+	address internal constant AWE = 0x1B4617734C43F6159F3a70b7E06d883647512778;
+	address internal constant AWE_USDC_AERO = 0xcb7f520d18141E36956fE0b3A6Bc3D4F11245521;
+	/// @dev symbol "BRETT", 18 dp, unpriced; Slipstream getPool(BRETT, WETH, 200): $409,694 WETH reserve
+	///      but $34,075 within ±10% — a band v2's old $50k band floor refused
+	address internal constant BRETT = 0x532f27101965dd16442E59d40670FaF5eBB142E4;
+	address internal constant BRETT_WETH_SLIP_200 = 0x4e829F8A5213c42535AB84AA40BD4aDCCE9cBa02;
+	/// @dev Uniswap getPool(BRETT, WETH, 10000): 308.9 WETH; the thin-band test buys through it, so the
+	///      listed pool's spot (and its TWAP guard) is untouched by the fund's buys
+	address internal constant BRETT_WETH_UNI_10000 = 0xBA3F945812a83471d709BCe9C3CA699A19FB46f7;
+	/// @dev symbol "crvUSD", 18 dp, unpriced. Aerodrome basic: getPool(crvUSD, USDC, true) is a real sAMM
+	///      pool (stable() = true; 19.6 crvUSD / 21.2 USDC); getPool(crvUSD, USDC, false),
+	///      getPool(crvUSD, WETH, false) and getPool(crvUSD, WETH, true) are all 0 — its only Aerodrome
+	///      pool vs USDC/WETH is stable. (USDe 0x5d3a…ef34 is the same: sAMM USDe/USDC 0x644B…0fE7 only.)
+	address internal constant CRVUSD = 0x417Ac0e078398C154EdFadD9Ef675d30Be60Af93;
+	address internal constant CRVUSD_USDC_STABLE = 0x7F6095FECb6b67c08F1b8397701d666d71d703e0;
+	/// @dev cbBTC (8 dp) and "cbBTC / USD" (8 dp) — the registry's third quote (Ruling 21)
+	address internal constant CBBTC = FundsMainnet.CBBTC;
+	address internal constant CL_CBBTC_USD = FundsMainnet.CL_CBBTC_USD;
+	/// @dev symbol "ZEN", 18 dp, unpriced; Slipstream getPool(ZEN, cbBTC, 200), cbBTC token0: 14.83 cbBTC
+	///      ($1,238,789) reserve, $219,349 band (GeckoTerminal's top cbBTC pools, then cast)
+	address internal constant ZEN = 0xf43eB8De897Fbc7F2502483B2Bef7Bb9EA179229;
+	address internal constant ZEN_CBBTC_SLIP_200 = 0x47f9e291bb766Fc307Ad7BBa4f29f3Eab6A97101;
+	/// @dev Slipstream getPool(ZEN, WETH, 100): 706 WETH — ZEN's independent WETH market
+	address internal constant ZEN_WETH_SLIP_100 = 0x0392B12a1cEb0cd13af5Ea448CF5586EA609852D;
+	/// @dev symbol "EDGE", 18 dp, unpriced; Aerodrome basic getPool(EDGE, cbBTC, false), volatile, cbBTC
+	///      token0: 4.147 cbBTC ($346,456) reserve
+	address internal constant EDGE = 0xED6E000dEF95780fb89734c07EE2ce9F6dcAf110;
+	address internal constant EDGE_CBBTC_AERO = 0x594b83709464A83F37aC77E69DDD447a8A33c0EE;
+	/// @dev symbol "B18", 18 dp, unpriced, transfer-TAXED on its pairs (test/fork/V2SwapAdaptersFork.t.sol);
+	///      Uniswap v2 getPair(B18, USDC): $625,531 USDC reserve
+	address internal constant B18 = 0xA0c8b0C06Ff087d168B79177bab402F8844825Cb;
+	address internal constant B18_USDC_V2 = 0x35876a255B24c76a686259943AfCFC455D52Ab53;
+	/// @dev Uniswap v2 Router02 and Aerodrome Router: the routers the new swap adapters wrap
+	address internal constant UNI_V2_ROUTER = TwapListingV2.UNI_V2_ROUTER;
+	address internal constant AERO_ROUTER = TwapListingV2.AERODROME_ROUTER;
+	address internal constant AERO_FACTORY = TwapListingV2.AERODROME_POOL_FACTORY;
+
+	// ─── F2 / Ruling 23: the two-part floor (cast, block 52014634) ─────────────────
+	/// @dev Uniswap getPool(VIRTUAL, USDC, 10000), spacing 200, VIRTUAL token0: a QUIET pool — 427
+	///      USDC and 2,953 VIRTUAL, liquidity 4.15e15, spot tick −278,502 (the 0.3% pool's −278,508),
+	///      oracle ring 10 at index 0. A rugger's position becomes most of its liquidity near spot.
+	address internal constant VIRTUAL_USDC_10000 = 0xa9991eEaCa10aF662633913106fE4c18EC06E1F8;
+	/// @dev symbol "CHECK", 18 dp, unpriced in the live VI; Slipstream-2 getPool(CHECK, USDC, 100),
+	///      USDC token0, oracle ring 2000: it holds 300,558 USDC ($300,545), but $512 of it within
+	///      −10% of the price (the registry's adapter; the 2026-09-30 scan read $476): the rest sits
+	///      far below
+	address internal constant CHECK = 0x9126236476eFBA9Ad8aB77855c60eB5BF37586Eb;
+	address internal constant CHECK_USDC_SLIP2_100 = 0x3c4384F3664B37A3Cb5A5cB3452B4B4A3Aa1256f;
+	/// @dev The USDC the rugger's position puts in VIRTUAL_USDC_10000.
+	uint256 internal constant RUG_USDC = 40_000e6;
+
+	// ─── sizing ─────────────────────────────────────────────────────────────────
+	/// @dev Real sells moving spot this many ticks against the asset put a pool's QUOTE RESERVE far
+	///      under the floor (block 52014634): VIRTUAL_WETH_SLIP_200 $225,424 → $4,006,
+	///      LCAP_WETH_SLIP_200 $305,346 → $3, VVV_USDC_3000 $285,310 → $2,601. (VIRTUAL_USDC_3000 can't
+	///      be used: it keeps ~$24.8k of USDC no sell reaches.)
+	int24 internal constant UNDER_FLOOR_TICKS = 20_000;
+	/// @dev Real sells into a v2-style pool of this many times its asset reserve leave ~1/50 of the
+	///      quote reserve: AGNT $500,857 → ~$10k, AWE $211,473 → ~$4k.
+	uint256 internal constant V2_DUMP_MULTIPLE = 49;
 	/// @dev Quote-only liquidity a flash attacker mints just past spot. It lifts VVV_USDC_3000's
-	///      live depth to its window leg's ceiling ($104,538 → $118,585; more does not add).
+	///      live depth to its window leg's ceiling ($102,358 → $117,224 at block 52014634; more does not add).
 	uint256 internal constant JIT_USDC = 200_000e6;
 	/// @dev The exposure policy's spec (TwapExposurePolicyV2 natspec), kept literal on purpose.
 	uint256 internal constant LARGE_POOL_USD18 = 250_000e18;
 	uint256 internal constant SMALL_CAP_BPS = 1_000;
 	uint256 internal constant LARGE_CAP_BPS = 5_000;
 	uint256 internal constant MARGIN_BPS = 12_500;
-	uint256 internal constant FLOOR_USD18 = 50_000e18;
+	/// @dev The registry's listing and delist-clock floor (MIN_QUOTE_RESERVE_USD × 1e18), kept literal
+	///      on purpose; test_fork_thinBandListsWithTinyCap pins it to the registry's constant.
+	uint256 internal constant RESERVE_FLOOR_USD18 = 25_000e18;
+	/// @dev The floor's second part (MIN_BAND_DEPTH_USD × 1e18): floor(25,000 × 51,316 / 1e6) = 1,282,
+	///      what a full-range x·y=k pool holding exactly $25k of quote has within −10%. Kept literal on
+	///      purpose; test_fork_ruggedConcentratedPoolStartsClock pins it to the registry's constant.
+	uint256 internal constant BAND_FLOOR_USD18 = 1_282e18;
+	/// @dev v2's retired band floor ($50k within ±10%): the band has no floor now; what it let through is shown.
+	uint256 internal constant OLD_BAND_FLOOR_USD18 = 50_000e18;
+	/// @dev Uniswap v2 pairs keep no history: the keeper's recorder snapshot must be a window (30 min) old.
+	uint256 internal constant V2_WARP = 31 minutes;
 
 	bool internal forked;
 	address internal deployer;
@@ -225,14 +344,19 @@ contract TwapListingV2ForkTest is Test {
 		assertTrue(d.registry.isTwapPriced(VIRTUAL));
 		assertEq(d.registry.listedCount(), 1);
 
+		// the reserve gated the listing; the band is what it records (Ruling 8)
+		uint256 reserve = adapter.quoteReserveUsd();
+		assertGe(reserve, RESERVE_FLOOR_USD18, 'the USDC reserve holds the floor');
 		uint256 recorded = d.registry.recordedDepthUsd18(VIRTUAL);
 		assertGe(recorded, 50_000e18, 'Ruling 8: the listing records its quote-side depth');
 		assertEq(recorded, adapter.poolDepthUsd());
+		assertLt(recorded, reserve, 'the band, not the reserve');
 
 		uint256 rate = vi.calcUsdRate(VIRTUAL);
 		uint256 chainlink = _chainlinkUsd18(CL_VIRTUAL_USD);
 		assertGt(rate, 0);
 		assertApproxEqRel(rate, chainlink, 0.05e18, 'the TWAP agrees with Chainlink VIRTUAL / USD');
+		emit log_named_decimal_uint('VIRTUAL USDC reserve (USD)  ', reserve, 18);
 		emit log_named_decimal_uint('VIRTUAL recorded depth (USD)', recorded, 18);
 		emit log_named_decimal_uint('VIRTUAL TWAP price (USD)    ', rate, 18);
 		emit log_named_decimal_uint('VIRTUAL Chainlink (USD)     ', chainlink, 18);
@@ -252,17 +376,19 @@ contract TwapListingV2ForkTest is Test {
 		vm.expectRevert(abi.encodeWithSelector(TwapListingRegistryV2.ObservationCardinalityTooLow.selector, uint16(1)));
 		d.module.list(LUMIA, WETH, UNI, 3000);
 
-		// with its oracle ring raised the way the keeper would, the one-sided depth is what refuses it
+		// with its oracle ring raised the way the keeper would, its WETH reserve is what refuses it:
+		// exactly the WETH the pool holds × ETH / USD, the LUMIA side never counted
 		_prepareOracle(LUMIA_POOL);
 		bytes memory err = _revertData(keeper, address(d.module), abi.encodeCall(PriceListingModule.list, (LUMIA, WETH, UNI, 3000)));
 		assertEq(_selector(err), TwapListingRegistryV2.BelowFloorAtListing.selector);
-		uint256 quoteDepth = abi.decode(_args(err), (uint256));
-		assertLt(quoteDepth, FLOOR_USD18, 'the WETH bids are under the floor');
-		assertGt(quoteDepth, 1_000e18, 'the real WETH side still counts');
+		uint256 quoteReserve = abi.decode(_args(err), (uint256));
+		assertEq(quoteReserve, _usd18(IERC20(WETH).balanceOf(LUMIA_POOL), WETH, CL_ETH_USD), 'the WETH the pool holds');
+		assertLt(quoteReserve, RESERVE_FLOOR_USD18, 'the WETH reserve is under the floor');
+		assertGt(quoteReserve, 1_000e18, 'the real WETH side still counts');
 		assertFalse(vi.isSupportedAsset(LUMIA));
 		assertEq(d.registry.listedCount(), 0);
 		emit log_named_decimal_uint('LUMIA v1 two-sided depth (USD)', v1Depth, 18);
-		emit log_named_decimal_uint('LUMIA quote-side depth (USD)  ', quoteDepth, 18);
+		emit log_named_decimal_uint('LUMIA WETH reserve (USD)      ', quoteReserve, 18);
 	}
 
 	function test_fork_wethQuotedListsAndPrices() public {
@@ -275,8 +401,9 @@ contract TwapListingV2ForkTest is Test {
 		assertEq(uint8(d.registry.venueOf(LCAP)), uint8(SLIP));
 		assertEq(address(adapter.quoteFeed()), CL_ETH_USD, 'the STANDARD ETH / USD proxy, never SVR');
 		assertEq(adapter.quoteHeartbeat(), 3600);
+		assertGe(adapter.quoteReserveUsd(), RESERVE_FLOOR_USD18, 'the WETH reserve holds the floor');
 		uint256 recorded = d.registry.recordedDepthUsd18(LCAP);
-		assertGe(recorded, FLOOR_USD18);
+		assertGe(recorded, OLD_BAND_FLOOR_USD18);
 		assertEq(recorded, adapter.poolDepthUsd());
 
 		uint256 rate = vi.calcUsdRate(LCAP);
@@ -300,8 +427,9 @@ contract TwapListingV2ForkTest is Test {
 
 		assertEq(_poolOf(USDL), USDL_USDC_SLIP3_50);
 		assertEq(uint8(d.registry.venueOf(USDL)), uint8(SLIP3));
+		assertGe(adapter.quoteReserveUsd(), RESERVE_FLOOR_USD18, 'the USDC reserve holds the floor');
 		uint256 recorded = d.registry.recordedDepthUsd18(USDL);
-		assertGe(recorded, FLOOR_USD18);
+		assertGe(recorded, OLD_BAND_FLOOR_USD18);
 		assertEq(recorded, adapter.poolDepthUsd());
 		uint256 rate = vi.calcUsdRate(USDL);
 		assertApproxEqRel(rate, 1e18, 0.05e18, 'a USD stablecoin prices near $1');
@@ -325,6 +453,211 @@ contract TwapListingV2ForkTest is Test {
 		emit log_named_decimal_uint('USDL recorded depth (USD)', recorded, 18);
 		emit log_named_decimal_uint('USDL TWAP price (USD)    ', rate, 18);
 		emit log_named_decimal_uint('USDL bought for 1 USDC   ', bought, 18);
+	}
+
+	/// @notice A Uniswap v2 pair keeps no price history: the keeper records it on the registry's
+	///         recorder and, once that snapshot is a window old, lists the token through the module.
+	///         The window spans quiet fork time, so the VI price is the pair's spot within 1%; the
+	///         live fund then buys it through the new UniswapV2SwapAdapter.
+	function test_fork_uniswapV2ListsPricesTrades() public {
+		vm.skip(!forked);
+		assertFalse(vi.isSupportedAsset(AGNT));
+		assertEq(IUniswapV2Factory(TwapListingV2.UNI_V2_FACTORY).getPair(AGNT, USDC), AGNT_USDC_V2);
+		assertEq(address(d.registry.recorder()), address(d.recorder), 'v2 prices from the deployed recorder');
+
+		// no snapshot yet: the listing waits for the keeper's recorder history
+		vm.prank(keeper);
+		vm.expectRevert(abi.encodeWithSelector(UniswapV2ObservationRecorder.NoSnapshot.selector, AGNT_USDC_V2));
+		d.module.list(AGNT, USDC, UNIV2, 0);
+
+		assertTrue(d.recorder.record(AGNT_USDC_V2));
+		_warpRoll(V2_WARP);
+		UniswapV2TwapAdapter adapter = UniswapV2TwapAdapter(address(_listAny(AGNT, USDC, UNIV2, 0)));
+		assertEq(address(adapter.pair()), AGNT_USDC_V2);
+		assertEq(address(adapter.recorder()), address(d.recorder));
+		_assertListedOn(AGNT, address(adapter), AGNT_USDC_V2, USDC, UNIV2);
+		(uint256 rA, uint256 rQ) = _v2Reserves(AGNT_USDC_V2, AGNT);
+		uint256 reserve = adapter.quoteReserveUsd();
+		assertEq(reserve, _usd18(rQ, USDC, CL_USDC_USD), 'the USDC reserve x USDC / USD');
+		assertGe(reserve, RESERVE_FLOOR_USD18);
+
+		uint256 rate = vi.calcUsdRate(AGNT);
+		uint256 spot = _reserveSpotUsd18(rA, rQ, AGNT, USDC, CL_USDC_USD);
+		assertApproxEqRel(rate, spot, 0.01e18, 'the VI price is the pair spot within 1%');
+
+		uint256 minOut = _oneUsdLess3Pct(AGNT, rate);
+		uint256 bought = _liveFundBuys(d.uniswapV2Adapter, AGNT, abi.encode(USDC, AGNT, uint256(1e6), minOut));
+		assertGe(bought, minOut, 'the vault received AGNT');
+		emit log_named_decimal_uint('AGNT USDC reserve (USD)', reserve, 18);
+		emit log_named_decimal_uint('AGNT band recorded (USD)', d.registry.recordedDepthUsd18(AGNT), 18);
+		emit log_named_decimal_uint('AGNT TWAP price (USD)  ', rate, 18);
+		emit log_named_decimal_uint('AGNT pair spot (USD)   ', spot, 18);
+		emit log_named_decimal_uint('AGNT bought for 1 USDC ', bought, 18);
+	}
+
+	/// @notice Aerodrome basic pools keep their own 30-minute observations: the keeper lists AWE on
+	///         its VOLATILE USDC pool with no warm-up and the live fund buys it through the new
+	///         AerodromeBasicSwapAdapter. The window spans the pool's REAL recent trading, so the
+	///         price is pinned exactly to the pool's time-averaged reserves (re-derived here from
+	///         its raw observations) and to spot within the adapter's 5% guard — a 1%-of-spot check
+	///         would test the market, not the code (at block 52014634 the two are equal: no trade
+	///         in the window).
+	function test_fork_aerodromeBasicListsPricesTrades() public {
+		vm.skip(!forked);
+		assertFalse(vi.isSupportedAsset(AWE));
+		assertEq(IAerodromeBasicFactory(AERO_FACTORY).getPool(AWE, USDC, false), AWE_USDC_AERO);
+		assertFalse(IAerodromeBasicPool(AWE_USDC_AERO).stable());
+
+		AerodromeBasicTwapAdapter adapter = AerodromeBasicTwapAdapter(address(_listAny(AWE, USDC, AERO, 0)));
+		assertEq(address(adapter.pool()), AWE_USDC_AERO);
+		_assertListedOn(AWE, address(adapter), AWE_USDC_AERO, USDC, AERO);
+		(uint256 rA, uint256 rQ) = _aeroReserves(AWE_USDC_AERO, AWE);
+		uint256 reserve = adapter.quoteReserveUsd();
+		assertEq(reserve, _usd18(rQ, USDC, CL_USDC_USD), 'the USDC reserve x USDC / USD');
+		assertGe(reserve, RESERVE_FLOOR_USD18);
+
+		uint256 rate = vi.calcUsdRate(AWE);
+		assertEq(rate, _aeroTwapUsd18(AWE_USDC_AERO, AWE, CL_USDC_USD), 'time-averaged reserves x USDC / USD');
+		uint256 spot = _reserveSpotUsd18(rA, rQ, AWE, USDC, CL_USDC_USD);
+		assertApproxEqRel(rate, spot, 0.05e18, 'within the 5% spot guard');
+
+		uint256 minOut = _oneUsdLess3Pct(AWE, rate);
+		uint256 bought = _liveFundBuys(d.aerodromeBasicAdapter, AWE, abi.encode(USDC, AWE, uint256(1e6), minOut));
+		assertGe(bought, minOut, 'the vault received AWE');
+		emit log_named_decimal_uint('AWE USDC reserve (USD)  ', reserve, 18);
+		emit log_named_decimal_uint('AWE band recorded (USD) ', d.registry.recordedDepthUsd18(AWE), 18);
+		emit log_named_decimal_uint('AWE TWAP price (USD)    ', rate, 18);
+		emit log_named_decimal_uint('AWE pool spot (USD)     ', spot, 18);
+		emit log_named_decimal_uint('AWE bought for 1 USDC   ', bought, 18);
+	}
+
+	/// @notice Aerodrome basic lists VOLATILE pools only. crvUSD's only Aerodrome pool against USDC
+	///         or WETH is a stable (sAMM) one: the registry never resolves it, whatever the fee /
+	///         spacing argument, and the adapter itself refuses a stable pool even when deployed
+	///         directly (the deployers are permissionless).
+	function test_fork_aerodromeStableNeverListed() public {
+		vm.skip(!forked);
+		IAerodromeBasicFactory aero = IAerodromeBasicFactory(AERO_FACTORY);
+		assertFalse(vi.isSupportedAsset(CRVUSD));
+		assertEq(aero.getPool(CRVUSD, USDC, true), CRVUSD_USDC_STABLE, 'a real sAMM pool');
+		assertTrue(IAerodromeBasicPool(CRVUSD_USDC_STABLE).stable());
+		assertEq(aero.getPool(CRVUSD, USDC, false), address(0), 'no volatile pool vs USDC');
+		assertEq(aero.getPool(CRVUSD, WETH, false), address(0), 'no volatile pool vs WETH');
+		assertEq(aero.getPool(CRVUSD, WETH, true), address(0));
+
+		int24[3] memory args = [int24(0), 1, -1];
+		for (uint256 i; i < args.length; ++i) {
+			vm.prank(keeper);
+			vm.expectRevert(abi.encodeWithSelector(TwapListingRegistryV2.PoolNotFound.selector, CRVUSD, USDC));
+			d.module.list(CRVUSD, USDC, AERO, args[i]);
+		}
+		vm.prank(keeper);
+		vm.expectRevert(abi.encodeWithSelector(TwapListingRegistryV2.PoolNotFound.selector, CRVUSD, WETH));
+		d.module.list(CRVUSD, WETH, AERO, 0);
+
+		vm.prank(stranger);
+		vm.expectRevert(AerodromeBasicTwapAdapter.StablePool.selector);
+		d.aeroDeployer.deploy(
+			IAerodromeBasicPool(CRVUSD_USDC_STABLE), CRVUSD, AggregatorV3Interface(CL_USDC_USD), 30 minutes, 25_000, 500, 90_000, 'sAMM'
+		);
+
+		assertEq(d.registry.listedCount(), 0);
+		assertFalse(vi.isSupportedAsset(CRVUSD));
+	}
+
+	/// @notice Ruling 21: cbBTC is the registry's third quote, on the VI's own cbBTC / USD feed and
+	///         heartbeat. Real tokens that pair against cbBTC list on it with an 8-decimal quote: ZEN
+	///         on its Slipstream pool and EDGE on its Aerodrome basic pool.
+	function test_fork_cbBtcQuotedLists() public {
+		vm.skip(!forked);
+		(AggregatorV3Interface feed, uint32 heartbeat) = d.registry.quotes(CBBTC);
+		(address viFeed, uint32 viHeartbeat,,) = vi.getAssetInfo(CBBTC);
+		assertEq(address(feed), CL_CBBTC_USD);
+		assertEq(viFeed, CL_CBBTC_USD, "the VI's own cbBTC feed");
+		assertEq(heartbeat, viHeartbeat, "and the VI's heartbeat");
+		assertEq(IERC20Metadata(CBBTC).decimals(), 8);
+		_assertZenListsOnCbBtc(heartbeat);
+		_assertEdgeListsOnCbBtc();
+		assertEq(d.registry.listedCount(), 2);
+	}
+
+	/// @dev ZEN on its Slipstream cbBTC pool (cbBTC is token0), priced against its WETH market.
+	function _assertZenListsOnCbBtc(uint32 heartbeat) internal {
+		assertFalse(vi.isSupportedAsset(ZEN));
+		assertEq(ISlipstreamPoolFactory(FundsMainnet.CL_FACTORY).getPool(ZEN, CBBTC, 200), ZEN_CBBTC_SLIP_200);
+		TwapAggregatorAdapterV2 zen = _list(ZEN, CBBTC, SLIP, 200);
+		_assertListedOn(ZEN, address(zen), ZEN_CBBTC_SLIP_200, CBBTC, SLIP);
+		assertEq(address(zen.quoteFeed()), CL_CBBTC_USD);
+		assertEq(zen.quoteHeartbeat(), heartbeat);
+		uint256 reserve = zen.quoteReserveUsd();
+		assertEq(reserve, _usd18(IERC20(CBBTC).balanceOf(ZEN_CBBTC_SLIP_200), CBBTC, CL_CBBTC_USD), 'the cbBTC the pool holds');
+		assertGe(reserve, RESERVE_FLOOR_USD18);
+		uint256 rate = vi.calcUsdRate(ZEN);
+		assertApproxEqRel(rate, _spotUsd18(ZEN_CBBTC_SLIP_200, ZEN, CBBTC, CL_CBBTC_USD), 0.05e18);
+		uint256 viaWeth = _spotUsd18(ZEN_WETH_SLIP_100, ZEN, WETH, CL_ETH_USD);
+		assertApproxEqRel(rate, viaWeth, 0.05e18, "agrees with ZEN's WETH market");
+		emit log_named_decimal_uint('ZEN cbBTC reserve (USD)  ', reserve, 18);
+		emit log_named_decimal_uint('ZEN band recorded (USD)  ', d.registry.recordedDepthUsd18(ZEN), 18);
+		emit log_named_decimal_uint('ZEN TWAP price (USD)     ', rate, 18);
+		emit log_named_decimal_uint('ZEN WETH-market spot     ', viaWeth, 18);
+	}
+
+	/// @dev EDGE on its Aerodrome basic cbBTC pool (volatile; cbBTC is token0).
+	function _assertEdgeListsOnCbBtc() internal {
+		assertFalse(vi.isSupportedAsset(EDGE));
+		assertEq(IAerodromeBasicFactory(AERO_FACTORY).getPool(EDGE, CBBTC, false), EDGE_CBBTC_AERO);
+		ITwapPriceAdapter edge = _listAny(EDGE, CBBTC, AERO, 0);
+		_assertListedOn(EDGE, address(edge), EDGE_CBBTC_AERO, CBBTC, AERO);
+		(uint256 rA, uint256 rQ) = _aeroReserves(EDGE_CBBTC_AERO, EDGE);
+		uint256 reserve = edge.quoteReserveUsd();
+		assertEq(reserve, _usd18(rQ, CBBTC, CL_CBBTC_USD), 'the cbBTC reserve x cbBTC / USD');
+		assertGe(reserve, RESERVE_FLOOR_USD18);
+		uint256 rate = vi.calcUsdRate(EDGE);
+		assertEq(rate, _aeroTwapUsd18(EDGE_CBBTC_AERO, EDGE, CL_CBBTC_USD), 'time-averaged reserves x cbBTC / USD');
+		uint256 spot = _reserveSpotUsd18(rA, rQ, EDGE, CBBTC, CL_CBBTC_USD);
+		assertApproxEqRel(rate, spot, 0.05e18);
+		emit log_named_decimal_uint('EDGE cbBTC reserve (USD) ', reserve, 18);
+		emit log_named_decimal_uint('EDGE band recorded (USD) ', d.registry.recordedDepthUsd18(EDGE), 18);
+		emit log_named_decimal_uint('EDGE TWAP price (USD)    ', rate, 18);
+		emit log_named_decimal_uint('EDGE pool spot (USD)     ', spot, 18);
+	}
+
+	/// @notice FOUNDER DECISION 2026-09-30: transfer-taxed tokens are never listed — and that is
+	///         KEEPER POLICY, not a contract rule. The keeper's round-trip buy→sell simulation refuses
+	///         any token whose transfers cost more than the pool fee; the registry, the module and the
+	///         swap adapters do not (and can't: an owner may switch a tax on after listing, and a TWAP
+	///         never sees it). This test pins that boundary so nobody assumes the contracts refuse
+	///         them: B18 really taxes its pair transfers, yet it lists on-chain and the live fund's
+	///         buy really pays the tax. The keeper's simulation is the only guard.
+	function test_fork_taxedTokenListsButIsKeeperPolicy() public {
+		vm.skip(!forked);
+		IB18Tax b18 = IB18Tax(B18);
+		assertTrue(b18.swapPairList(B18_USDC_V2), 'B18 taxes transfers to and from its USDC pair');
+		assertGt(b18.buyFeeRate(), 0, 'a buy tax');
+		assertGt(b18.sellFeeRate(), 0, 'a sell tax');
+		assertEq(IUniswapV2Factory(TwapListingV2.UNI_V2_FACTORY).getPair(B18, USDC), B18_USDC_V2);
+		assertFalse(vi.isSupportedAsset(B18));
+
+		// the keeper's recorder snapshot, a window, then the listing: nothing on-chain objects
+		assertTrue(d.recorder.record(B18_USDC_V2));
+		_warpRoll(V2_WARP);
+		ITwapPriceAdapter adapter = _listAny(B18, USDC, UNIV2, 0);
+		_assertListedOn(B18, address(adapter), B18_USDC_V2, USDC, UNIV2);
+		assertGe(adapter.quoteReserveUsd(), RESERVE_FLOOR_USD18);
+		(uint256 rA, uint256 rQ) = _v2Reserves(B18_USDC_V2, B18);
+		uint256 rate = vi.calcUsdRate(B18);
+		assertApproxEqRel(rate, _reserveSpotUsd18(rA, rQ, B18, USDC, CL_USDC_USD), 0.01e18);
+
+		// the live fund buys 1 USDC of it: the pair pays the untaxed quote, the vault gets it less the tax
+		uint256 untaxed =
+			IUniswapV2RouterQuote(UNI_V2_ROUTER).getAmountOut(IERC20(USDC).balanceOf(B18_USDC_V2) - rQ + 1e6, rQ, rA);
+		uint256 bought = _liveFundBuys(d.uniswapV2Adapter, B18, abi.encode(USDC, B18, uint256(1e6), uint256(0)));
+		assertEq(bought, untaxed - untaxed * b18.buyFeeRate() / b18.RATE_UNIT(), 'credited net of the buy tax');
+		assertLt(bought, untaxed);
+		emit log_named_decimal_uint('B18 USDC reserve (USD)      ', adapter.quoteReserveUsd(), 18);
+		emit log_named_decimal_uint('B18 TWAP price (USD)        ', rate, 18);
+		emit log_named_decimal_uint('B18 untaxed quote for 1 USDC', untaxed, 18);
+		emit log_named_decimal_uint('B18 credited (after buy tax)', bought, 18);
 	}
 
 	// ─── repoint ─────────────────────────────────────────────────────────────────
@@ -376,46 +709,58 @@ contract TwapListingV2ForkTest is Test {
 		emit log_named_decimal_uint('deepest depth (USD)       ', deepestDepth, 18);
 	}
 
-	/// @notice Ruling 9: real sells take the listed pool JUST under the floor; anyone starts the
-	///         clock; the keeper then moves the listing to a qualifying pool that is NOT 25% deeper
-	///         than the slipped one — only the under-floor branch (currentOk = false) allows that —
-	///         and the move resets the clock and records the new pool's depth.
+	/// @notice Ruling 9: real sells take the listed pool's quote RESERVE just under the floor; anyone
+	///         starts the clock; the keeper then moves the listing to a qualifying pool whose band is
+	///         NOT 25% deeper than the slipped one's — only the under-floor branch (currentOk = false)
+	///         allows that — and the move resets the clock and records the new pool's band.
+	///         LCAP, not MORPHO (see the contract natspec): the target must hold the $25k reserve while
+	///         its band stays under 1.25× a band that sits in a reserve under $25k.
 	function test_fork_underFloorRepointAndClock() public {
 		vm.skip(!forked);
-		TwapAggregatorAdapterV2 current = _list(MORPHO, WETH, UNI, 3000);
+		TwapAggregatorAdapterV2 current = _list(LCAP, USDC, SLIP, 200);
 		uint256 healthyDepth = current.poolDepthUsd();
+		uint256 healthyReserve = current.quoteReserveUsd();
+		assertEq(IAerodromeBasicFactory(AERO_FACTORY).getPool(LCAP, USDC, false), LCAP_USDC_AERO);
 
-		// healthy: the USDC 1% pool is shallower, refused
-		(uint256 cur, uint256 next) = _notDeepEnough(
-			_revertData(keeper, address(d.module), abi.encodeCall(PriceListingModule.repoint, (MORPHO, USDC, UNI, 10000)))
-		);
+		// healthy: LCAP's Aerodrome basic USDC pool holds the reserve floor but its band is shallower: refused
+		(uint256 cur, uint256 next) =
+			_notDeepEnough(_revertData(keeper, address(d.module), abi.encodeCall(PriceListingModule.repoint, (LCAP, USDC, AERO, 0))));
 		assertEq(cur, healthyDepth);
 		assertLt(next, cur);
 
-		// real sells: the smallest push that takes the WETH bids under the floor
-		int24 push = _sellJustUnderFloor(current, 3000);
+		// real sells: the smallest push that takes the USDC reserve under the floor
+		int24 push = _sellJustUnderFloor(current);
+		uint256 slippedReserve = current.quoteReserveUsd();
 		uint256 slipped = current.poolDepthUsd();
-		assertLt(slipped, FLOOR_USD18);
+		assertLt(slippedReserve, RESERVE_FLOOR_USD18, 'the reserve slipped under the floor');
 
 		// anyone starts the clock
 		vm.prank(stranger);
-		assertTrue(d.registry.pokeFloor(MORPHO));
-		assertEq(_clockOf(MORPHO), block.timestamp);
+		assertTrue(d.registry.pokeFloor(LCAP));
+		assertEq(_clockOf(LCAP), block.timestamp);
 
-		TwapAggregatorAdapterV2 moved = _repoint(MORPHO, USDC, UNI, 10000);
+		ITwapPriceAdapter moved = _repointAny(LCAP, USDC, AERO, 0);
 		uint256 movedDepth = moved.poolDepthUsd();
-		assertGe(movedDepth, FLOOR_USD18);
+		assertGe(moved.quoteReserveUsd(), RESERVE_FLOOR_USD18, 'the new pool holds the reserve floor');
 		assertLt(movedDepth, Math.mulDiv(slipped, MARGIN_BPS, 10_000), 'the margin alone would have refused this move');
-		assertEq(_poolOf(MORPHO), MORPHO_USDC_10000);
-		assertEq(_clockOf(MORPHO), 0, 'the repoint resets the clock');
-		assertEq(d.registry.recordedDepthUsd18(MORPHO), movedDepth, 'Ruling 8: the new depth is recorded');
-		(address aggregator,,,) = vi.getAssetInfo(MORPHO);
+		assertEq(_poolOf(LCAP), LCAP_USDC_AERO);
+		assertEq(uint8(d.registry.venueOf(LCAP)), uint8(AERO));
+		assertEq(_clockOf(LCAP), 0, 'the repoint resets the clock');
+		assertEq(d.registry.recordedDepthUsd18(LCAP), movedDepth, 'Ruling 8: the new depth is recorded');
+		(address aggregator,,,) = vi.getAssetInfo(LCAP);
 		assertEq(aggregator, address(moved));
-		assertApproxEqRel(vi.calcUsdRate(MORPHO), _chainlinkUsd18(CL_MORPHO_USD), 0.05e18, 'agrees with Chainlink MORPHO / USD');
-		emit log_named_int('real sells pushed spot (ticks)', push);
-		emit log_named_decimal_uint('WETH-pool depth healthy (USD) ', healthyDepth, 18);
-		emit log_named_decimal_uint('WETH-pool depth after sells   ', slipped, 18);
-		emit log_named_decimal_uint('USDC-pool depth recorded (USD)', movedDepth, 18);
+		// LCAP has no Chainlink feed: its WETH market, untouched by the sells, is the independent check
+		uint256 viaWeth = _spotUsd18(LCAP_WETH_SLIP_200, LCAP, WETH, CL_ETH_USD);
+		assertApproxEqRel(vi.calcUsdRate(LCAP), viaWeth, 0.05e18, "agrees with LCAP's WETH market");
+		emit log_named_int('real sells pushed spot (ticks)  ', push);
+		emit log_named_decimal_uint('USDC-pool reserve healthy (USD) ', healthyReserve, 18);
+		emit log_named_decimal_uint('USDC-pool band healthy (USD)    ', healthyDepth, 18);
+		emit log_named_decimal_uint('USDC-pool reserve after sells   ', slippedReserve, 18);
+		emit log_named_decimal_uint('USDC-pool band after sells      ', slipped, 18);
+		emit log_named_decimal_uint('Aerodrome reserve (USD)         ', moved.quoteReserveUsd(), 18);
+		emit log_named_decimal_uint('Aerodrome band recorded (USD)   ', movedDepth, 18);
+		emit log_named_decimal_uint('LCAP TWAP (USD) / WETH market   ', vi.calcUsdRate(LCAP), 18);
+		emit log_named_decimal_uint('                                ', viaWeth, 18);
 	}
 
 	/// @notice A pool dumped far under the floor by real sells: the keeper moves the listing to a
@@ -423,18 +768,19 @@ contract TwapListingV2ForkTest is Test {
 	///         from the dumped pool.
 	function test_fork_dumpedPoolRepointsToHealthyPool() public {
 		vm.skip(!forked);
-		TwapAggregatorAdapterV2 dumped = _list(VIRTUAL, USDC, UNI, 3000);
+		TwapAggregatorAdapterV2 dumped = _list(VIRTUAL, WETH, SLIP, 200);
 		uint256 healthyDepth = dumped.poolDepthUsd();
 
-		// healthy: the WETH pool is not 25% deeper
+		// healthy: the Uniswap WETH 0.05% pool is not 25% deeper
 		(uint256 cur, uint256 next) =
-			_notDeepEnough(_revertData(keeper, address(d.module), abi.encodeCall(PriceListingModule.repoint, (VIRTUAL, WETH, SLIP, 200))));
+			_notDeepEnough(_revertData(keeper, address(d.module), abi.encodeCall(PriceListingModule.repoint, (VIRTUAL, WETH, UNI, 500))));
 		assertEq(cur, healthyDepth);
 		assertLt(next, Math.mulDiv(cur, MARGIN_BPS, 10_000));
 
-		// real sells take the pool's USDC bids out of the band
-		uint256 sold = _dumpVirtual(UNDER_FLOOR_TICKS);
+		// real sells pay the pool's WETH out: its reserve ends far under the floor
+		uint256 sold = _sellAsset(dumped, UNDER_FLOOR_TICKS);
 		assertTrue(dumped.isBelowFloor());
+		uint256 dumpedReserve = dumped.quoteReserveUsd();
 		uint256 dumpedDepth = dumped.poolDepthUsd();
 
 		// anyone starts the clock
@@ -442,21 +788,23 @@ contract TwapListingV2ForkTest is Test {
 		assertTrue(d.registry.pokeFloor(VIRTUAL));
 		assertEq(_clockOf(VIRTUAL), block.timestamp);
 
-		// the keeper moves the listing to the WETH pool with no margin (the current one is not answerable)
-		TwapAggregatorAdapterV2 moved = _repoint(VIRTUAL, WETH, SLIP, 200);
-		assertEq(_poolOf(VIRTUAL), VIRTUAL_WETH_SLIP_200);
+		// the keeper moves the listing with no margin (the current reserve is under the floor)
+		TwapAggregatorAdapterV2 moved = _repoint(VIRTUAL, WETH, UNI, 500);
+		assertEq(_poolOf(VIRTUAL), VIRTUAL_WETH_UNI_500);
 		assertEq(_clockOf(VIRTUAL), 0, 'the repoint resets the clock');
 		assertEq(d.registry.recordedDepthUsd18(VIRTUAL), moved.poolDepthUsd(), 'Ruling 8: the new depth is recorded');
 		assertLt(moved.poolDepthUsd(), Math.mulDiv(healthyDepth, MARGIN_BPS, 10_000), 'no margin was needed');
+		assertGe(moved.quoteReserveUsd(), RESERVE_FLOOR_USD18);
 		assertFalse(d.registry.isDelisted(VIRTUAL));
 		// the dumped pool no longer prices VIRTUAL
 		(address aggregator,,,) = vi.getAssetInfo(VIRTUAL);
 		assertEq(aggregator, address(moved));
 		assertApproxEqRel(vi.calcUsdRate(VIRTUAL), _chainlinkUsd18(CL_VIRTUAL_USD), 0.05e18);
-		emit log_named_decimal_uint('VIRTUAL sold into the pool     ', sold, 18);
-		emit log_named_decimal_uint('USDC-pool depth healthy (USD)  ', healthyDepth, 18);
-		emit log_named_decimal_uint('USDC-pool depth after sells    ', dumpedDepth, 18);
-		emit log_named_decimal_uint('WETH-pool depth recorded (USD) ', moved.poolDepthUsd(), 18);
+		emit log_named_decimal_uint('VIRTUAL sold into the pool       ', sold, 18);
+		emit log_named_decimal_uint('Slip WETH-pool band healthy (USD)', healthyDepth, 18);
+		emit log_named_decimal_uint('Slip WETH-pool reserve after sells', dumpedReserve, 18);
+		emit log_named_decimal_uint('Slip WETH-pool band after sells  ', dumpedDepth, 18);
+		emit log_named_decimal_uint('Uni WETH-pool band recorded (USD)', moved.poolDepthUsd(), 18);
 	}
 
 	/// @notice Ruling 12a: once governance prices a listed token through Chainlink, the keeper can
@@ -646,9 +994,11 @@ contract TwapListingV2ForkTest is Test {
 		emit log_named_decimal_uint('holding refused (USD)         ', holding, 18);
 	}
 
-	/// @dev (a) real sells put the pool under the floor; a stranger starts the clock, then can't clear it.
+	/// @dev (a) real sells put the pool's quote reserve just under the floor; a stranger starts the
+	///      clock, then can't clear it.
 	function _jitPokeCannotClearClock(TwapAggregatorAdapterV2 adapter) internal {
-		int24 push = _sellJustUnderFloor(adapter, 3000);
+		int24 push = _sellJustUnderFloor(adapter);
+		uint256 reserveUnder = adapter.quoteReserveUsd();
 		vm.prank(stranger);
 		assertTrue(d.registry.pokeFloor(VVV));
 		uint64 since = _clockOf(VVV);
@@ -658,6 +1008,7 @@ contract TwapListingV2ForkTest is Test {
 		// the stranger flash-mints quote at the new spot: the live read now says "over the floor" …
 		(uint256 tokenId, uint128 liquidity,) = _mintQuoteOnly(adapter, JIT_USDC, stranger);
 		assertFalse(adapter.isBelowFloor(), 'the flash liquidity fools a live read');
+		uint256 reserveFlash = adapter.quoteReserveUsd();
 		uint256 liveFlash = adapter.poolDepthUsd();
 		// … but a non-lister's poke neither clears the clock nor records depth
 		vm.prank(stranger);
@@ -667,16 +1018,284 @@ contract TwapListingV2ForkTest is Test {
 		_burn(tokenId, liquidity, stranger);
 		assertTrue(adapter.isBelowFloor());
 		emit log_named_int('sells pushed spot (ticks)     ', push);
+		emit log_named_decimal_uint('reserve after sells (USD)     ', reserveUnder, 18);
+		emit log_named_decimal_uint('reserve + flash mint (USD)    ', reserveFlash, 18);
 		emit log_named_decimal_uint('under-floor depth + flash mint', liveFlash, 18);
+	}
+
+	/// @notice The rule split on a real thin pool: BRETT's Slipstream WETH pool holds hundreds of
+	///         thousands of dollars of WETH but only ~$34k within −10% of the price. The reserve lists
+	///         it (v2's old $50k band floor refused it); the band sizes the cap: a non-degen fund may
+	///         hold 10% of the band — far less than 10% of the reserve.
+	function test_fork_thinBandListsWithTinyCap() public {
+		vm.skip(!forked);
+		assertEq(d.registry.MIN_QUOTE_RESERVE_USD() * 1e18, RESERVE_FLOOR_USD18);
+		assertFalse(vi.isSupportedAsset(BRETT));
+		assertEq(ISlipstreamPoolFactory(FundsMainnet.CL_FACTORY).getPool(BRETT, WETH, 200), BRETT_WETH_SLIP_200);
+		TwapAggregatorAdapterV2 adapter = _list(BRETT, WETH, SLIP, 200);
+		uint256 reserve = adapter.quoteReserveUsd();
+		uint256 band = d.registry.recordedDepthUsd18(BRETT);
+		assertGe(reserve, RESERVE_FLOOR_USD18, 'the reserve lists it');
+		assertLt(band, OLD_BAND_FLOOR_USD18, "a band v2's old floor refused");
+		assertEq(band, adapter.poolDepthUsd(), 'the band is recorded, not the reserve');
+		uint256 cap = _capUsd18(band);
+		assertEq(cap, band / 10, '10% of the band');
+
+		// a NON-degen fund with GAV 10x the cap
+		uint256 capUsdc = cap / 1e12;
+		Comptroller fund = _fundWithDeposit('TWAP v2b Thin Band', 'frTHIN', manager, capUsdc * 10);
+		_assertCarriesPolicyV2(fund);
+		assertFalse(fund.allowRiskyAssets());
+
+		// under the cap: the buy goes through
+		_buyBrett(fund, capUsdc * 6 / 10, false);
+		uint256 held = _holdingUsd18(fund, BRETT);
+		assertGt(held, 0);
+		assertLt(held, cap);
+
+		// past 10% of the band: refused, though 10% of the reserve would have allowed it
+		(uint256 holding, uint256 capHit) = _poolShareExceeded(_buyBrett(fund, capUsdc * 6 / 10, true), BRETT);
+		assertEq(capHit, cap, 'the cap is 10% of the recorded band');
+		assertGt(holding, cap);
+		assertLt(Math.mulDiv(holding, 10_000, _gavUsd18(fund)), 2_000, 'under 20% of GAV: only the pool cap binds');
+		assertLt(holding, Math.mulDiv(reserve, SMALL_CAP_BPS, 10_000), 'a reserve-sized cap would have allowed it');
+		emit log_named_decimal_uint('BRETT WETH reserve (USD)      ', reserve, 18);
+		emit log_named_decimal_uint('BRETT band recorded (USD)     ', band, 18);
+		emit log_named_decimal_uint('cap: 10% of the band (USD)    ', cap, 18);
+		emit log_named_decimal_uint('held after first buy (USD)    ', held, 18);
+		emit log_named_decimal_uint('holding refused (USD)         ', holding, 18);
+	}
+
+	/// @dev The fund owner buys BRETT for `usdcIn`: USDC → WETH on Uniswap's 0.05% pool, then WETH →
+	///      BRETT on BRETT's Uniswap 1% pool — a separate market, so the listed Slipstream pool's spot
+	///      (and its TWAP guard) stays put. With `expectRevert`, the second leg must revert; its
+	///      revert data is returned.
+	function _buyBrett(Comptroller fund, uint256 usdcIn, bool expectRevert) internal returns (bytes memory err) {
+		address vault = address(fund.vault());
+		uint256 wethBefore = IERC20(WETH).balanceOf(vault);
+		vm.prank(manager);
+		fund.callOnIntegration(uniAdapter, abi.encode(USDC, WETH, uint24(500), usdcIn, uint256(0)));
+		uint256 wethIn = IERC20(WETH).balanceOf(vault) - wethBefore;
+		assertEq(IUniswapV3PoolFactory(FundsMainnet.UNI_FACTORY).getPool(BRETT, WETH, 10000), BRETT_WETH_UNI_10000);
+		bytes memory leg = abi.encode(WETH, BRETT, uint24(10000), wethIn, uint256(0));
+		if (expectRevert) {
+			return _revertData(manager, address(fund), abi.encodeCall(Comptroller.callOnIntegration, (uniAdapter, leg)));
+		}
+		vm.prank(manager);
+		fund.callOnIntegration(uniAdapter, leg);
+	}
+
+	// ─── F2 / Ruling 23: the floor is two-part ───────────────────────────────────
+
+	/// @notice A pool's quote balance is not its bids: CHECK's Slipstream-2 USDC pool holds ~$300k
+	///         of USDC, but only ~$512 of it within −10% of the price. It prices, its oracle ring is
+	///         long, its reserve clears $25k many times over — and the band floor refuses it, with
+	///         the band it read.
+	function test_fork_thinBandRefusedAtListing() public {
+		vm.skip(!forked);
+		assertFalse(vi.isSupportedAsset(CHECK));
+		assertEq(ISlipstreamPoolFactory(FundsMainnet.CL2_FACTORY).getPool(CHECK, USDC, 100), CHECK_USDC_SLIP2_100);
+		// the registry's own adapter parameters, through its (permissionless) deployer
+		(, uint32 heartbeat) = d.registry.quotes(USDC);
+		TwapAggregatorAdapterV2 probe = TwapAggregatorAdapterV2(
+			d.clDeployer.deploy(
+				IConcentratedPoolOracle(CHECK_USDC_SLIP2_100),
+				CHECK,
+				AggregatorV3Interface(CL_USDC_USD),
+				d.registry.WINDOW(),
+				d.registry.MIN_QUOTE_RESERVE_USD(),
+				d.registry.MAX_DEVIATION_BPS(),
+				heartbeat,
+				'probe'
+			)
+		);
+		(, int256 price,,,) = probe.latestRoundData();
+		assertGt(price, 0, 'it prices: neither the window nor the spot guard refuses it');
+		uint256 reserve = probe.quoteReserveUsd();
+		uint256 band = probe.poolDepthUsd();
+		emit log_named_decimal_uint('CHECK USDC reserve (USD)', reserve, 18);
+		emit log_named_decimal_uint('CHECK band (USD)        ', band, 18);
+		assertEq(reserve, _usd18(IERC20(USDC).balanceOf(CHECK_USDC_SLIP2_100), USDC, CL_USDC_USD), 'the USDC it holds');
+		assertGe(reserve, RESERVE_FLOOR_USD18, 'the reserve alone would list it');
+		assertLt(band, BAND_FLOOR_USD18, 'under the band floor');
+
+		bytes memory err = _revertData(keeper, address(d.module), abi.encodeCall(PriceListingModule.list, (CHECK, USDC, SLIP2, 100)));
+		assertEq(_selector(err), TwapListingRegistryV2.BandBelowFloorAtListing.selector, 'refused on its band');
+		assertEq(abi.decode(_args(err), (uint256)), band, 'with the band it read');
+		assertFalse(vi.isSupportedAsset(CHECK));
+		assertEq(d.registry.listedCount(), 0);
+	}
+
+	/// @notice F2 on a real pool, the way a rugger does it. VIRTUAL's QUIET Uniswap USDC 1% pool
+	///         (427 USDC at block 52014634) gets the keeper's oracle-ring prep, then a rugger's
+	///         position minted through the real NonfungiblePositionManager — most of the liquidity
+	///         near spot. A window later it holds both parts of the floor and the keeper lists it.
+	///         The rugger then removes ALL its liquidity WITHOUT collecting: the USDC stays in the
+	///         pool as the position's tokensOwed, so the quote reserve (the pool's balance) still
+	///         reads over $25k — a reserve-only floor never starts the clock, and a zero-liquidity
+	///         pool's TWAP moves with dust — while nothing is left within −10% of the price. The band
+	///         floor sees it: isBelowFloor(), the lens and a stranger's poke all report it, and the
+	///         clock starts. Collecting then takes the "reserve" with it.
+	function test_fork_ruggedConcentratedPoolStartsClock() public {
+		vm.skip(!forked);
+		assertEq(d.registry.MIN_BAND_DEPTH_USD() * 1e18, BAND_FLOOR_USD18);
+		Rug memory g;
+		TwapAggregatorAdapterV2 adapter = _listRuggablePool(g);
+		assertEq(adapter.minBandDepthUsd(), d.registry.MIN_BAND_DEPTH_USD(), 'the adapter derives the same band floor');
+		_rugWithoutCollecting(g);
+
+		g.reserveRugged = adapter.quoteReserveUsd();
+		g.bandRugged = adapter.poolDepthUsd();
+		bool readsBelow = adapter.isBelowFloor();
+		(address[] memory due,) = d.lens.assetsNeedingPoke(d.registry, 0, 10);
+		vm.prank(stranger);
+		bool pokedBelow = d.registry.pokeFloor(VIRTUAL);
+		_logRug(g, readsBelow, due.length, pokedBelow);
+
+		// what a reserve-only floor saw: the uncollected USDC still reads over $25k
+		assertGe(g.reserveRugged, RESERVE_FLOOR_USD18, 'the uncollected USDC keeps the reserve over $25k');
+		assertApproxEqAbs(
+			g.reserveRugged, g.quietReserve + _usd18(g.usdcOwed, USDC, CL_USDC_USD), 0.01e18, 'the quiet pool + the owed USDC'
+		);
+		// what the band floor sees: no bids
+		assertLt(g.bandRugged, BAND_FLOOR_USD18, 'nothing within -10%');
+		assertTrue(readsBelow, 'isBelowFloor() sees the rug');
+		assertEq(due, _addrs(VIRTUAL), 'the lens flags it');
+		assertTrue(pokedBelow, "a stranger's poke reports it");
+		assertEq(_clockOf(VIRTUAL), block.timestamp, 'and starts the clock');
+
+		// collecting takes the "reserve" with it: it was the rugger's owed USDC all along
+		vm.prank(g.rugger);
+		IUniswapV3NonfungiblePositionManager(UNI_NPM).collect(
+			IUniswapV3NonfungiblePositionManager.CollectParams({
+				tokenId: g.tokenId, recipient: g.rugger, amount0Max: type(uint128).max, amount1Max: type(uint128).max
+			})
+		);
+		uint256 reserveCollected = adapter.quoteReserveUsd();
+		emit log_named_decimal_uint('collected: reserve (USD)       ', reserveCollected, 18);
+		assertApproxEqAbs(reserveCollected, g.quietReserve, 0.01e18, 'back to the quiet pool');
+		skip(d.registry.DELIST_GRACE());
+		assertTrue(d.registry.isDelisted(VIRTUAL), '72 hours on: delisted');
+	}
+
+	/// @dev The rug scenario's state, in memory (the stack can't hold it).
+	struct Rug {
+		address rugger;
+		uint256 tokenId;
+		uint128 liquidity;
+		uint256 quietReserve;
+		uint256 reserveListed;
+		uint256 bandListed;
+		uint256 usdcOwed;
+		uint256 reserveRugged;
+		uint256 bandRugged;
+	}
+
+	/// @dev The keeper's ring prep on the quiet pool (its ring holds 10), the rugger's position
+	///      around spot, and — a window later, the pool holding the floor on both reads — the
+	///      keeper's listing.
+	function _listRuggablePool(Rug memory g) internal returns (TwapAggregatorAdapterV2 adapter) {
+		address pool = VIRTUAL_USDC_10000;
+		assertEq(IUniswapV3PoolFactory(FundsMainnet.UNI_FACTORY).getPool(VIRTUAL, USDC, 10000), pool);
+		g.quietReserve = _usd18(IERC20(USDC).balanceOf(pool), USDC, CL_USDC_USD);
+		assertLt(g.quietReserve, BAND_FLOOR_USD18, 'a quiet pool');
+
+		_prepareOracle(pool);
+		g.rugger = makeAddr('rugger');
+		uint256 usdcIn;
+		(g.tokenId, g.liquidity, usdcIn) = _mintAroundSpot(pool, USDC, g.rugger, RUG_USDC);
+		assertApproxEqAbs(usdcIn, RUG_USDC, 1, 'the USDC side bound the mint');
+
+		_warpRoll(V2_WARP);
+		adapter = _list(VIRTUAL, USDC, UNI, 10000);
+		g.reserveListed = adapter.quoteReserveUsd();
+		g.bandListed = d.registry.recordedDepthUsd18(VIRTUAL);
+		assertGe(g.reserveListed, RESERVE_FLOOR_USD18);
+		assertGe(g.bandListed, BAND_FLOOR_USD18);
+		assertFalse(adapter.isBelowFloor());
+	}
+
+	/// @dev The rug: every unit of the rugger's liquidity out through the real NPM, nothing
+	///      collected — the USDC stays in the pool as the position's tokensOwed.
+	function _rugWithoutCollecting(Rug memory g) internal {
+		IUniswapV3NonfungiblePositionManager npm = IUniswapV3NonfungiblePositionManager(UNI_NPM);
+		uint256 poolUsdc = IERC20(USDC).balanceOf(VIRTUAL_USDC_10000);
+		vm.prank(g.rugger);
+		(, uint256 usdcFreed) = npm.decreaseLiquidity(
+			IUniswapV3NonfungiblePositionManager.DecreaseLiquidityParams({
+				tokenId: g.tokenId, liquidity: g.liquidity, amount0Min: 0, amount1Min: 0, deadline: block.timestamp
+			})
+		);
+		(,,,,,,, uint128 left,,,, uint128 owed1) = npm.positions(g.tokenId);
+		g.usdcOwed = owed1;
+		assertEq(left, 0, 'all liquidity removed');
+		assertEq(g.usdcOwed, usdcFreed, 'owed to the rugger, uncollected');
+		assertEq(IERC20(USDC).balanceOf(VIRTUAL_USDC_10000), poolUsdc, 'not one USDC left the pool');
+	}
+
+	function _logRug(Rug memory g, bool readsBelow, uint256 flagged, bool pokedBelow) internal {
+		emit log_named_decimal_uint('quiet pool USDC (USD)          ', g.quietReserve, 18);
+		emit log_named_decimal_uint('listed: reserve (USD)          ', g.reserveListed, 18);
+		emit log_named_decimal_uint('listed: band recorded (USD)    ', g.bandListed, 18);
+		emit log_named_decimal_uint('rugged: USDC owed, uncollected ', _usd18(g.usdcOwed, USDC, CL_USDC_USD), 18);
+		emit log_named_decimal_uint('rugged: reserve (USD)          ', g.reserveRugged, 18);
+		emit log_named_decimal_uint('rugged: band (USD)             ', g.bandRugged, 18);
+		emit log_named_string('rugged: isBelowFloor()         ', readsBelow ? 'true' : 'false');
+		emit log_named_uint('rugged: lens flags (count)     ', flagged);
+		emit log_named_string("rugged: stranger's pokeFloor   ", pokedBelow ? 'true (clock started)' : 'false (no clock)');
+	}
+
+	/// @dev `who` mints a two-sided position of `quoteIn` of `quote` (and as much of the other token
+	///      as that needs) on the ten tick spacings either side of spot, through the real Uniswap v3
+	///      NonfungiblePositionManager.
+	function _mintAroundSpot(address pool, address quote, address who, uint256 quoteIn)
+		internal
+		returns (uint256 tokenId, uint128 liquidity, uint256 quotePaid)
+	{
+		IUniswapV3NonfungiblePositionManager.MintParams memory p = _aroundSpot(pool, quote, who, quoteIn);
+		vm.startPrank(who);
+		IERC20(p.token0).approve(UNI_NPM, p.amount0Desired);
+		IERC20(p.token1).approve(UNI_NPM, p.amount1Desired);
+		uint256 paid0;
+		uint256 paid1;
+		(tokenId, liquidity, paid0, paid1) = IUniswapV3NonfungiblePositionManager(UNI_NPM).mint(p);
+		vm.stopPrank();
+		quotePaid = quote == p.token0 ? paid0 : paid1;
+	}
+
+	/// @dev Mint parameters for `who` on `pool`: ten spacings either side of spot, `quoteIn` of
+	///      `quote` and 100M of the other token, both dealt to `who`.
+	function _aroundSpot(address pool, address quote, address who, uint256 quoteIn)
+		internal
+		returns (IUniswapV3NonfungiblePositionManager.MintParams memory p)
+	{
+		p.token0 = IConcentratedPoolOracle(pool).token0();
+		p.token1 = IConcentratedPoolOracle(pool).token1();
+		p.fee = IUniswapV3PoolFee(pool).fee();
+		(, int24 spot) = _slot0(pool);
+		int24 spacing = IConcentratedPoolOracle(pool).tickSpacing();
+		int24 c = spot / spacing;
+		if (spot < 0 && spot % spacing != 0) c--;
+		p.tickLower = (c - 10) * spacing;
+		p.tickUpper = (c + 11) * spacing;
+		address asset = quote == p.token0 ? p.token1 : p.token0;
+		uint256 assetIn = 100_000_000 * 10 ** IERC20Metadata(asset).decimals();
+		(p.amount0Desired, p.amount1Desired) = quote == p.token0 ? (quoteIn, assetIn) : (assetIn, quoteIn);
+		deal(quote, who, quoteIn);
+		deal(asset, who, assetIn);
+		p.recipient = who;
+		p.deadline = block.timestamp;
 	}
 
 	// ─── delist clock ────────────────────────────────────────────────────────────
 
 	/// @notice Ruling 12b: the keeper's poke through the module reports `below`, records live
 	///         depth, and is the only poke that clears a clock once the pool has really recovered.
+	///         VIRTUAL on its Slipstream WETH ts200 pool, which real sells can empty (its USDC 0.3%
+	///         pool can't be put under the floor; see the contract natspec).
 	function test_fork_keeperPokeClearsAndRecords() public {
 		vm.skip(!forked);
-		TwapAggregatorAdapterV2 adapter = _list(VIRTUAL, USDC, UNI, 3000);
+		TwapAggregatorAdapterV2 adapter = _list(VIRTUAL, WETH, SLIP, 200);
 		vm.prank(stranger);
 		vm.expectRevert(PriceListingModule.NotKeeper.selector);
 		d.module.pokeFloor(VIRTUAL);
@@ -688,20 +1307,22 @@ contract TwapListingV2ForkTest is Test {
 		assertEq(d.registry.recordedDepthUsd18(VIRTUAL), adapter.poolDepthUsd());
 
 		// real sells: under the floor, the keeper's poke starts the clock and records the shortfall
-		(uint160 sqrtBefore,) = _slot0(VIRTUAL_USDC_3000);
-		_dumpVirtual(UNDER_FLOOR_TICKS);
+		(uint160 sqrtBefore,) = _slot0(VIRTUAL_WETH_SLIP_200);
+		_sellAsset(adapter, UNDER_FLOOR_TICKS);
 		vm.prank(keeper);
 		assertTrue(d.module.pokeFloor(VIRTUAL));
 		uint64 since = _clockOf(VIRTUAL);
 		assertEq(since, block.timestamp);
 		uint256 shortfall = adapter.poolDepthUsd();
 		assertEq(d.registry.recordedDepthUsd18(VIRTUAL), shortfall);
-		assertLt(shortfall, FLOOR_USD18);
+		uint256 reserveUnder = adapter.quoteReserveUsd();
+		assertLt(reserveUnder, RESERVE_FLOOR_USD18);
 
 		// a later block buys the price back to where it was, then the window rolls past the dip
+		// (1,862 s in all: ETH / USD, last updated 1,150 s before block 52014634, stays inside 3,600 s)
 		vm.roll(block.number + 1);
 		vm.warp(block.timestamp + 2);
-		_restoreVirtual(sqrtBefore);
+		_buyBack(adapter, sqrtBefore);
 		vm.roll(block.number + 930);
 		vm.warp(block.timestamp + 31 minutes);
 		assertFalse(adapter.isBelowFloor(), 'the pool really recovered');
@@ -722,9 +1343,12 @@ contract TwapListingV2ForkTest is Test {
 		assertFalse(d.module.pokeFloor(VIRTUAL));
 		assertEq(_clockOf(VIRTUAL), 0);
 		assertEq(d.registry.recordedDepthUsd18(VIRTUAL), recovered);
-		assertGe(recovered, FLOOR_USD18);
-		emit log_named_decimal_uint('depth after sells (USD)  ', shortfall, 18);
-		emit log_named_decimal_uint('depth after recovery (USD)', recovered, 18);
+		assertGe(adapter.quoteReserveUsd(), RESERVE_FLOOR_USD18);
+		assertGe(recovered, OLD_BAND_FLOOR_USD18);
+		emit log_named_decimal_uint('reserve after sells (USD)   ', reserveUnder, 18);
+		emit log_named_decimal_uint('depth after sells (USD)     ', shortfall, 18);
+		emit log_named_decimal_uint('reserve after recovery (USD)', adapter.quoteReserveUsd(), 18);
+		emit log_named_decimal_uint('depth after recovery (USD)  ', recovered, 18);
 	}
 
 	// ─── lens ────────────────────────────────────────────────────────────────────
@@ -732,7 +1356,7 @@ contract TwapListingV2ForkTest is Test {
 	function test_fork_lensPagesRealListings() public {
 		vm.skip(!forked);
 		_list(VIRTUAL, USDC, UNI, 3000);
-		_list(LCAP, WETH, SLIP, 200);
+		TwapAggregatorAdapterV2 lcap = _list(LCAP, WETH, SLIP, 200);
 		_prepareOracle(USDL_USDC_SLIP3_50);
 		_list(USDL, USDC, SLIP3, 50);
 		assertEq(d.registry.listedCount(), 3);
@@ -747,23 +1371,89 @@ contract TwapListingV2ForkTest is Test {
 		assertEq(next, 3, 'past the end: done');
 		assertEq(due.length, 0);
 
-		// real sells put VIRTUAL under the floor: the lens reports it on its page only
-		_dumpVirtual(UNDER_FLOOR_TICKS);
+		// real sells put LCAP's WETH reserve under the floor: the lens reports it on its page only
+		_sellAsset(lcap, UNDER_FLOOR_TICKS);
 		uint256 g = gasleft();
 		(due, next) = d.lens.assetsNeedingPoke(d.registry, 0, 2);
 		uint256 pageGas = g - gasleft();
 		assertEq(next, 2);
 		assertEq(due.length, 1);
-		assertEq(due[0], VIRTUAL);
+		assertEq(due[0], LCAP);
 		(due,) = d.lens.assetsNeedingPoke(d.registry, 2, 2);
 		assertEq(due.length, 0);
 
 		// once the clock matches the pool, nothing is due
 		vm.prank(stranger);
-		d.registry.pokeFloor(VIRTUAL);
+		d.registry.pokeFloor(LCAP);
 		(due,) = d.lens.assetsNeedingPoke(d.registry, 0, 3);
 		assertEq(due.length, 0);
+		emit log_named_decimal_uint('LCAP WETH reserve after sells', lcap.quoteReserveUsd(), 18);
 		emit log_named_uint('lens page (2 real listings) gas', pageGas);
+	}
+
+	/// @notice One listing per pool kind — concentrated (VVV, Uniswap v3), Uniswap v2 (AGNT) and
+	///         Aerodrome basic (AWE) — paged two at a time. Real sells take each quote reserve under
+	///         the floor in turn and the lens flags exactly that asset, on its own page; strangers'
+	///         pokes start the clocks and clear the flags; a real buy-back restores the v2 pool, the
+	///         lens flags it as clearable, and only the keeper's poke clears it.
+	function test_fork_lensPagesAcrossVenues() public {
+		vm.skip(!forked);
+		assertTrue(d.recorder.record(AGNT_USDC_V2));
+		_warpRoll(V2_WARP);
+		TwapAggregatorAdapterV2 vvv = _list(VVV, USDC, UNI, 3000);
+		ITwapPriceAdapter agnt = _listAny(AGNT, USDC, UNIV2, 0);
+		ITwapPriceAdapter awe = _listAny(AWE, USDC, AERO, 0);
+		assertEq(d.registry.listedCount(), 3);
+		address[] memory none = new address[](0);
+		// pages [VVV, AGNT] and [AWE]
+		_assertPage(0, none, 2);
+		_assertPage(2, none, 3);
+		_assertPage(3, none, 3);
+
+		// Aerodrome basic: real sells take AWE's USDC reserve under the floor
+		_dumpAerodrome(AWE_USDC_AERO, AWE, USDC);
+		assertTrue(awe.isBelowFloor());
+		_assertPage(0, none, 2);
+		_assertPage(2, _addrs(AWE), 3);
+		// Uniswap v2: AGNT
+		uint256 usdcOut = _dumpV2(AGNT_USDC_V2, AGNT, USDC);
+		assertTrue(agnt.isBelowFloor());
+		_assertPage(0, _addrs(AGNT), 2);
+		_assertPage(2, _addrs(AWE), 3);
+		// concentrated: VVV, flagged in listing order
+		_sellAsset(vvv, UNDER_FLOOR_TICKS);
+		assertTrue(vvv.isBelowFloor());
+		uint256 g = gasleft();
+		_assertPage(0, _addrs(VVV, AGNT), 2);
+		uint256 pageGas = g - gasleft();
+		_assertPage(2, _addrs(AWE), 3);
+		emit log_named_decimal_uint('VVV reserve after sells (USD) ', vvv.quoteReserveUsd(), 18);
+		emit log_named_decimal_uint('AGNT reserve after sells (USD)', agnt.quoteReserveUsd(), 18);
+		emit log_named_decimal_uint('AWE reserve after sells (USD) ', awe.quoteReserveUsd(), 18);
+
+		// a stranger starts every clock: nothing is due
+		vm.startPrank(stranger);
+		assertTrue(d.registry.pokeFloor(VVV));
+		assertTrue(d.registry.pokeFloor(AGNT));
+		assertTrue(d.registry.pokeFloor(AWE));
+		vm.stopPrank();
+		_assertPage(0, none, 2);
+		_assertPage(2, none, 3);
+
+		// real buys restore AGNT's reserve: flagged again (a clock to clear), until the keeper pokes
+		_buyBackV2(AGNT_USDC_V2, AGNT, USDC, usdcOut);
+		assertFalse(agnt.isBelowFloor());
+		_assertPage(0, _addrs(AGNT), 2);
+		vm.prank(stranger);
+		assertFalse(d.registry.pokeFloor(AGNT));
+		_assertPage(0, _addrs(AGNT), 2);
+		vm.prank(keeper);
+		assertFalse(d.module.pokeFloor(AGNT));
+		assertEq(_clockOf(AGNT), 0);
+		_assertPage(0, none, 2);
+		_assertPage(2, none, 3);
+		emit log_named_decimal_uint('AGNT reserve after buy-back   ', agnt.quoteReserveUsd(), 18);
+		emit log_named_uint('lens page (CL + v2 listings) gas', pageGas);
 	}
 
 	// ─── helpers ─────────────────────────────────────────────────────────────────
@@ -848,12 +1538,15 @@ contract TwapListingV2ForkTest is Test {
 	}
 
 	/// @dev What the keeper does before listing a pool whose oracle ring is short: ask for
-	///      ORACLE_RING observations, then one real observation write if the ring hasn't grown — a
+	///      ORACLE_RING observations, then real observation writes until the ring has grown — a
 	///      pool grows its ring only on a write at the ring's last slot, which for cardinality 1 is
-	///      the very next write.
+	///      the very next write (VIRTUAL_USDC_10000, ring 10 at index 0: the tenth).
 	function _prepareOracle(address pool) internal {
 		IOracleRing(pool).increaseObservationCardinalityNext(ORACLE_RING);
-		if (_cardinality(pool) < ORACLE_RING) _writeObservation(pool);
+		uint16 ring = _cardinality(pool);
+		for (uint256 i; i < ring && _cardinality(pool) < ORACLE_RING; ++i) {
+			_writeObservation(pool);
+		}
 		assertGe(_cardinality(pool), ORACLE_RING, 'the ring grew');
 	}
 
@@ -979,11 +1672,6 @@ contract TwapListingV2ForkTest is Test {
 		}
 	}
 
-	/// @dev Real sells of VIRTUAL into its USDC 0.3% pool until spot is `ticks` lower.
-	function _dumpVirtual(int24 ticks) internal returns (uint256 sold) {
-		return _sellInto(VIRTUAL, USDC, 3000, ticks);
-	}
-
 	/// @dev Real sells of `asset` into its Uniswap v3 pool vs `quote` through SwapRouter02 until
 	///      spot has moved `ticks` against the asset (a price limit), `deal`ing the asset. Returns
 	///      the amount sold.
@@ -1011,45 +1699,101 @@ contract TwapListingV2ForkTest is Test {
 		assertEq(sqrtAfter, TickMath.getSqrtRatioAtTick(limitTick), 'the sells reached the limit');
 	}
 
-	/// @dev Real sells that leave `adapter`'s Uniswap pool JUST under the floor: the smallest push
-	///      (binary search over snapshots) whose quote-side depth reads under $50k.
-	function _sellJustUnderFloor(TwapAggregatorAdapterV2 adapter, uint24 fee) internal returns (int24 push) {
+	/// @dev Real sells of `adapter`'s asset into its pool until spot has moved `ticks` against the
+	///      asset: Uniswap v3 through SwapRouter02 (`_sellInto`), Slipstream through the router of the
+	///      pool's own deployment. Returns the amount sold.
+	function _sellAsset(TwapAggregatorAdapterV2 adapter, int24 ticks) internal returns (uint256 sold) {
+		address pool = address(adapter.pool());
 		address asset = adapter.asset();
-		address quote = adapter.quoteAsset();
+		address venueFactory = IOracleRing(pool).factory();
+		if (venueFactory == FundsMainnet.UNI_FACTORY) {
+			return _sellInto(asset, adapter.quoteAsset(), IUniswapV3PoolFee(pool).fee(), ticks);
+		}
+		(, int24 spot) = _slot0(pool);
+		uint160 limit = TickMath.getSqrtRatioAtTick(adapter.assetIsToken0() ? spot - ticks : spot + ticks);
+		uint256 amount = 100_000_000 * 10 ** IERC20Metadata(asset).decimals();
+		deal(asset, address(this), amount);
+		address router = _slipstreamRouter(venueFactory);
+		IERC20(asset).approve(router, amount);
+		ISlipstreamSwapRouter(router).exactInputSingle(
+			ISlipstreamSwapRouter.ExactInputSingleParams({
+				tokenIn: asset,
+				tokenOut: adapter.quoteAsset(),
+				tickSpacing: IConcentratedPoolOracle(pool).tickSpacing(),
+				recipient: address(this),
+				deadline: block.timestamp,
+				amountIn: amount,
+				amountOutMinimum: 0,
+				sqrtPriceLimitX96: limit
+			})
+		);
+		sold = amount - IERC20(asset).balanceOf(address(this));
+		(uint160 sqrtAfter,) = _slot0(pool);
+		assertEq(sqrtAfter, limit, 'the sells reached the limit');
+	}
+
+	/// @dev The swap router of a Slipstream deployment, by its pool factory.
+	function _slipstreamRouter(address venueFactory) internal pure returns (address) {
+		if (venueFactory == FundsMainnet.CL_FACTORY) return FundsMainnet.CL_SWAP_ROUTER;
+		if (venueFactory == FundsMainnet.CL2_FACTORY) return FundsMainnet.CL2_SWAP_ROUTER;
+		assertEq(venueFactory, TwapListingV2.CL3_FACTORY, 'a Slipstream deployment');
+		return TwapListingV2.CL3_SWAP_ROUTER;
+	}
+
+	/// @dev Whether real sells moving spot `ticks` against the asset leave the pool under the floor
+	///      (two-part since Ruling 23; on the pools used here the QUOTE RESERVE crosses first — the
+	///      pushes found are the same as under the reserve-only floor); the state is rolled back.
+	function _belowAfterSells(TwapAggregatorAdapterV2 adapter, int24 ticks) internal returns (bool below) {
+		uint256 snap = vm.snapshotState();
+		_sellAsset(adapter, ticks);
+		below = adapter.isBelowFloor();
+		vm.revertToState(snap);
+	}
+
+	/// @dev Real sells that leave `adapter`'s pool JUST under the floor: the smallest push (to the
+	///      tick) whose quote reserve reads under $25k. Selling the asset pays quote out of the pool,
+	///      so the push is bracketed by doubling, then binary-searched over snapshots.
+	function _sellJustUnderFloor(TwapAggregatorAdapterV2 adapter) internal returns (int24 push) {
 		assertFalse(adapter.isBelowFloor());
 		int24 over;
-		int24 under = 5_000;
+		int24 under = 1_000;
+		while (!_belowAfterSells(adapter, under)) {
+			over = under;
+			under *= 2;
+			assertLe(under, 256_000, 'real sells reach the floor');
+		}
 		while (under - over > 1) {
 			int24 mid = (over + under) / 2;
-			uint256 snap = vm.snapshotState();
-			_sellInto(asset, quote, fee, mid);
-			bool below = adapter.isBelowFloor();
-			vm.revertToState(snap);
-			if (below) under = mid;
+			if (_belowAfterSells(adapter, mid)) under = mid;
 			else over = mid;
 		}
-		_sellInto(asset, quote, fee, under);
+		_sellAsset(adapter, under);
 		assertTrue(adapter.isBelowFloor());
 		push = under;
 	}
 
-	/// @dev Real buys of VIRTUAL with USDC until the pool is back at `sqrtTarget` exactly.
-	function _restoreVirtual(uint160 sqrtTarget) internal {
-		uint256 amount = 100_000_000e6;
-		deal(USDC, address(this), amount);
-		IERC20(USDC).approve(UNI_ROUTER, amount);
-		IUniswapV3SwapRouter(UNI_ROUTER).exactInputSingle(
-			IUniswapV3SwapRouter.ExactInputSingleParams({
-				tokenIn: USDC,
-				tokenOut: VIRTUAL,
-				fee: 3000,
+	/// @dev Real buys of `adapter`'s asset with its quote token, through the router of the pool's
+	///      own Slipstream deployment, until the pool is back at `sqrtTarget` exactly.
+	function _buyBack(TwapAggregatorAdapterV2 adapter, uint160 sqrtTarget) internal {
+		address pool = address(adapter.pool());
+		address quote = adapter.quoteAsset();
+		address router = _slipstreamRouter(IOracleRing(pool).factory());
+		uint256 amount = 100_000_000 * 10 ** IERC20Metadata(quote).decimals();
+		deal(quote, address(this), amount);
+		IERC20(quote).approve(router, amount);
+		ISlipstreamSwapRouter(router).exactInputSingle(
+			ISlipstreamSwapRouter.ExactInputSingleParams({
+				tokenIn: quote,
+				tokenOut: adapter.asset(),
+				tickSpacing: IConcentratedPoolOracle(pool).tickSpacing(),
 				recipient: address(this),
+				deadline: block.timestamp,
 				amountIn: amount,
 				amountOutMinimum: 0,
 				sqrtPriceLimitX96: sqrtTarget
 			})
 		);
-		(uint160 sqrtNow,) = _slot0(VIRTUAL_USDC_3000);
+		(uint160 sqrtNow,) = _slot0(pool);
 		assertEq(sqrtNow, sqrtTarget);
 	}
 
@@ -1183,5 +1927,176 @@ contract TwapListingV2ForkTest is Test {
 
 	function _gavUsd18(Comptroller fund) internal returns (uint256) {
 		return Math.mulDiv(fund.calcGav(), vi.calcUsdRate(USDC), 1e6);
+	}
+
+	function _listAny(address asset, address quote, TwapListingRegistryV2.Venue venue, int24 feeOrTickSpacing)
+		internal
+		returns (ITwapPriceAdapter)
+	{
+		vm.prank(keeper);
+		return ITwapPriceAdapter(d.module.list(asset, quote, venue, feeOrTickSpacing));
+	}
+
+	function _repointAny(address asset, address quote, TwapListingRegistryV2.Venue venue, int24 feeOrTickSpacing)
+		internal
+		returns (ITwapPriceAdapter)
+	{
+		vm.prank(keeper);
+		return ITwapPriceAdapter(d.module.repoint(asset, quote, venue, feeOrTickSpacing));
+	}
+
+	/// @dev The listing is live: the registry's record, the venue, the VI primitive (TWAP heartbeat)
+	///      and the band the lister recorded.
+	function _assertListedOn(address asset, address adapter, address pool, address quote, TwapListingRegistryV2.Venue venue)
+		internal
+		view
+	{
+		(ITwapPriceAdapter stored, address storedPool, address storedQuote,, uint64 since) = d.registry.listings(asset);
+		assertEq(address(stored), adapter);
+		assertEq(storedPool, pool);
+		assertEq(storedQuote, quote);
+		assertEq(since, 0);
+		assertEq(uint8(d.registry.venueOf(asset)), uint8(venue));
+		assertTrue(d.registry.isTwapPriced(asset));
+		(address aggregator, uint32 heartbeat,,) = vi.getAssetInfo(asset);
+		assertEq(aggregator, adapter, 'the VI prices through the new adapter');
+		assertEq(heartbeat, d.module.TWAP_HEARTBEAT());
+		assertEq(d.registry.recordedDepthUsd18(asset), ITwapPriceAdapter(adapter).poolDepthUsd(), 'the band is recorded');
+	}
+
+	/// @dev The live degen fund, as its owner, trades through `swapAdapter`; returns the `asset` its
+	///      vault received, after checking the fund still values itself within 1%.
+	function _liveFundBuys(address swapAdapter, address asset, bytes memory data) internal returns (uint256 bought) {
+		Comptroller live = Comptroller(LIVE_FUND);
+		address vault = address(live.vault());
+		assertEq(live.fundOwner(), deployer);
+		assertTrue(factory.isAdapterRegistered(swapAdapter), 'the deploy registered the swap adapter');
+		assertGe(IERC20(USDC).balanceOf(vault), 1e6, 'the live fund holds USDC');
+		uint256 before = IERC20(asset).balanceOf(vault);
+		uint256 gavBefore = live.calcGav();
+		vm.prank(deployer);
+		live.callOnIntegration(swapAdapter, data);
+		bought = IERC20(asset).balanceOf(vault) - before;
+		assertGt(bought, 0);
+		assertApproxEqRel(live.calcGav(), gavBefore, 0.01e18, 'the fund values its new holding');
+	}
+
+	/// @dev One USD of `asset` at `rate` (USD per whole asset, 18 dp), less 3%.
+	function _oneUsdLess3Pct(address asset, uint256 rate) internal view returns (uint256) {
+		return Math.mulDiv(0.97e18, 10 ** IERC20Metadata(asset).decimals(), rate);
+	}
+
+	/// @dev Time passes on Base: ~2-second blocks.
+	function _warpRoll(uint256 secs) internal {
+		vm.warp(block.timestamp + secs);
+		vm.roll(block.number + secs / 2);
+	}
+
+	/// @dev USD (18 dp) of `amount` raw units of `token` at `feed`.
+	function _usd18(uint256 amount, address token, address feed) internal view returns (uint256) {
+		return Math.mulDiv(amount, _chainlinkUsd18(feed), 10 ** IERC20Metadata(token).decimals());
+	}
+
+	/// @dev USD (18 dp) per whole asset at the reserves' spot: rQ / rA × the quote feed.
+	function _reserveSpotUsd18(uint256 rA, uint256 rQ, address asset, address quote, address feed)
+		internal
+		view
+		returns (uint256)
+	{
+		return Math.mulDiv(_usd18(rQ, quote, feed), 10 ** IERC20Metadata(asset).decimals(), rA);
+	}
+
+	/// @dev (asset reserve, quote reserve) of a Uniswap v2 pair.
+	function _v2Reserves(address pair, address asset) internal view returns (uint256 rA, uint256 rQ) {
+		(uint112 r0, uint112 r1,) = IUniswapV2Pair(pair).getReserves();
+		(rA, rQ) = IUniswapV2Pair(pair).token0() == asset ? (uint256(r0), uint256(r1)) : (uint256(r1), uint256(r0));
+	}
+
+	/// @dev (asset reserve, quote reserve) of an Aerodrome basic pool.
+	function _aeroReserves(address pool, address asset) internal view returns (uint256 rA, uint256 rQ) {
+		(uint256 r0, uint256 r1,) = IAerodromeBasicPool(pool).getReserves();
+		(rA, rQ) = IAerodromeBasicPool(pool).token0() == asset ? (r0, r1) : (r1, r0);
+	}
+
+	/// @dev The pool's own time-averaged reserves (asset, quote), read from the raw pool, × `feed`,
+	///      rounded once: USD (18 dp) per whole asset.
+	function _aeroTwapUsd18(address pool, address asset, address feed) internal view returns (uint256) {
+		(uint256 avgA, uint256 avgQ) = _aeroTwar(IAerodromeBasicPool(pool), asset);
+		address quote = IAerodromeBasicPool(pool).token0() == asset ? IAerodromeBasicPool(pool).token1() : IAerodromeBasicPool(pool).token0();
+		return Math.mulDiv(avgQ, 10 ** IERC20Metadata(asset).decimals() * _chainlinkUsd18(feed), avgA)
+			/ 10 ** IERC20Metadata(quote).decimals();
+	}
+
+	/// @dev Average reserves from the newest observation at least 30 minutes old (the last one, else
+	///      the one before it) to now.
+	function _aeroTwar(IAerodromeBasicPool p, address asset) internal view returns (uint256 avgA, uint256 avgQ) {
+		(uint256 t, uint256 c0, uint256 c1) = p.lastObservation();
+		if (block.timestamp - t < 30 minutes) (t, c0, c1) = p.observations(p.observationLength() - 2);
+		(uint256 n0, uint256 n1, uint256 tNow) = p.currentCumulativePrices();
+		(uint256 avg0, uint256 avg1) = ((n0 - c0) / (tNow - t), (n1 - c1) / (tNow - t));
+		(avgA, avgQ) = p.token0() == asset ? (avg0, avg1) : (avg1, avg0);
+	}
+
+	/// @dev Real sells of V2_DUMP_MULTIPLE × the pair's `asset` reserve through Uniswap v2 Router02;
+	///      returns the `quote` paid out.
+	function _dumpV2(address pair, address asset, address quote) internal returns (uint256 quoteOut) {
+		(uint256 rA,) = _v2Reserves(pair, asset);
+		uint256 amount = rA * V2_DUMP_MULTIPLE;
+		deal(asset, address(this), amount);
+		IERC20(asset).approve(UNI_V2_ROUTER, amount);
+		uint256 before = IERC20(quote).balanceOf(address(this));
+		IUniswapV2Router02(UNI_V2_ROUTER).swapExactTokensForTokensSupportingFeeOnTransferTokens(
+			amount, 0, _path(asset, quote), address(this), block.timestamp
+		);
+		quoteOut = IERC20(quote).balanceOf(address(this)) - before;
+	}
+
+	/// @dev Real buys of `asset` with `quoteIn` of `quote` through Uniswap v2 Router02.
+	function _buyBackV2(address pair, address asset, address quote, uint256 quoteIn) internal {
+		(uint256 rABefore,) = _v2Reserves(pair, asset);
+		IERC20(quote).approve(UNI_V2_ROUTER, quoteIn);
+		IUniswapV2Router02(UNI_V2_ROUTER).swapExactTokensForTokensSupportingFeeOnTransferTokens(
+			quoteIn, 0, _path(quote, asset), address(this), block.timestamp
+		);
+		(uint256 rAAfter,) = _v2Reserves(pair, asset);
+		assertLt(rAAfter, rABefore, 'the buys took the asset back out');
+	}
+
+	/// @dev Real sells of V2_DUMP_MULTIPLE × the pool's `asset` reserve through the Aerodrome Router,
+	///      on the volatile route.
+	function _dumpAerodrome(address pool, address asset, address quote) internal {
+		(uint256 rA,) = _aeroReserves(pool, asset);
+		uint256 amount = rA * V2_DUMP_MULTIPLE;
+		deal(asset, address(this), amount);
+		IERC20(asset).approve(AERO_ROUTER, amount);
+		IAerodromeRouter.Route[] memory routes = new IAerodromeRouter.Route[](1);
+		routes[0] = IAerodromeRouter.Route({from: asset, to: quote, stable: false, factory: AERO_FACTORY});
+		IAerodromeRouter(AERO_ROUTER).swapExactTokensForTokensSupportingFeeOnTransferTokens(
+			amount, 0, routes, address(this), block.timestamp
+		);
+	}
+
+	function _path(address from, address to) internal pure returns (address[] memory path) {
+		path = new address[](2);
+		path[0] = from;
+		path[1] = to;
+	}
+
+	/// @dev The lens page [offset, offset + 2) flags exactly `expected`, in listing order.
+	function _assertPage(uint256 offset, address[] memory expected, uint256 expectedNext) internal view {
+		(address[] memory due, uint256 next) = d.lens.assetsNeedingPoke(d.registry, offset, 2);
+		assertEq(next, expectedNext);
+		assertEq(due, expected);
+	}
+
+	function _addrs(address a) internal pure returns (address[] memory list) {
+		list = new address[](1);
+		list[0] = a;
+	}
+
+	function _addrs(address a, address b) internal pure returns (address[] memory list) {
+		list = new address[](2);
+		list[0] = a;
+		list[1] = b;
 	}
 }

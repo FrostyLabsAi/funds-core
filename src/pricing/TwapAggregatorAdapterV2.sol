@@ -2,10 +2,13 @@
 pragma solidity 0.8.24;
 
 import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
+import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {IERC20Metadata} from '@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol';
 import {AggregatorV3Interface} from '../interfaces/AggregatorV3Interface.sol';
+import {ITwapPriceAdapter} from '../interfaces/ITwapPriceAdapter.sol';
 import {TickMath} from '../libraries/TickMath.sol';
 import {LiquidityAmounts} from '../libraries/LiquidityAmounts.sol';
+import {TwapFloor} from '../libraries/TwapFloor.sol';
 import {IConcentratedPoolOracle} from './TwapAggregatorAdapter.sol';
 
 /// @title TwapAggregatorAdapterV2
@@ -19,13 +22,20 @@ import {IConcentratedPoolOracle} from './TwapAggregatorAdapter.sol';
 ///      3. quote feed answer > 0 and within `quoteHeartbeat`;
 ///      4. observations cover the full window.
 ///      The liquidity floor does not revert: `isBelowFloor()` reports it, the registry runs a
-///      72-hour clock, and the exposure caps bound what a thin pool can move. Depth = USD of the
-///      QUOTE token (USDC/WETH) held within ±10% of the price — the real bids an asset seller
-///      meets — the lower of the window's harmonic-mean liquidity over the band and what current
-///      liquidity actually holds in it. The asset side is never counted: a one-sided position of
-///      a self-priced token is not depth (v1 counted it; see LUMIA in the fork test).
+///      72-hour clock, and the exposure caps bound what a thin pool can move. Two reads:
+///      - Reserve = USD of the QUOTE token (USDC/WETH) the pool holds (`quoteReserveUsd()`): its
+///        whole balance, which on a concentrated pool includes uncollected fees, liquidity removed
+///        but not collected (tokensOwed) and donations — none of them bids.
+///      - Depth = USD of the QUOTE token held within ±10% of the price — the real bids an asset
+///        seller meets — the lower of the window's harmonic-mean liquidity over the band and what
+///        current liquidity actually holds in it. It sizes exposure caps, the recorded depth and
+///        the repoint margin.
+///      The floor is both (Ruling 23): reserve ≥ `minLiquidityUsd` AND depth ≥ `minBandDepthUsd`,
+///      so a pool rugged without collecting (its balance intact, nothing near the price) is under it.
+///      The asset side is never counted: a one-sided position of a self-priced token is neither
+///      reserve nor depth (v1 counted it; see LUMIA in the fork test).
 ///      `updatedAt` is the read's own timestamp.
-contract TwapAggregatorAdapterV2 is AggregatorV3Interface {
+contract TwapAggregatorAdapterV2 is AggregatorV3Interface, ITwapPriceAdapter {
 	uint32 public constant MIN_WINDOW = 30 minutes;
 	uint16 public constant MAX_DEVIATION_BPS = 2_000;
 	uint256 private constant BPS = 10_000;
@@ -40,8 +50,11 @@ contract TwapAggregatorAdapterV2 is AggregatorV3Interface {
 	bool public immutable assetIsToken0;
 	AggregatorV3Interface public immutable quoteFeed;
 	uint32 public immutable window;
-	/// @notice Floor on the window's ±10% depth, whole USD.
+	/// @notice Floor on the QUOTE reserve (`quoteReserveUsd()`), whole USD.
 	uint256 public immutable minLiquidityUsd;
+	/// @notice Floor on the band depth (`poolDepthUsd()`), whole USD:
+	///         TwapFloor.minBandDepthUsd(minLiquidityUsd) — 1,282 for the registry's 25,000.
+	uint256 public immutable minBandDepthUsd;
 	uint16 public immutable maxDeviationBps;
 	uint32 public immutable quoteHeartbeat;
 	uint8 private immutable assetDecimals;
@@ -94,13 +107,14 @@ contract TwapAggregatorAdapterV2 is AggregatorV3Interface {
 		quoteFeed = quoteFeed_;
 		window = window_;
 		minLiquidityUsd = minLiquidityUsd_;
+		minBandDepthUsd = TwapFloor.minBandDepthUsd(minLiquidityUsd_);
 		maxDeviationBps = maxDeviationBps_;
 		quoteHeartbeat = quoteHeartbeat_;
 		description = description_;
 	}
 
 	/// @inheritdoc AggregatorV3Interface
-	function decimals() external pure returns (uint8) {
+	function decimals() external pure override(AggregatorV3Interface, ITwapPriceAdapter) returns (uint8) {
 		return ANSWER_DECIMALS;
 	}
 
@@ -109,15 +123,14 @@ contract TwapAggregatorAdapterV2 is AggregatorV3Interface {
 	function latestRoundData()
 		external
 		view
+		override(AggregatorV3Interface, ITwapPriceAdapter)
 		returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)
 	{
 		(int24 meanTick,) = _consult();
 		int24 spotTick = _spotTick();
 		if (!_withinDeviation(spotTick, meanTick)) revert SpotDeviatesFromTwap(spotTick, meanTick);
 
-		uint256 quoteUsd18 = _quoteUsd18();
-		uint256 quotePerAsset = _convertAtTick(meanTick, uint128(10 ** assetDecimals), assetIsToken0);
-		uint256 price = Math.mulDiv(quotePerAsset, quoteUsd18, 10 ** quoteDecimals);
+		uint256 price = _usdPerAssetAtTick(meanTick, _quoteUsd18());
 		if (price == 0) revert PriceRoundsToZero();
 
 		answer = int256(price);
@@ -133,9 +146,19 @@ contract TwapAggregatorAdapterV2 is AggregatorV3Interface {
 		return _depthUsd();
 	}
 
-	/// @notice True while the ±10% depth is under `minLiquidityUsd`.
+	/// @notice USD (18 decimals) of the QUOTE token the pool holds: its whole balance (every
+	///         position in range or not, plus anything owed, accrued or donated) × the quote feed.
+	///         Reverts when the pool can't serve the window or the quote feed is non-positive or
+	///         stale; the spot-deviation guard is not applied.
+	function quoteReserveUsd() public view returns (uint256) {
+		_consult();
+		return Math.mulDiv(IERC20(quoteAsset).balanceOf(address(pool)), _quoteUsd18(), 10 ** quoteDecimals);
+	}
+
+	/// @notice True while the quote reserve is under `minLiquidityUsd` or the band depth under
+	///         `minBandDepthUsd` (read only when the reserve holds).
 	function isBelowFloor() external view returns (bool) {
-		return _depthUsd() < minLiquidityUsd * 1e18;
+		return quoteReserveUsd() < minLiquidityUsd * 1e18 || _depthUsd() < minBandDepthUsd * 1e18;
 	}
 
 	/// @notice USD of the QUOTE token the pool's current liquidity holds within ±10% of spot,
@@ -304,15 +327,29 @@ contract TwapAggregatorAdapterV2 is AggregatorV3Interface {
 		return Math.mulDiv(quoteAmount, quoteUsd18, 10 ** quoteDecimals);
 	}
 
-	/// @dev `baseAmount` of one pool token → the other token at `tick` (raw units).
-	///      Adapted from Uniswap OracleLibrary.getQuoteAtTick.
-	function _convertAtTick(int24 tick, uint128 baseAmount, bool baseIsToken0) internal pure returns (uint256) {
-		uint160 sqrtRatioX96 = TickMath.getSqrtRatioAtTick(tick);
-		if (sqrtRatioX96 <= type(uint128).max) {
-			uint256 ratioX192 = uint256(sqrtRatioX96) * sqrtRatioX96;
-			return baseIsToken0 ? Math.mulDiv(ratioX192, baseAmount, 1 << 192) : Math.mulDiv(1 << 192, baseAmount, ratioX192);
+	/// @dev USD (18 decimals) per whole asset at `tick`, rounded down ONCE (never to whole quote
+	///      units first, so a $0.000001 token keeps its digits):
+	///      asset = token0: sqrtP² / 2^192 × 10^ad × quoteUsd18 / 10^qd;
+	///      asset = token1: 2^192 / sqrtP² × 10^ad × quoteUsd18 / 10^qd.
+	///      A trailing integer division adds no rounding: floor(floor(x) / n) = floor(x / n).
+	///      Bounds (sqrtP < 2^160; scale = 10^ad × quoteUsd18 fits for ad ≤ 38 and a quote < $1e21):
+	///      - sqrtP ≤ 2^128: sqrtP² < 2^256; mulDiv returns price × 10^qd.
+	///      - sqrtP > 2^128, asset = token1 (an asset worth < 2^-64 quote units per unit): the
+	///        denominator sqrtP × 10^qd fits for qd ≤ 28; mulDiv returns < 2^64 × scale / 10^qd.
+	///      - sqrtP > 2^128, asset = token0 (an asset worth > 2^64 quote units per unit, which no
+	///        USDC/WETH pair reaches): sqrtP² / 2^64 is floored first, a relative error < 2^-192.
+	///      A result that can't fit reverts in mulDiv; it never wraps.
+	function _usdPerAssetAtTick(int24 tick, uint256 quoteUsd18) internal view returns (uint256) {
+		uint256 sqrtP = TickMath.getSqrtRatioAtTick(tick);
+		uint256 scale = 10 ** assetDecimals * quoteUsd18;
+		uint256 quoteUnit = 10 ** quoteDecimals;
+		if (sqrtP <= type(uint128).max) {
+			uint256 ratioX192 = sqrtP * sqrtP;
+			return assetIsToken0
+				? Math.mulDiv(ratioX192, scale, 1 << 192) / quoteUnit
+				: Math.mulDiv(1 << 192, scale, ratioX192) / quoteUnit;
 		}
-		uint256 ratioX128 = Math.mulDiv(sqrtRatioX96, sqrtRatioX96, 1 << 64);
-		return baseIsToken0 ? Math.mulDiv(ratioX128, baseAmount, 1 << 128) : Math.mulDiv(1 << 128, baseAmount, ratioX128);
+		if (assetIsToken0) return Math.mulDiv(Math.mulDiv(sqrtP, sqrtP, 1 << 64), scale, 1 << 128) / quoteUnit;
+		return Math.mulDiv(1 << 192, scale, sqrtP * quoteUnit) / sqrtP;
 	}
 }

@@ -71,6 +71,10 @@ library FundsMainnet {
 	address internal constant CL2_FACTORY = 0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef;
 	address internal constant CL2_SWAP_ROUTER = 0x698Cb2b6dd822994581fEa6eA4Fc755d1363A92F;
 	address internal constant CL2_NPM = 0xe1f8cd9AC4e4A65F54f38a5CdAfCA44f6dD68b53;
+	/// @dev Slipstream-3's NonfungiblePositionManager (aerodrome-finance/slipstream README, "Gauge Caps
+	///      Deployment"); factory() = 0xaDe6…716a, the pool factory TwapListingV2.CL3_FACTORY names
+	///      (read 2026-10-01). Not a genesis venue: the fee compounders use it (CompoundersMainnet).
+	address internal constant CL3_NPM = 0xa990C6a764b73BF43cee5Bb40339c3322FB9D55F;
 
 	address internal constant VERANTA_ROUTER = 0x44914408af82bC9983bbb330e3578E1105e11d4e;
 	address internal constant VERANTA_STORAGE = 0x8a311D7048c35985aa31C131B9A13e03a5f7422d;

@@ -9,7 +9,7 @@ import {IExternalPosition} from '../interfaces/IExternalPosition.sol';
 import {IValueInterpreter} from '../interfaces/IValueInterpreter.sol';
 import {Comptroller} from '../core/Comptroller.sol';
 import {TwapListingRegistryV2} from '../pricing/TwapListingRegistryV2.sol';
-import {TwapAggregatorAdapterV2} from '../pricing/TwapAggregatorAdapterV2.sol';
+import {ITwapPriceAdapter} from '../interfaces/ITwapPriceAdapter.sol';
 
 /// @title TwapExposurePolicyV2
 /// @notice Limits for funds holding TWAP-priced assets:
@@ -102,7 +102,7 @@ contract TwapExposurePolicyV2 is IPolicy {
 		uint256 units = IERC20(asset).balanceOf(address(comptroller.vault())) + _unitsInPositions(comptroller, asset);
 		uint256 holdingUsd18 = Math.mulDiv(vi.calcUsdRate(asset), units, 10 ** IERC20Metadata(asset).decimals());
 		uint256 depthUsd18 = Math.min(
-			TwapAggregatorAdapterV2(registry.adapterOf(asset)).poolDepthUsd(), registry.recordedDepthUsd18(asset)
+			ITwapPriceAdapter(registry.adapterOf(asset)).poolDepthUsd(), registry.recordedDepthUsd18(asset)
 		);
 		uint256 capBps = depthUsd18 < LARGE_POOL_USD * 1e18 ? SMALL_POOL_CAP_BPS : LARGE_POOL_CAP_BPS;
 		uint256 capUsd18 = Math.mulDiv(depthUsd18, capBps, BPS);

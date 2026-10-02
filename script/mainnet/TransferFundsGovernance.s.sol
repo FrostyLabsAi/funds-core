@@ -11,15 +11,20 @@ import {TwapExposurePolicy} from '../../src/policies/TwapExposurePolicy.sol';
 import {VerantaPerpPositionV2Factory} from '../../src/positions/VerantaPerpPositionV2.sol';
 import {PriceListingModule} from '../../src/pricing/PriceListingModule.sol';
 import {TwapListingRegistryV2} from '../../src/pricing/TwapListingRegistryV2.sol';
+import {CompounderFactory} from '../../src/yield/CompounderFactory.sol';
+import {SlipstreamLPPositionV2Factory} from '../../src/positions/SlipstreamLPPositionV2.sol';
+import {VerantaPerpPositionV3Factory} from '../../src/positions/VerantaPerpPositionV3.sol';
 import {FundsMainnet} from './FundsMainnet.sol';
 import {FundsGovernance} from './FundsGovernance.sol';
 
-/// @dev Shared: load the genesis addresses DeployFundsMainnet wrote (and TWAP listing v2's, when
-///      DeployTwapListingV2 has run), and the handoff batch.
+/// @dev Shared: load the genesis addresses DeployFundsMainnet wrote (and TWAP listing v2's and the fee
+///      compounders', when DeployTwapListingV2 / DeployCompoundersMainnet have run), and the handoff batch.
 abstract contract FundsGovernanceBase is Script {
 	bytes32 internal constant SALT = keccak256('frostyfunds-genesis-handoff');
 	/// @dev What DeployTwapListingV2 writes; absent = v2 not deployed, the VI moves directly.
 	string internal constant TWAP_V2_FILE = 'deployments/base-mainnet-twap-v2.json';
+	/// @dev What DeployCompoundersMainnet writes; absent = not deployed.
+	string internal constant COMPOUNDERS_FILE = 'deployments/base-mainnet-compounders.json';
 
 	function _file() internal view returns (string memory) {
 		return vm.envOr('DEPLOYMENTS_FILE', string('deployments/base-mainnet.json'));
@@ -56,6 +61,26 @@ abstract contract FundsGovernanceBase is Script {
 		console2.log('  TwapExposurePolicyV2', v2.policy);
 	}
 
+	/// @dev The fee compounders from COMPOUNDERS_FILE when it exists; otherwise the zero struct
+	///      (FundsGovernance refuses that once the module's compounder listing is wired).
+	function _loadCompounders() internal view returns (FundsGovernance.Compounders memory c) {
+		if (!vm.exists(COMPOUNDERS_FILE)) {
+			console2.log('fee compounders: not found:', COMPOUNDERS_FILE);
+			return c;
+		}
+		string memory json = vm.readFile(COMPOUNDERS_FILE);
+		c.factory = CompounderFactory(vm.parseJsonAddress(json, '.compounderFactory'));
+		c.feed = vm.parseJsonAddress(json, '.feed');
+		c.slipstreamLp = SlipstreamLPPositionV2Factory(vm.parseJsonAddress(json, '.slipstreamLpFactory'));
+		c.slipstream2Lp = SlipstreamLPPositionV2Factory(vm.parseJsonAddress(json, '.slipstream2LpFactory'));
+		c.perpV3 = VerantaPerpPositionV3Factory(vm.parseJsonAddress(json, '.perpV3Factory'));
+		console2.log('fee compounders: found', COMPOUNDERS_FILE);
+		console2.log('  CompounderFactory', address(c.factory));
+		console2.log('  SlipstreamLPPositionV2Factory (type 4)', address(c.slipstreamLp));
+		console2.log('  SlipstreamLPPositionV2Factory (type 7)', address(c.slipstream2Lp));
+		console2.log('  VerantaPerpPositionV3Factory (type 6, ownerless)', address(c.perpV3));
+	}
+
 	function _timelock() internal view returns (TimelockController) {
 		return TimelockController(payable(vm.envAddress('TIMELOCK')));
 	}
@@ -65,28 +90,34 @@ abstract contract FundsGovernanceBase is Script {
 ///         begun. Then writes the Safe Transaction Builder batch that SCHEDULES the timelock's
 ///         acceptOwnership calls (import it in the Safe app, sign 2-of-3, execute).
 ///         Run AFTER DeployTwapListingV2 when v2 ships: with its file present the batch moves the
-///         PriceListingModule (owner of the VI) and TwapListingRegistryV2 instead of the VI.
+///         PriceListingModule (owner of the VI) and TwapListingRegistryV2 instead of the VI. Run AFTER
+///         DeployCompoundersMainnet too: its file adds the CompounderFactory and both
+///         SlipstreamLPPositionV2 factories.
 ///         Run: TIMELOCK=<governance timelock (DeployFundsTimelock)> forge script script/mainnet/TransferFundsGovernance.s.sol:StartFundsGovernance \
 ///              --rpc-url <base> --broadcast --private-key <deployer>
 contract StartFundsGovernance is FundsGovernanceBase {
 	function run() external {
 		(FundsMainnet.Deployed memory d, string memory json) = _load();
 		FundsGovernance.TwapV2 memory v2 = _loadV2();
+		FundsGovernance.Compounders memory c = _loadCompounders();
 		TimelockController timelock = _timelock();
 		address safe = vm.parseJsonAddress(json, '.safe');
 		require(timelock.hasRole(timelock.PROPOSER_ROLE(), safe), 'the Safe must be a proposer of this timelock');
 		require(timelock.hasRole(timelock.EXECUTOR_ROLE(), address(0)), 'timelock execution must be open');
 
 		vm.startBroadcast();
-		FundsGovernance.start(d, v2, address(timelock), msg.sender);
+		FundsGovernance.start(d, v2, c, address(timelock), msg.sender);
 		vm.stopBroadcast();
 
-		(address[] memory targets, uint256[] memory values, bytes[] memory payloads) = FundsGovernance.acceptBatch(d, v2);
+		(address[] memory targets, uint256[] memory values, bytes[] memory payloads) = FundsGovernance.acceptBatch(d, v2, c);
 		bytes memory schedule =
 			abi.encodeCall(TimelockController.scheduleBatch, (targets, values, payloads, bytes32(0), SALT, timelock.getMinDelay()));
 		string memory accepted = address(v2.module) != address(0)
 			? 'PriceListingModule (owns the ValueInterpreter), TwapListingRegistryV2'
 			: 'ValueInterpreter';
+		if (address(c.factory) != address(0)) {
+			accepted = string.concat(accepted, ', CompounderFactory, SlipstreamLPPositionV2Factory x2 (types 4, 7)');
+		}
 		string memory out = string.concat(
 			'{"version":"1.0","chainId":"', vm.toString(block.chainid),
 			'","meta":{"name":"FrostyFunds governance handoff - schedule acceptOwnership","description":"Timelock accepts ownership of ',
@@ -110,14 +141,16 @@ contract FinishFundsGovernance is FundsGovernanceBase {
 	function run() external {
 		(FundsMainnet.Deployed memory d, string memory json) = _load();
 		FundsGovernance.TwapV2 memory v2 = _loadV2();
+		FundsGovernance.Compounders memory c = _loadCompounders();
 		TimelockController timelock = _timelock();
-		(address[] memory targets, uint256[] memory values, bytes[] memory payloads) = FundsGovernance.acceptBatch(d, v2);
+		(address[] memory targets, uint256[] memory values, bytes[] memory payloads) = FundsGovernance.acceptBatch(d, v2, c);
 		vm.startBroadcast();
 		timelock.executeBatch(targets, values, payloads, bytes32(0), SALT);
 		vm.stopBroadcast();
 		FundsGovernance.verify(
 			d,
 			v2,
+			c,
 			address(timelock),
 			vm.parseJsonAddress(json, '.safe'),
 			vm.parseJsonAddress(json, '.deployer'),
@@ -135,6 +168,7 @@ contract VerifyFundsGovernance is FundsGovernanceBase {
 		FundsGovernance.verify(
 			d,
 			_loadV2(),
+			_loadCompounders(),
 			address(_timelock()),
 			vm.parseJsonAddress(json, '.safe'),
 			vm.parseJsonAddress(json, '.deployer'),
