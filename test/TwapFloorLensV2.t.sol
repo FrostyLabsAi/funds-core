@@ -4,35 +4,46 @@ pragma solidity 0.8.24;
 import {Test} from 'forge-std/Test.sol';
 import {TwapFloorLensV2} from '../src/pricing/TwapFloorLensV2.sol';
 import {TwapListingRegistryV2} from '../src/pricing/TwapListingRegistryV2.sol';
-import {IUniswapV3PoolFactory, ISlipstreamPoolFactory} from '../src/pricing/TwapListingRegistry.sol';
 import {IValueInterpreter} from '../src/interfaces/IValueInterpreter.sol';
-import {TwapListingRegistryV2Harness, FloorProbeAdapter} from './TwapListingRegistryV2.t.sol';
+import {TwapListingRegistryV2Harness, FloorProbeAdapter, TestVenues} from './TwapListingRegistryV2.t.sol';
 
-/// @dev FloorProbeAdapter plus the real adapter's `isBelowFloor()` (depth under the MIN_DEPTH_USD
-///      every registry adapter is built with), which is the read the lens makes.
+/// @dev FloorProbeAdapter plus the real adapters' two-part `isBelowFloor()` (Ruling 23: quote
+///      reserve under the MIN_QUOTE_RESERVE_USD every registry adapter is built with, or — read only
+///      when the reserve holds — band depth under its MIN_BAND_DEPTH_USD), which is the read the lens
+///      makes.
 contract FloorProbeAdapterWithFloor is FloorProbeAdapter {
-	/// @dev = TwapListingRegistryV2.MIN_DEPTH_USD (asserted in the tests)
-	uint256 public constant MIN_LIQUIDITY_USD = 50_000;
+	/// @dev = TwapListingRegistryV2.MIN_QUOTE_RESERVE_USD (asserted in the tests)
+	uint256 public constant MIN_LIQUIDITY_USD = 25_000;
+	/// @dev = TwapListingRegistryV2.MIN_BAND_DEPTH_USD (asserted in the tests)
+	uint256 public constant MIN_BAND_DEPTH_USD = 1_282;
 
 	function isBelowFloor() external view returns (bool) {
-		return this.poolDepthUsd() < MIN_LIQUIDITY_USD * 1e18;
+		return this.quoteReserveUsd() < MIN_LIQUIDITY_USD * 1e18 || this.poolDepthUsd() < MIN_BAND_DEPTH_USD * 1e18;
 	}
 }
 
 /// @notice The lens must page the registry without ever reverting or overflowing, and name exactly
 ///         the assets in the page whose `pokeFloor` would change the stored 72-hour clock.
 contract TwapFloorLensV2Test is Test {
-	uint256 internal constant UNDER = 20_000e18; // quote-side depth under the $50k floor
+	uint256 internal constant UNDER = 20_000e18; // quote reserve under the $25k floor
 	uint256 internal constant OVER = 80_000e18;
+	uint256 internal constant BAND_OVER = 4_000e18; // band over the $1,282 band floor
+	uint256 internal constant BAND_UNDER = 1_281e18;
+
+	function _venues() internal returns (TwapListingRegistryV2.Venues memory) {
+		return TestVenues.build(
+			IValueInterpreter(makeAddr('vi')),
+			makeAddr('uni'),
+			makeAddr('s1'),
+			makeAddr('s2'),
+			makeAddr('s3'),
+			makeAddr('uniV2'),
+			makeAddr('aero')
+		);
+	}
 
 	function test_pagination() public {
-		TwapListingRegistryV2 r = new TwapListingRegistryV2(
-			IValueInterpreter(makeAddr('vi')),
-			IUniswapV3PoolFactory(makeAddr('uni')),
-			ISlipstreamPoolFactory(makeAddr('s1')),
-			ISlipstreamPoolFactory(makeAddr('s2')),
-			ISlipstreamPoolFactory(makeAddr('s3'))
-		);
+		TwapListingRegistryV2 r = new TwapListingRegistryV2(_venues());
 		TwapFloorLensV2 lens = new TwapFloorLensV2();
 		(address[] memory due, uint256 next) = lens.assetsNeedingPoke(r, 0, 50);
 		assertEq(due.length, 0);
@@ -45,23 +56,19 @@ contract TwapFloorLensV2Test is Test {
 	// ─── real entries (registry harness + probe adapters) ───────────────────────
 
 	function _harness() internal returns (TwapListingRegistryV2Harness h) {
-		h = new TwapListingRegistryV2Harness(
-			IValueInterpreter(makeAddr('vi')),
-			IUniswapV3PoolFactory(makeAddr('uni')),
-			ISlipstreamPoolFactory(makeAddr('s1')),
-			ISlipstreamPoolFactory(makeAddr('s2')),
-			ISlipstreamPoolFactory(makeAddr('s3'))
-		);
+		h = new TwapListingRegistryV2Harness(_venues());
 	}
 
-	/// @dev List `name` on a fresh probe reading `depth`, appended to the listed-asset array.
-	function _list(TwapListingRegistryV2Harness h, string memory name, uint256 depth)
+	/// @dev List `name` on a fresh probe reading `reserve` (and a band over the band floor),
+	///      appended to the listed-asset array.
+	function _list(TwapListingRegistryV2Harness h, string memory name, uint256 reserve)
 		internal
 		returns (address asset, FloorProbeAdapterWithFloor probe)
 	{
 		asset = makeAddr(name);
 		probe = new FloorProbeAdapterWithFloor();
-		probe.setDepth(depth);
+		probe.setReserve(reserve);
+		probe.setDepth(BAND_OVER);
 		h.listOnProbe(asset, address(probe));
 		h.pushListed(asset);
 	}
@@ -77,8 +84,9 @@ contract TwapFloorLensV2Test is Test {
 		vm.prank(stranger);
 		assertTrue(h.pokeFloor(restore), 'clock started while under');
 		skip(1 hours);
-		restoreProbe.setDepth(OVER); // recovered with the clock running: a keeper poke would clear it
-		assertEq(restoreProbe.MIN_LIQUIDITY_USD(), h.MIN_DEPTH_USD(), 'probe floor = registry floor');
+		restoreProbe.setReserve(OVER); // recovered with the clock running: a keeper poke would clear it
+		assertEq(restoreProbe.MIN_LIQUIDITY_USD(), h.MIN_QUOTE_RESERVE_USD(), 'probe floor = registry floor');
+		assertEq(restoreProbe.MIN_BAND_DEPTH_USD(), h.MIN_BAND_DEPTH_USD(), 'probe band floor = registry band floor');
 		assertEq(h.listedCount(), 3);
 
 		(address[] memory due, uint256 next) = lens.assetsNeedingPoke(h, 0, 2);
@@ -128,6 +136,36 @@ contract TwapFloorLensV2Test is Test {
 		(due, next) = lens.assetsNeedingPoke(h, 0, type(uint256).max);
 		assertEq(due.length, 0);
 		assertEq(next, 3);
+	}
+
+	/// Ruling 23 through the lens: a pool holding the reserve floor with its band under the band
+	/// floor is due (a poke would start its clock); once the clock runs it isn't; once the band is
+	/// back it is due again (a keeper poke would clear it) — and the registry agrees each time
+	function test_thinBandIsDue() public {
+		TwapListingRegistryV2Harness h = _harness();
+		TwapFloorLensV2 lens = new TwapFloorLensV2();
+		(address thin, FloorProbeAdapterWithFloor probe) = _list(h, 'thin', OVER);
+		_list(h, 'steady', OVER);
+		probe.setDepth(BAND_UNDER);
+
+		(address[] memory due,) = lens.assetsNeedingPoke(h, 0, 50);
+		assertEq(due.length, 1, 'reserve over, band under: due');
+		assertEq(due[0], thin);
+		vm.prank(makeAddr('stranger'));
+		assertTrue(h.pokeFloor(thin), 'the registry agrees: under');
+		(due,) = lens.assetsNeedingPoke(h, 0, 50);
+		assertEq(due.length, 0, 'clock running');
+
+		probe.setDepth(BAND_OVER);
+		(due,) = lens.assetsNeedingPoke(h, 0, 50);
+		assertEq(due.length, 1, 'band back: a keeper poke would clear it');
+		assertEq(due[0], thin);
+		address keeper = makeAddr('keeper');
+		h.setLister(keeper, true);
+		vm.prank(keeper);
+		assertFalse(h.pokeFloor(thin));
+		(due,) = lens.assetsNeedingPoke(h, 0, 50);
+		assertEq(due.length, 0);
 	}
 
 	/// the registry's rule: an adapter that can't answer counts as under the floor, and never

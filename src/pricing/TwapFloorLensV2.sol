@@ -2,7 +2,7 @@
 pragma solidity 0.8.24;
 
 import {TwapListingRegistryV2} from './TwapListingRegistryV2.sol';
-import {TwapAggregatorAdapterV2} from './TwapAggregatorAdapterV2.sol';
+import {ITwapPriceAdapter} from '../interfaces/ITwapPriceAdapter.sol';
 
 /// @title TwapFloorLensV2
 /// @notice Paged version of TwapFloorLens for a registry with hundreds of listings: which assets
@@ -12,6 +12,8 @@ import {TwapAggregatorAdapterV2} from './TwapAggregatorAdapterV2.sol';
 /// @dev Same rule as v1 (an adapter that cannot answer counts as under the floor), per page, so
 ///      one eth_call stays within RPC gas caps.
 /// @dev Matches the registry's floor test, except an out-of-gas read counts as due here (harmless in an eth_call).
+/// @dev The floor is two-part (Ruling 23): `isBelowFloor()` walks a concentrated pool's band whenever its
+///      reserve holds, so a page costs up to one band walk per concentrated listing — size pages by gas.
 contract TwapFloorLensV2 {
 	/// @notice Listed assets in [offset, offset+limit) whose pool state disagrees with the stored
 	///         72-hour clock, in listing order.
@@ -29,7 +31,7 @@ contract TwapFloorLensV2 {
 		due = new address[](assets.length);
 		uint256 count;
 		for (uint256 i; i < assets.length; ++i) {
-			(TwapAggregatorAdapterV2 adapter,,,, uint64 belowFloorSince) = registry.listings(assets[i]);
+			(ITwapPriceAdapter adapter,,,, uint64 belowFloorSince) = registry.listings(assets[i]);
 			bool below;
 			try adapter.isBelowFloor() returns (bool b) {
 				below = b;

@@ -13,8 +13,10 @@ import {AggregatorV3Interface} from '../src/interfaces/AggregatorV3Interface.sol
 import {IUniswapV3SwapRouter} from '../src/interfaces/external/IUniswapV3SwapRouter.sol';
 import {UniswapV3SwapAdapter} from '../src/adapters/UniswapV3SwapAdapter.sol';
 import {TwapListingRegistryV2} from '../src/pricing/TwapListingRegistryV2.sol';
-import {IUniswapV3PoolFactory, ISlipstreamPoolFactory} from '../src/pricing/TwapListingRegistry.sol';
 import {TwapAggregatorAdapterV2} from '../src/pricing/TwapAggregatorAdapterV2.sol';
+import {ITwapPriceAdapter} from '../src/interfaces/ITwapPriceAdapter.sol';
+import {TickMath} from '../src/libraries/TickMath.sol';
+import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
 import {TwapExposurePolicyV2} from '../src/policies/TwapExposurePolicyV2.sol';
 import {MockERC20, MockAggregator, MockSwapRouter, MockUniV3PositionManager} from './utils/Mocks.sol';
 import {LimitOrderPosition, LimitOrderPositionFactory} from '../src/positions/LimitOrderPosition.sol';
@@ -22,18 +24,22 @@ import {UniswapV3LPPositionFactory} from '../src/positions/UniswapV3LPPosition.s
 import {IUniswapV3NonfungiblePositionManager} from '../src/interfaces/external/IUniswapV3NonfungiblePositionManager.sol';
 import {ScriptedPool} from './TwapAggregatorAdapter.t.sol';
 import {ScriptedFactory} from './TwapListingRegistry.t.sol';
+import {TestVenues} from './TwapListingRegistryV2.t.sol';
 
 /// @notice The exposure limits on a real fund: MEME ($2,500, TWAP-listed) bought and sold
 ///         through the Uniswap adapter. V2 depth is the QUOTE side only (USDC within −10% of the
 ///         price; MEME is token0) and linear in liquidity: L = 1e18 → $2,566,602, closed form
 ///         L·(√P − √(0.9·P)) — v1's two-sided $4,893,076 is 1.906× that. v1's liquidities are
-///         scaled ×1.9 so every scenario keeps v1's dollar depths: L = 7.6e16 → $195,062 and
-///         L = 1.9e16 → $48,765 (under the $50k floor).
+///         scaled ×1.9 so every scenario keeps v1's dollar depths: L = 7.6e16 → $195,062.
+///         The floor is the QUOTE RESERVE (the pool's USDC balance, $25k). The scripted pool's
+///         liquidity is flat from spot down to zero, so `_setPool` gives it exactly the USDC that
+///         liquidity holds, L·√P (≈ 19.5× the band): $95.0M at L_DEEP, $3.80M at L_SMALL. "Under
+///         the floor" (v1: $48.8k of depth under $50k) is L = 4.75e14: $23,750 of USDC, a $1,219 band.
 contract TwapExposurePolicyV2Test is Test {
 	int24 internal constant TICK_2500 = -198_080;
 	uint128 internal constant L_DEEP = 1.9e18; // $4.88M depth → 50% cap
 	uint128 internal constant L_SMALL = 7.6e16; // $195.1k depth → 10% cap ($19.5k)
-	uint128 internal constant L_UNDER = 1.9e16; // $48.8k depth → under the floor
+	uint128 internal constant L_UNDER = 4.75e14; // $23.75k of USDC held → under the $25k reserve floor
 
 	ValueInterpreter internal vi;
 	MockERC20 internal meme;
@@ -64,12 +70,22 @@ contract TwapExposurePolicyV2Test is Test {
 
 		ScriptedFactory uni = new ScriptedFactory();
 		pool = new ScriptedPool(address(meme), address(usdc));
-		pool.set(TICK_2500, TICK_2500, L_DEEP);
+		_setPool(L_DEEP);
 		uni.setUni(address(meme), address(usdc), 3000, address(pool));
-		registry = new TwapListingRegistryV2(IValueInterpreter(address(vi)), IUniswapV3PoolFactory(address(uni)), ISlipstreamPoolFactory(address(new ScriptedFactory())), ISlipstreamPoolFactory(address(new ScriptedFactory())), ISlipstreamPoolFactory(address(new ScriptedFactory())));
+		registry = new TwapListingRegistryV2(
+			TestVenues.build(
+				IValueInterpreter(address(vi)),
+				address(uni),
+				address(new ScriptedFactory()),
+				address(new ScriptedFactory()),
+				address(new ScriptedFactory()),
+				makeAddr('uniV2'),
+				makeAddr('aero')
+			)
+		);
 		registry.setQuote(address(usdc), AggregatorV3Interface(address(usdcFeed)), 2 days);
 		registry.setLister(address(this), true); // v2 listers are explicit (the module in production)
-		TwapAggregatorAdapterV2 adapter = registry.list(address(meme), address(usdc), TwapListingRegistryV2.Venue.UniswapV3, 3000);
+		ITwapPriceAdapter adapter = registry.list(address(meme), address(usdc), TwapListingRegistryV2.Venue.UniswapV3, 3000);
 		vi.addPrimitive(address(meme), address(adapter), 1 hours); // the VI owner's step
 		policy = new TwapExposurePolicyV2(registry);
 
@@ -82,6 +98,13 @@ contract TwapExposurePolicyV2Test is Test {
 	}
 
 	// ─── helpers ────────────────────────────────────────────────────────────────
+
+	/// @dev Script the pool's liquidity at $2,500 and give it the USDC that flat liquidity holds
+	///      from spot down to zero: L·√P (USDC is token1).
+	function _setPool(uint128 liquidity) internal {
+		pool.set(TICK_2500, TICK_2500, liquidity);
+		deal(address(usdc), address(pool), Math.mulDiv(liquidity, TickMath.getSqrtRatioAtTick(TICK_2500), 1 << 96));
+	}
 
 	function _fund(bool degen) internal returns (Comptroller c) {
 		FundFactory.PolicyReg[] memory regs = new FundFactory.PolicyReg[](4);
@@ -164,7 +187,7 @@ contract TwapExposurePolicyV2Test is Test {
 
 	function test_smallPool_capsAtTenPercentOfDepth() public {
 		Comptroller c = _fund(false);
-		pool.set(TICK_2500, TICK_2500, L_SMALL); // $195.1k depth → $19.51k cap
+		_setPool(L_SMALL); // $195.1k depth → $19.51k cap
 		_buyMemeExpectingRevert(c, 20_000e6, abi.encodePacked(TwapExposurePolicyV2.PoolShareExceeded.selector));
 		_buyMeme(c, 19_000e6);
 	}
@@ -176,7 +199,7 @@ contract TwapExposurePolicyV2Test is Test {
 		usdc.mint(bob, 9_900_000e6);
 		_deposit(c, bob, 9_900_000e6);
 		_buyMeme(c, 1_900_000e6);
-		pool.set(TICK_2500, TICK_2500, 1.33e18); // depth $3.41M → cap $1.71M, holding $1.9M
+		_setPool(1.33e18); // depth $3.41M → cap $1.71M, holding $1.9M
 		_buyMemeExpectingRevert(c, 10_000e6, abi.encodePacked(TwapExposurePolicyV2.PoolShareExceeded.selector));
 	}
 
@@ -185,7 +208,7 @@ contract TwapExposurePolicyV2Test is Test {
 	function test_sellingIsNeverBlocked_evenOverACap() public {
 		Comptroller c = _fund(false);
 		_buyMeme(c, 15_000e6);
-		pool.set(TICK_2500, TICK_2500, 1.9e15); // depth $4.9k → cap $488, holding $15k
+		_setPool(1.9e15); // depth $4.9k → cap $488, holding $15k
 		_sellMeme(c, 3e18); // partial exit, still way over the cap — allowed
 		_sellMeme(c, 3e18);
 		assertEq(_memeHeld(c), 0);
@@ -197,7 +220,7 @@ contract TwapExposurePolicyV2Test is Test {
 		Comptroller c = _fund(false);
 		_buyMeme(c, 15_000e6);
 
-		pool.set(TICK_2500, TICK_2500, L_UNDER);
+		_setPool(L_UNDER);
 		registry.pokeFloor(address(meme));
 		skip(72 hours);
 		_keepQuoteFresh();
@@ -228,7 +251,7 @@ contract TwapExposurePolicyV2Test is Test {
 	function test_delisted_before72h_nothingPauses() public {
 		Comptroller c = _fund(false);
 		_buyMeme(c, 15_000e6);
-		pool.set(TICK_2500, TICK_2500, L_UNDER);
+		_setPool(L_UNDER);
 		registry.pokeFloor(address(meme));
 		skip(71 hours);
 		_keepQuoteFresh();
@@ -237,7 +260,7 @@ contract TwapExposurePolicyV2Test is Test {
 
 	function test_delisted_fundsNotHoldingItAreUnaffected() public {
 		Comptroller c = _fund(false);
-		pool.set(TICK_2500, TICK_2500, L_UNDER);
+		_setPool(L_UNDER);
 		registry.pokeFloor(address(meme));
 		skip(72 hours);
 		_keepQuoteFresh();
@@ -248,7 +271,7 @@ contract TwapExposurePolicyV2Test is Test {
 
 	function test_degenFund_skipsTheCaps() public {
 		Comptroller c = _fund(true);
-		pool.set(TICK_2500, TICK_2500, L_SMALL); // $19.51k pool cap for a standard fund
+		_setPool(L_SMALL); // $19.51k pool cap for a standard fund
 		_buyMeme(c, 60_000e6); // 60% of GAV, 3× the pool cap
 		assertEq(_memeHeld(c), 24e18);
 	}
@@ -256,7 +279,7 @@ contract TwapExposurePolicyV2Test is Test {
 	function test_degenFund_stillGetsTheDepositPause() public {
 		Comptroller c = _fund(true);
 		_buyMeme(c, 60_000e6);
-		pool.set(TICK_2500, TICK_2500, L_UNDER);
+		_setPool(L_UNDER);
 		registry.pokeFloor(address(meme));
 		skip(72 hours);
 		_keepQuoteFresh();
@@ -404,11 +427,11 @@ contract TwapExposurePolicyV2Test is Test {
 	function test_capUsesLowerOfLiveAndRecorded() public {
 		Comptroller c = _fund(false);
 		// the keeper (a lister) last sampled a small pool: $195.1k recorded
-		pool.set(TICK_2500, TICK_2500, L_SMALL);
+		_setPool(L_SMALL);
 		registry.pokeFloor(address(meme));
 		uint256 recorded = registry.recordedDepthUsd18(address(meme));
 		// then liquidity is added the way a same-transaction mint would: live depth $4.88M
-		pool.set(TICK_2500, TICK_2500, L_DEEP);
+		_setPool(L_DEEP);
 		uint256 live = TwapAggregatorAdapterV2(registry.adapterOf(address(meme))).poolDepthUsd();
 		assertGt(live, 20 * recorded, 'live depth now far above the recorded one');
 

@@ -16,9 +16,11 @@ import {TwapListingV2} from './TwapListingV2.sol';
 ///         `createReconfigurationRequest` moves such a fund to v2, once the factory owner approves
 ///         `setPolicyReplacement(v1, v2)`.
 ///         Reads deployments/base-mainnet.json (valueInterpreter, factory, twapPolicy, deployer).
-///         Writes deployments/base-mainnet-twap-v2.json: registry, module, policy, lens,
-///         slipstream3Adapter, keeper (zero when unset), and startBlock (a lower bound of the deploy
-///         block). Plans B (keeper) and C (terminal) read it.
+///         Writes deployments/base-mainnet-twap-v2.json: registry, module, policy, lens, the swap
+///         adapters (slipstream3Adapter, uniswapV2Adapter, aerodromeBasicAdapter — all registered on
+///         the factory), the registry's recorder (Uniswap v2 observation recorder) and adapter
+///         deployers (clDeployer, v2Deployer, aeroDeployer), keeper (zero when unset), and
+///         startBlock (a lower bound of the deploy block). Plans B (keeper) and C (terminal) read it.
 ///         Run: forge script script/mainnet/DeployTwapListingV2.s.sol --rpc-url <base> --account <keystore> \
 ///              --sender <deployer> --broadcast --slow [--verify]
 ///         Env: [TWAP_KEEPER] (the auto-lister's wallet; unset = add it later with module.setKeeper),
@@ -59,6 +61,12 @@ contract DeployTwapListingV2 is Script {
 		vm.serializeAddress(k, 'policy', address(d.policy));
 		vm.serializeAddress(k, 'lens', address(d.lens));
 		vm.serializeAddress(k, 'slipstream3Adapter', d.slipstream3Adapter);
+		vm.serializeAddress(k, 'uniswapV2Adapter', d.uniswapV2Adapter);
+		vm.serializeAddress(k, 'aerodromeBasicAdapter', d.aerodromeBasicAdapter);
+		vm.serializeAddress(k, 'recorder', address(d.recorder));
+		vm.serializeAddress(k, 'clDeployer', address(d.clDeployer));
+		vm.serializeAddress(k, 'v2Deployer', address(d.v2Deployer));
+		vm.serializeAddress(k, 'aeroDeployer', address(d.aeroDeployer));
 		vm.serializeAddress(k, 'keeper', cfg.keeper);
 		string memory out = vm.serializeUint(k, 'startBlock', startBlock);
 		vm.writeJson(out, file);
@@ -69,6 +77,12 @@ contract DeployTwapListingV2 is Script {
 		console2.log('TwapExposurePolicyV2', address(d.policy));
 		console2.log('TwapFloorLensV2', address(d.lens));
 		console2.log('slipstream3Adapter', d.slipstream3Adapter);
+		console2.log('uniswapV2Adapter', d.uniswapV2Adapter);
+		console2.log('aerodromeBasicAdapter', d.aerodromeBasicAdapter);
+		console2.log('UniswapV2ObservationRecorder', address(d.recorder));
+		console2.log('clDeployer', address(d.clDeployer));
+		console2.log('v2Deployer', address(d.v2Deployer));
+		console2.log('aeroDeployer', address(d.aeroDeployer));
 		console2.log('startBlock', startBlock);
 	}
 }

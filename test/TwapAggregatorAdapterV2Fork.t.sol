@@ -9,8 +9,10 @@ import {SafeCast} from '@openzeppelin/contracts/utils/math/SafeCast.sol';
 import {TwapAggregatorAdapterV2} from '../src/pricing/TwapAggregatorAdapterV2.sol';
 import {TwapAggregatorAdapter, IConcentratedPoolOracle} from '../src/pricing/TwapAggregatorAdapter.sol';
 import {AggregatorV3Interface} from '../src/interfaces/AggregatorV3Interface.sol';
+import {ITwapPriceAdapter} from '../src/interfaces/ITwapPriceAdapter.sol';
 import {IUniswapV3NonfungiblePositionManager} from
 	'../src/interfaces/external/IUniswapV3NonfungiblePositionManager.sol';
+import {TickMath} from '../src/libraries/TickMath.sol';
 
 /// @notice The Uniswap v3 pool reads the test needs beyond the adapter's oracle surface.
 interface IUniswapV3PoolState {
@@ -21,7 +23,10 @@ interface IUniswapV3PoolState {
 /// @notice Quote-side depth on real Base pools: a two-sided pool keeps a real depth; LUMIA's
 ///         one-sided pool (0.98 WETH vs 150M LUMIA) collapses to its ~$2.6k of WETH. A quote-only
 ///         position minted through the real NonfungiblePositionManager moves the depth by exactly
-///         its USD value in both orientations (asset = token1 and asset = token0).
+///         its USD value in both orientations (asset = token1 and asset = token0). The floor is
+///         two-part (Ruling 23): the quote RESERVE (USDC/WETH the pool holds × Chainlink) — LUMIA's
+///         ~$2.6k stays under the $25k listing floor, VIRTUAL's pool clears it — AND the band (CHECK's
+///         pool holds ~$300k of USDC but ~$500 of it within −10%: under the $1,282 band floor).
 ///         Run: BASE_MAINNET_RPC=<url> [BASE_FORK_BLOCK=<n>] forge test --match-path test/TwapAggregatorAdapterV2Fork.t.sol -vv
 contract TwapAggregatorAdapterV2ForkTest is Test {
 	address internal constant WETH = 0x4200000000000000000000000000000000000006;
@@ -40,6 +45,25 @@ contract TwapAggregatorAdapterV2ForkTest is Test {
 	// the 2007-tick band holds at most 34 initialized ticks, so the error is < 40 wei; 100 wei is
 	// $0.0001 of USDC and ~$3e-13 of WETH.
 	uint256 internal constant ROUNDING_WEI = 100;
+	/// @dev The registry's listing / delist-clock floor (MIN_QUOTE_RESERVE_USD), whole USD.
+	uint256 internal constant MIN_QUOTE_RESERVE_USD = 25_000;
+	// Real USDC pools pricing a token below $0.0001 (cast over DefiLlama Base USDC pools, 2026-09-30;
+	// each = UniV3 factory 0x3312…FDfD getPool(asset, USDC, fee), HTEA = Slipstream CL2 factory
+	// 0xf8f2…61Ef getPool(asset, USDC, 200)); none is VI-priced
+	address internal constant GILD = 0xA6C3b8Dcb7C31132Dcef64eF099f68B731db1e73;
+	address internal constant GILD_POOL = 0x85DF35277A271F8217380735D8cDa2F604907589; // 0.3%, USDC token0
+	address internal constant BONSAI = 0xA0aeBd4Ae5F256B72B7D43f67eD934237Adb1AeE;
+	address internal constant BONSAI_POOL = 0x4fe87203b27a105a772f195D3F30dea714d1ECf0; // 1%, USDC token0
+	address internal constant X8004 = 0x8004c039F2c7AC2Df4C54836de452161fF248004;
+	address internal constant X8004_POOL = 0xDC1BA8D332BFd3D954Ca472eD9e1634c5c9d39F5; // 1%, USDC token1
+	address internal constant HTEA = 0xa1A0B2E02B0E6830aD5A4A7211691200945d8919;
+	address internal constant HTEA_POOL = 0xAbe1f289107C20081F591BB3972b8289aDd64f6C; // CL200, USDC token0
+	// Slipstream-2 getPool(CHECK, USDC, 100), USDC token0 (2026-09-30 scan, cast at block 52014634):
+	// 300,558 USDC held, $512 of it within −10% of the price (this adapter, block 52014634)
+	address internal constant CHECK = 0x9126236476eFBA9Ad8aB77855c60eB5BF37586Eb;
+	address internal constant CHECK_POOL = 0x3c4384F3664B37A3Cb5A5cB3452B4B4A3Aa1256f;
+	/// @dev floor((1 − √0.9) · 1e6): the band floor is minLiquidityUsd × this / 1e6 (Ruling 23)
+	uint256 internal constant BAND_QUOTE_PPM = 51_316;
 
 	bool internal forked;
 
@@ -60,9 +84,19 @@ contract TwapAggregatorAdapterV2ForkTest is Test {
 		v2 = new TwapAggregatorAdapterV2(IConcentratedPoolOracle(pool), asset, AggregatorV3Interface(feed), 30 minutes, 50_000, 500, hb, 'v2');
 	}
 
+	function _v2(address pool, address asset, address feed, uint32 hb, uint256 minLiquidityUsd)
+		internal
+		returns (TwapAggregatorAdapterV2)
+	{
+		return new TwapAggregatorAdapterV2(
+			IConcentratedPoolOracle(pool), asset, AggregatorV3Interface(feed), 30 minutes, minLiquidityUsd, 500, hb, 'v2'
+		);
+	}
+
 	function test_fork_oneSidedPoolIsShallow() public {
 		vm.skip(!forked);
 		(TwapAggregatorAdapter v1, TwapAggregatorAdapterV2 v2) = _pair(LUMIA_POOL, LUMIA, ETH_USD, 3600);
+		_assertMatchesOldFormula(v1, v2, ETH_USD);
 		assertGt(v1.poolDepthUsd(), 1_000_000e18, 'v1 counts the self-priced asset side');
 		assertLt(v2.poolDepthUsd(), 10_000e18, 'v2 counts only the WETH side');
 		assertGt(v2.poolDepthUsd(), 1_000e18, 'the real WETH side still counts');
@@ -71,33 +105,246 @@ contract TwapAggregatorAdapterV2ForkTest is Test {
 
 	function test_fork_twoSidedPoolKeepsDepth() public {
 		vm.skip(!forked);
-		(, TwapAggregatorAdapterV2 v2) = _pair(VIRTUAL_POOL, VIRTUAL, USDC_USD, 90_000);
+		(TwapAggregatorAdapter v1, TwapAggregatorAdapterV2 v2) = _pair(VIRTUAL_POOL, VIRTUAL, USDC_USD, 90_000);
 		assertGt(v2.poolDepthUsd(), 50_000e18, 'real USDC bids within 10%');
 		assertFalse(v2.isBelowFloor());
 		(, int256 answer,,,) = v2.latestRoundData();
 		assertGt(answer, 0);
+		_assertMatchesOldFormula(v1, v2, USDC_USD);
 	}
 
 	function test_fork_quoteSideNeverExceedsTwoSided() public {
 		vm.skip(!forked);
 		(TwapAggregatorAdapter v1, TwapAggregatorAdapterV2 v2) = _pair(VIRTUAL_POOL, VIRTUAL, USDC_USD, 90_000);
 		assertLt(v2.poolDepthUsd(), v1.poolDepthUsd(), 'the VIRTUAL side is not counted');
+		_assertMatchesOldFormula(v1, v2, USDC_USD);
 	}
 
 	/// @notice asset = token1 (LUMIA; WETH is token0): a WETH-only position above spot.
 	function test_fork_quotePositionMovesDepth_assetToken1() public {
 		vm.skip(!forked);
-		(, TwapAggregatorAdapterV2 v2) = _pair(LUMIA_POOL, LUMIA, ETH_USD, 3600);
+		(TwapAggregatorAdapter v1, TwapAggregatorAdapterV2 v2) = _pair(LUMIA_POOL, LUMIA, ETH_USD, 3600);
 		assertFalse(v2.assetIsToken0());
+		_assertMatchesOldFormula(v1, v2, ETH_USD);
 		_assertDepthTracksQuotePosition(v2, ETH_USD, 1 ether);
 	}
 
 	/// @notice asset = token0 (VIRTUAL; USDC is token1): a USDC-only position below spot.
 	function test_fork_quotePositionMovesDepth_assetToken0() public {
 		vm.skip(!forked);
-		(, TwapAggregatorAdapterV2 v2) = _pair(VIRTUAL_POOL, VIRTUAL, USDC_USD, 90_000);
+		(TwapAggregatorAdapter v1, TwapAggregatorAdapterV2 v2) = _pair(VIRTUAL_POOL, VIRTUAL, USDC_USD, 90_000);
 		assertTrue(v2.assetIsToken0());
+		_assertMatchesOldFormula(v1, v2, USDC_USD);
 		_assertDepthTracksQuotePosition(v2, USDC_USD, 10_000e6);
+	}
+
+	// ─── quote reserve floor ─────────────────────────────────────────────────────
+
+	/// @notice VIRTUAL/USDC 0.3%: the reserve is the pool's USDC balance × the USDC feed, to the
+	///         wei, read through ITwapPriceAdapter; it clears the $25k floor.
+	function test_fork_quoteReserveIsQuoteBalanceTimesFeed() public {
+		vm.skip(!forked);
+		ITwapPriceAdapter a = _v2(VIRTUAL_POOL, VIRTUAL, USDC_USD, 90_000, MIN_QUOTE_RESERVE_USD);
+		assertEq(a.quoteAsset(), USDC);
+		uint256 expected = Math.mulDiv(IERC20(USDC).balanceOf(VIRTUAL_POOL), _quoteUsd18(USDC_USD), 1e6);
+		uint256 reserve = a.quoteReserveUsd();
+		emit log_named_decimal_uint('VIRTUAL pool USDC reserve (USD)', reserve, 18);
+		emit log_named_decimal_uint('VIRTUAL pool band depth (USD)  ', a.poolDepthUsd(), 18);
+		assertEq(reserve, expected, 'USDC.balanceOf(pool) x the feed, exactly');
+		assertGe(reserve, MIN_QUOTE_RESERVE_USD * 1e18);
+		assertFalse(a.isBelowFloor());
+	}
+
+	/// @notice LUMIA's one-sided pool holds ~$2.6k of real WETH: under the $25k floor.
+	function test_fork_oneSidedPoolReserveUnderFloor() public {
+		vm.skip(!forked);
+		TwapAggregatorAdapterV2 v2 = _v2(LUMIA_POOL, LUMIA, ETH_USD, 3600, MIN_QUOTE_RESERVE_USD);
+		assertEq(v2.quoteAsset(), WETH);
+		uint256 reserve = v2.quoteReserveUsd();
+		emit log_named_decimal_uint('LUMIA pool WETH reserve (USD)  ', reserve, 18);
+		emit log_named_decimal_uint('LUMIA pool band depth (USD)    ', v2.poolDepthUsd(), 18);
+		assertEq(reserve, Math.mulDiv(IERC20(WETH).balanceOf(LUMIA_POOL), _quoteUsd18(ETH_USD), 1e18));
+		assertLt(reserve, MIN_QUOTE_RESERVE_USD * 1e18, 'under the floor');
+		assertGt(reserve, 1_000e18, 'the real WETH still counts');
+		assertTrue(v2.isBelowFloor());
+	}
+
+	/// @notice isBelowFloor()'s reserve part is exactly quoteReserveUsd() < minLiquidityUsd·1e18: a
+	///         floor at the reserve's whole dollars reads over, one dollar more reads under. VIRTUAL's
+	///         band depth sits under that floor's NUMBER, but over its band floor (5.13% of it), so a
+	///         band-depth floor at the reserve's number would read under at both.
+	function test_fork_isBelowFloorIsTheReserveFloor() public {
+		vm.skip(!forked);
+		uint256 whole = _v2(VIRTUAL_POOL, VIRTUAL, USDC_USD, 90_000, 1).quoteReserveUsd() / 1e18;
+		TwapAggregatorAdapterV2 atReserve = _v2(VIRTUAL_POOL, VIRTUAL, USDC_USD, 90_000, whole);
+		TwapAggregatorAdapterV2 overReserve = _v2(VIRTUAL_POOL, VIRTUAL, USDC_USD, 90_000, whole + 1);
+		assertLt(atReserve.poolDepthUsd(), whole * 1e18, 'the band reads under this floor');
+		assertGe(atReserve.poolDepthUsd(), atReserve.minBandDepthUsd() * 1e18, 'and over its band floor');
+		assertFalse(atReserve.isBelowFloor(), 'reserve >= floor');
+		assertTrue(overReserve.isBelowFloor(), 'reserve < floor + $1');
+		_assertTwoPartFloor(atReserve);
+		_assertTwoPartFloor(overReserve);
+
+		// LUMIA, on the registry's floor
+		TwapAggregatorAdapterV2 lumia = _v2(LUMIA_POOL, LUMIA, ETH_USD, 3600, MIN_QUOTE_RESERVE_USD);
+		_assertTwoPartFloor(lumia);
+		assertTrue(lumia.isBelowFloor());
+	}
+
+	/// @dev isBelowFloor() = reserve < minLiquidityUsd·1e18 || band < minBandDepthUsd·1e18, with the
+	///      band floor derived from the reserve floor (1,282 for 25,000).
+	function _assertTwoPartFloor(TwapAggregatorAdapterV2 a) internal view {
+		assertEq(a.minBandDepthUsd(), a.minLiquidityUsd() * BAND_QUOTE_PPM / 1e6, 'band floor = reserve floor x PPM');
+		assertEq(
+			a.isBelowFloor(),
+			a.quoteReserveUsd() < a.minLiquidityUsd() * 1e18 || a.poolDepthUsd() < a.minBandDepthUsd() * 1e18
+		);
+	}
+
+	/// @notice Ruling 23: isBelowFloor() is two-part — the quote reserve under minLiquidityUsd OR the
+	///         band under minLiquidityUsd × BAND_QUOTE_PPM / 1e6 (what a full-range pool holding the
+	///         reserve floor has within −10%). CHECK's pool holds ~$300k of USDC but ~$512 within
+	///         −10%: under the registry's $25k floor (band floor $1,282) it reads under. The band floor
+	///         follows minLiquidityUsd exactly: at the largest floor whose band floor is still ≤ the
+	///         band it reads over, one band-floor dollar more and it reads under — far below the
+	///         reserve both times.
+	function test_fork_isBelowFloorNeedsTheBand() public {
+		vm.skip(!forked);
+		TwapAggregatorAdapterV2 a = _v2(CHECK_POOL, CHECK, USDC_USD, 90_000, MIN_QUOTE_RESERVE_USD);
+		assertFalse(a.assetIsToken0());
+		uint256 reserve = a.quoteReserveUsd();
+		uint256 band = a.poolDepthUsd();
+		emit log_named_decimal_uint('CHECK pool USDC reserve (USD)  ', reserve, 18);
+		emit log_named_decimal_uint('CHECK pool band depth (USD)    ', band, 18);
+		assertEq(reserve, Math.mulDiv(IERC20(USDC).balanceOf(CHECK_POOL), _quoteUsd18(USDC_USD), 1e6));
+		assertGe(reserve, MIN_QUOTE_RESERVE_USD * 1e18, 'the reserve holds the floor');
+		assertLt(band, (MIN_QUOTE_RESERVE_USD * BAND_QUOTE_PPM / 1e6) * 1e18, 'the band does not');
+		assertTrue(a.isBelowFloor(), 'reserve over, band under: under the floor');
+		assertEq(a.minBandDepthUsd(), 1_282, "the registry's band floor");
+		_assertTwoPartFloor(a);
+
+		// the band floor is minLiquidityUsd's: the largest floor whose band floor (whole USD) is ≤ the band ...
+		uint256 bandWhole = band / 1e18;
+		uint256 over = ((bandWhole + 1) * 1e6 - 1) / BAND_QUOTE_PPM; // over × PPM < (bandWhole + 1) × 1e6 ≤ (over + 1) × PPM
+		TwapAggregatorAdapterV2 atBand = _v2(CHECK_POOL, CHECK, USDC_USD, 90_000, over);
+		assertLe(atBand.minBandDepthUsd(), bandWhole);
+		assertFalse(atBand.isBelowFloor(), 'band floor <= the band: over');
+		// ... and one more dollar of floor lifts the band floor past it
+		TwapAggregatorAdapterV2 pastBand = _v2(CHECK_POOL, CHECK, USDC_USD, 90_000, over + 1);
+		assertGt(pastBand.minBandDepthUsd() * 1e18, band);
+		assertGe(reserve, (over + 1) * 1e18, 'the reserve holds that floor too');
+		assertTrue(pastBand.isBelowFloor(), 'band floor > the band: under');
+	}
+
+	/// @notice No reserve reading from a pool that can't serve the window: a year-long window
+	///         outruns VIRTUAL's observations, so quoteReserveUsd() and isBelowFloor() revert.
+	function test_fork_quoteReserveRevertsWhenWindowUnserved() public {
+		vm.skip(!forked);
+		TwapAggregatorAdapterV2 v2 = new TwapAggregatorAdapterV2(
+			IConcentratedPoolOracle(VIRTUAL_POOL), VIRTUAL, AggregatorV3Interface(USDC_USD), 365 days, 25_000, 500, 90_000, 'v2'
+		);
+		vm.expectRevert(TwapAggregatorAdapterV2.ObservationWindowUnavailable.selector);
+		v2.quoteReserveUsd();
+		vm.expectRevert(TwapAggregatorAdapterV2.ObservationWindowUnavailable.selector);
+		v2.isBelowFloor();
+	}
+
+	// ─── price precision (Ruling 19) ─────────────────────────────────────────────
+
+	/// @notice Both existing pools, both orientations: v2's single-rounded price stays within one
+	///         old rounding unit of v1's (WETH-quoted LUMIA: unchanged to ~1e-15 USD) and within 1e-6
+	///         of the independent full-precision reference.
+	function test_fork_priceMatchesOldFormulaAndReference() public {
+		vm.skip(!forked);
+		(TwapAggregatorAdapter lumiaV1, TwapAggregatorAdapterV2 lumiaV2) = _pair(LUMIA_POOL, LUMIA, ETH_USD, 3600);
+		(TwapAggregatorAdapter virtualV1, TwapAggregatorAdapterV2 virtualV2) = _pair(VIRTUAL_POOL, VIRTUAL, USDC_USD, 90_000);
+		(uint256 lumiaPrice,) = _assertMatchesOldFormula(lumiaV1, lumiaV2, ETH_USD);
+		(uint256 virtualPrice,) = _assertMatchesOldFormula(virtualV1, virtualV2, USDC_USD);
+		assertApproxEqRel(lumiaPrice, _referencePrice(lumiaV2, ETH_USD), 1e12, 'LUMIA within 1e-6 of the reference');
+		assertApproxEqRel(virtualPrice, _referencePrice(virtualV2, USDC_USD), 1e12, 'VIRTUAL within 1e-6 of the reference');
+	}
+
+	/// @notice $GILD/USDC 0.3% (asset = token1, sqrtP ≤ 2^128), ~$0.0000007: the old formula floored
+	///         to zero raw USDC units (v1 reverts PriceRoundsToZero); v2 prices it.
+	function test_fork_subCentUsdc_gild() public {
+		vm.skip(!forked);
+		_assertSubCentPricedInFull(GILD_POOL, GILD, false, false);
+	}
+
+	/// @notice BONSAICOIN/USDC 1% (asset = token1, sqrtP > 2^128), ~$0.00000001.
+	function test_fork_subCentUsdc_bonsai() public {
+		vm.skip(!forked);
+		_assertSubCentPricedInFull(BONSAI_POOL, BONSAI, false, true);
+	}
+
+	/// @notice X8004/USDC 1% (asset = token0), ~$0.00001: the old formula read ~4% low.
+	function test_fork_subCentUsdc_x8004() public {
+		vm.skip(!forked);
+		_assertSubCentPricedInFull(X8004_POOL, X8004, true, false);
+	}
+
+	/// @notice hTEA/USDC Slipstream CL200 (asset = token1), ~$0.00004.
+	function test_fork_subCentUsdc_htea() public {
+		vm.skip(!forked);
+		_assertSubCentPricedInFull(HTEA_POOL, HTEA, false, false);
+	}
+
+	function _assertSubCentPricedInFull(address pool, address asset, bool assetIsToken0, bool sqrtAbove128) internal {
+		(TwapAggregatorAdapter v1, TwapAggregatorAdapterV2 v2) = _pair(pool, asset, USDC_USD, 90_000);
+		assertEq(v2.quoteAsset(), USDC);
+		assertEq(v2.assetIsToken0(), assetIsToken0);
+		(int24 meanTick,) = v2.consult();
+		assertEq(TickMath.getSqrtRatioAtTick(meanTick) > type(uint128).max, sqrtAbove128, 'sqrtP branch');
+		(uint256 price, uint256 old) = _assertMatchesOldFormula(v1, v2, USDC_USD);
+		uint256 expected = _referencePrice(v2, USDC_USD);
+		emit log_named_decimal_uint('reference price (USD)  ', expected, 18);
+		emit log_named_decimal_uint('old / new              ', Math.mulDiv(old, 1e18, price), 18);
+		assertLt(price, 0.0001e18, 'below $0.0001');
+		assertApproxEqRel(price, expected, 1e12, 'within 1e-6 of the full-precision reference');
+	}
+
+	/// @dev Equality guard (Ruling 19): v1 still runs the old formula (quote floored to whole raw
+	///      units per whole asset, then x the feed). floor(Q) <= Q < floor(Q) + 1, so v2's price is
+	///      never below v1's and exceeds it by at most the USD of one raw quote unit (+1 wei). Where
+	///      the old quote floors to zero, v1 reverts PriceRoundsToZero (old = 0) and v2 still prices.
+	function _assertMatchesOldFormula(TwapAggregatorAdapter v1, TwapAggregatorAdapterV2 v2, address feed)
+		internal
+		returns (uint256 price, uint256 old)
+	{
+		(, int256 answer,,,) = v2.latestRoundData();
+		price = SafeCast.toUint256(answer);
+		try v1.latestRoundData() returns (uint80, int256 oldAnswer, uint256, uint256, uint80) {
+			old = SafeCast.toUint256(oldAnswer);
+		} catch (bytes memory reason) {
+			assertEq(bytes4(reason), TwapAggregatorAdapter.PriceRoundsToZero.selector, 'v1 fails only by rounding to zero');
+		}
+		uint256 unit = _quoteUsd18(feed) / 10 ** IERC20Metadata(v2.quoteAsset()).decimals();
+		emit log_named_decimal_uint('v2 price (USD)         ', price, 18);
+		emit log_named_decimal_uint('v1 old-formula (USD)   ', old, 18);
+		assertGe(price, old, 'never below the truncated price');
+		assertLe(price - old, unit + 1, 'within one old rounding unit');
+	}
+
+	/// @dev Independent full-precision reference: Uniswap OracleLibrary.getQuoteAtTick for 10^38 raw
+	///      asset units (10^(38 - ad) whole assets), so its own floor costs < 1e-18 relative on these
+	///      pools, then per whole asset and x the feed.
+	function _referencePrice(TwapAggregatorAdapterV2 v2, address feed) internal view returns (uint256) {
+		(int24 meanTick,) = v2.consult();
+		uint256 assetDecimals = IERC20Metadata(v2.asset()).decimals();
+		uint256 quoteOut = _getQuoteAtTick(meanTick, uint128(1e38), v2.assetIsToken0());
+		uint256 denominator = 10 ** (38 - assetDecimals) * 10 ** IERC20Metadata(v2.quoteAsset()).decimals();
+		return Math.mulDiv(quoteOut, _quoteUsd18(feed), denominator);
+	}
+
+	/// @dev Uniswap v3-periphery OracleLibrary.getQuoteAtTick.
+	function _getQuoteAtTick(int24 tick, uint128 baseAmount, bool baseIsToken0) internal pure returns (uint256) {
+		uint160 sqrtRatioX96 = TickMath.getSqrtRatioAtTick(tick);
+		if (sqrtRatioX96 <= type(uint128).max) {
+			uint256 ratioX192 = uint256(sqrtRatioX96) * sqrtRatioX96;
+			return baseIsToken0 ? Math.mulDiv(ratioX192, baseAmount, 1 << 192) : Math.mulDiv(1 << 192, baseAmount, ratioX192);
+		}
+		uint256 ratioX128 = Math.mulDiv(sqrtRatioX96, sqrtRatioX96, 1 << 64);
+		return baseIsToken0 ? Math.mulDiv(ratioX128, baseAmount, 1 << 128) : Math.mulDiv(1 << 128, baseAmount, ratioX128);
 	}
 
 	/// @dev Mints `quoteIn` of the quote token as an out-of-range position inside the band, checks
