@@ -3,6 +3,7 @@ pragma solidity 0.8.24;
 
 import {IERC4626} from '@openzeppelin/contracts/interfaces/IERC4626.sol';
 import {ValueInterpreter} from '../../src/core/ValueInterpreter.sol';
+import {PriceListingModule} from '../../src/pricing/PriceListingModule.sol';
 
 /// @title YieldListing
 /// @notice The yield vaults funds can deposit into through the generic ERC4626Adapter,
@@ -15,6 +16,8 @@ import {ValueInterpreter} from '../../src/core/ValueInterpreter.sol';
 ///           LP positions on stocks the stock script already prices)
 ///         A vault is listed only when its underlying is already priced, so on mainnet this
 ///         runs AFTER list-coinbase-stocks.sh. Already-listed vaults are skipped.
+///         The VI is owned by TWAP listing v2's PriceListingModule, so each derivative is added
+///         through `module.execute` (module owner only).
 library YieldListing {
 	address internal constant AAVE_STATIC_USDC = 0xC768c589647798a6EE01A91FdE98EF2ed046DBD6;
 	address internal constant AAVE_STATIC_WETH = 0xe298b938631f750DD409fB18227C4a23dCdaab9b;
@@ -51,12 +54,13 @@ library YieldListing {
 		v[3] = IPOR_NVDA_CARRY;
 	}
 
-	function listAll(ValueInterpreter vi, address feed, address[] memory vaults) internal returns (uint256 listed) {
+	function listAll(PriceListingModule module, address feed, address[] memory vaults) internal returns (uint256 listed) {
+		ValueInterpreter vi = module.valueInterpreter();
 		for (uint256 i; i < vaults.length; ++i) {
 			if (vi.isSupportedAsset(vaults[i])) continue;
 			address asset = IERC4626(vaults[i]).asset();
 			if (!vi.isSupportedAsset(asset)) revert UnderlyingNotPriced(vaults[i], asset);
-			vi.addDerivative(vaults[i], feed);
+			module.execute(abi.encodeCall(ValueInterpreter.addDerivative, (vaults[i], feed)));
 			++listed;
 		}
 	}
