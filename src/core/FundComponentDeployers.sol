@@ -43,25 +43,31 @@ contract ComptrollerDeployer is IComptrollerDeployer {
 /// @title ComptrollerBlueprintDeployer
 /// @notice Comptroller fix path (FundFactory.setComptrollerDeployer): deploys a Comptroller build
 ///         from creation code stored in data contracts, so a fixed build isn't bound by EIP-170.
-/// @dev The build must keep Comptroller's constructor signature and every function FundFactory
-///      calls on it (incl. `initializeForMigration`). Data contracts are STOP ‖ chunk, never
-///      callable. `initcodeHash` lets fund owners check which build will take over.
+/// @dev The build must keep Comptroller's constructor parameters (it may add more after them,
+///      supplied as `extraConstructorArgs`) and every function FundFactory calls on it (incl.
+///      `initializeForMigration`). Data contracts are STOP ‖ chunk, never callable. `initcodeHash`
+///      lets fund owners check which build will take over.
 contract ComptrollerBlueprintDeployer is IComptrollerDeployer {
 	uint256 private constant CHUNK_SIZE = 24_000; // + the STOP prefix stays under EIP-170 (24,576)
 
 	address[] private chunks;
 	uint256 public immutable initcodeLength;
 	bytes32 public immutable initcodeHash;
+	/// @notice ABI-encoded static values appended after Comptroller's own constructor arguments.
+	bytes public extraConstructorArgs;
 
 	error EmptyInitcode();
 	error ChunkWriteFailed();
 	error DeploymentFailed();
 
 	/// @param build the fixed Comptroller's creation code (type(X).creationCode), no constructor args
-	constructor(bytes memory build) {
+	/// @param extraConstructorArgs_ abi.encode of the build's additional (static) constructor
+	///        arguments, or empty
+	constructor(bytes memory build, bytes memory extraConstructorArgs_) {
 		if (build.length == 0) revert EmptyInitcode();
 		initcodeLength = build.length;
 		initcodeHash = keccak256(build);
+		extraConstructorArgs = extraConstructorArgs_;
 		for (uint256 start; start < build.length; start += CHUNK_SIZE) {
 			chunks.push(_writeChunk(Bytes.slice(build, start, Math.min(start + CHUNK_SIZE, build.length))));
 		}
@@ -86,7 +92,8 @@ contract ComptrollerBlueprintDeployer is IComptrollerDeployer {
 		bytes memory creation = abi.encodePacked(
 			initcode(),
 			abi.encode(msg.sender, fundOwner, denominationAsset, valueInterpreter, feeConfig),
-			abi.encode(sharesActionTimelock, minRequestDuration, executionWindow, allowRiskyAssets)
+			abi.encode(sharesActionTimelock, minRequestDuration, executionWindow, allowRiskyAssets),
+			extraConstructorArgs
 		);
 		assembly ('memory-safe') {
 			comptroller := create(0, add(creation, 0x20), mload(creation))

@@ -6,7 +6,7 @@ import {VerantaPerpPositionV2Factory} from '../../src/positions/VerantaPerpPosit
 import {PriceMarker} from '../../src/pricing/PriceMarker.sol';
 import {VerantaPriceStore} from '../../src/pricing/VerantaPriceStore.sol';
 import {VerantaPriceAdapter} from '../../src/pricing/VerantaPriceAdapter.sol';
-import {PriceListingModule} from '../../src/pricing/PriceListingModule.sol';
+import {IValueInterpreterAdmin} from './ListingModuleBook.sol';
 import {FundsMainnet} from './FundsMainnet.sol';
 
 /// @notice Veranta's PairStorage views the listing walks (verified ABI, impl 0x2511bF7e…).
@@ -28,8 +28,8 @@ interface IVerantaPairCatalog {
 ///         so running it twice is a no-op. Driven entirely by Veranta's on-chain catalog.
 ///         Max age: 24/7 crypto groups 1 hour; closed-market groups (forex, commodities,
 ///         equities) 5 days, so weekends and holidays never block a fund (founder rule).
-///         The VI is owned by TWAP listing v2's PriceListingModule, so the primitive is added
-///         through `module.execute` (module owner only).
+///         The primitive is added through the VI's owner (`admin.execute`: the pool-pricing
+///         registrar, or the TWAP v2 module before the switch-over; its owner only).
 library VerantaListing {
 	/// @notice Pyth Lazer's verifier on Base — the one Veranta's PriceAggregator uses.
 	address internal constant PYTH_LAZER_VERIFIER = 0xACeA761c27A909d4D3895128EBe6370FDE2dF481;
@@ -43,7 +43,7 @@ library VerantaListing {
 		return group == 0 || group == 1 || group == 4 || group == 5;
 	}
 
-	function listAll(VerantaPriceStore store, PriceListingModule module, VerantaPerpPositionV2Factory factory)
+	function listAll(VerantaPriceStore store, IValueInterpreterAdmin admin, VerantaPerpPositionV2Factory factory)
 		internal
 		returns (uint256 listed)
 	{
@@ -58,7 +58,7 @@ library VerantaListing {
 			string memory symbol = keccak256(bytes(to)) == keccak256('USD') ? string.concat('vm', from) : string.concat('vm', from, to);
 			PriceMarker marker = new PriceMarker(string.concat('Veranta ', pair), symbol);
 			VerantaPriceAdapter adapter = new VerantaPriceAdapter(store, i, maxAge, string.concat(pair, ' (Veranta)'));
-			module.execute(abi.encodeCall(ValueInterpreter.addPrimitive, (address(marker), address(adapter), maxAge)));
+			admin.execute(abi.encodeCall(ValueInterpreter.addPrimitive, (address(marker), address(adapter), maxAge)));
 			factory.setPairAsset(i, address(marker));
 			++listed;
 		}
