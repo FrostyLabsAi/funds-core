@@ -104,7 +104,7 @@ contract ComptrollerFixPathTest is Test {
 	}
 
 	function _blueprint() internal returns (ComptrollerBlueprintDeployer) {
-		return new ComptrollerBlueprintDeployer(type(FixedComptroller).creationCode);
+		return new ComptrollerBlueprintDeployer(type(FixedComptroller).creationCode, '');
 	}
 
 	function _reconfigure() internal returns (address newComptroller) {
@@ -138,7 +138,7 @@ contract ComptrollerFixPathTest is Test {
 
 	function test_blueprintRejectsEmptyInitcode() public {
 		vm.expectRevert(ComptrollerBlueprintDeployer.EmptyInitcode.selector);
-		new ComptrollerBlueprintDeployer('');
+		new ComptrollerBlueprintDeployer('', '');
 	}
 
 	function test_onlyTheOwnerMovesTheDeployer() public {

@@ -1,0 +1,7 @@
+{
+  "fundDeployer": "0xdB293A4DE1664bE4B60F6646ea2edF809002317F",
+  "fundInitcodeHash": "0x3d8880f34baaeeb97a5060bcad0b384f8c593da605afc4209d8e40bd8ad55471",
+  "policy": "0x3ce8eDA4c48635983F15af7D3Dae96C8D9Ae593d",
+  "registrar": "0x34AcBA229Aeaf7F1c0f442633F35E26Bc94b4e2A",
+  "startBlock": 52175712
+}

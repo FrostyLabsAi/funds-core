@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# LIST COINBASE TOKENIZED STOCKS (Base mainnet) — while the deployer owns the PriceListingModule
-# (which owns the ValueInterpreter since TWAP listing v2) and the Veranta perp factory:
+# LIST COINBASE TOKENIZED STOCKS (Base mainnet) — while the deployer owns the ValueInterpreter's
+# owner (the PoolPriceRegistrar after the pool-pricing switch-over, the PriceListingModule before
+# it) and the Veranta perp factory:
 #   1. each Coinbase B20 stock becomes a VI primitive on its Chainlink "Coinbase <TICKER>" feed
 #      (the feed prices ONE token = share price × the token's multiplier, per Chainlink's docs),
 #      with a 5-day staleness limit so weekends/holidays (feeds are 24/5) never block trading;
 #   2. each stock perp on Veranta is mapped onto the same token (setPairAsset), re-pointing a pair
 #      ListVerantaPairs had mapped to its Veranta-priced marker (COIN/CRCL/INTC, listed 2026-10-01).
-# The VI is owned by TWAP listing v2's PriceListingModule, so addPrimitive goes through
-# module.execute (deployments/base-mainnet-twap-v2.json, or TWAP_V2_FILE).
+# addPrimitive goes through the VI's owner's `execute`: the registrar named in
+# deployments/base-mainnet-pool-pricing.json (POOL_PRICING_FILE) or, before the switch-over, the
+# module named in deployments/base-mainnet-twap-v2.json (TWAP_V2_FILE). Anything else is refused.
 # cast, NOT forge: B20 tokens are a Base node precompile that Foundry's EVM does not implement
 # (a local call to decimals() fails with OpcodeNotFound), so a forge script dies simulating
 # addPrimitive. cast sends to the real chain, where B20 works.
@@ -16,13 +18,14 @@
 #   Checks only (default): BASE_RPC_URL=<rpc> ./script/mainnet/list-coinbase-stocks.sh
 #   Send:                  SEND=1 DEPLOYER_KEY=<key> BASE_RPC_URL=<rpc> ./script/mainnet/list-coinbase-stocks.sh
 # Reads the VI + perp factory from deployments/base-mainnet.json (DeployFundsMainnet writes it)
-# and the module from deployments/base-mainnet-twap-v2.json (DeployTwapListingV2 writes it).
+# and the VI's owner from the pool-pricing or TWAP v2 book (see above).
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 
 RPC=${BASE_RPC_URL:?set BASE_RPC_URL}
 DEPLOYMENTS=${DEPLOYMENTS_FILE:-deployments/base-mainnet.json}
 TWAP_V2=${TWAP_V2_FILE:-deployments/base-mainnet-twap-v2.json}
+POOL_PRICING=${POOL_PRICING_FILE:-deployments/base-mainnet-pool-pricing.json}
 VERANTA_PAIR_STORAGE=0x5db3772136e5557EFE028Db05EE95C84D76faEC4
 STALENESS=432000 # 5 days — outlives weekend + holiday closures (longest seen ≈ 92.5h); VI max is 7 days
 
@@ -57,11 +60,16 @@ if [ -f "$DEPLOYMENTS" ]; then
 	VI=$(python3 -c "import json; print(json.load(open('$DEPLOYMENTS'))['valueInterpreter'])")
 	PERPS=$(python3 -c "import json; print(json.load(open('$DEPLOYMENTS'))['verantaFactory'])")
 	echo "VI $VI · perp factory $PERPS"
-	[ -f "$TWAP_V2" ] || fail "no $TWAP_V2: the VI is owned by the PriceListingModule it names"
-	MODULE=$(python3 -c "import json; print(json.load(open('$TWAP_V2'))['module'])")
-	[ "$(call "$VI" 'owner()(address)' | tr '[:upper:]' '[:lower:]')" = "$(echo "$MODULE" | tr '[:upper:]' '[:lower:]')" ] \
-		|| fail "the VI is not owned by the module $MODULE"
-	echo "module $MODULE owns the VI"
+	OWNER=$(call "$VI" 'owner()(address)' | tr '[:upper:]' '[:lower:]')
+	ADMIN=""
+	for BOOK_KEY in "$POOL_PRICING:registrar" "$TWAP_V2:module"; do
+		BOOK=${BOOK_KEY%:*}
+		[ -f "$BOOK" ] || continue
+		NAMED=$(python3 -c "import json; print(json.load(open('$BOOK')).get('${BOOK_KEY##*:}', ''))" | tr '[:upper:]' '[:lower:]')
+		[ "$NAMED" = "$OWNER" ] && ADMIN=$OWNER
+	done
+	[ -n "$ADMIN" ] || fail "the VI's owner $OWNER is neither the pool-pricing registrar nor the TWAP v2 module"
+	echo "$ADMIN owns the VI"
 else
 	echo "no $DEPLOYMENTS yet — checking tokens, feeds and pairs only"
 fi
@@ -91,7 +99,7 @@ echo "── listing"
 for row in "${STOCKS[@]}"; do
 	read -r SYM TOKEN FEED PAIR PAIR_SYM <<<"$row"
 	if [ "$(call "$VI" 'isSupportedAsset(address)(bool)' "$TOKEN")" != "true" ]; then
-		cast send "$MODULE" 'execute(bytes)' "$(cast calldata 'addPrimitive(address,address,uint32)' "$TOKEN" "$FEED" "$STALENESS")" \
+		cast send "$ADMIN" 'execute(bytes)' "$(cast calldata 'addPrimitive(address,address,uint32)' "$TOKEN" "$FEED" "$STALENESS")" \
 			--rpc-url "$RPC" --private-key "$KEY" >/dev/null || fail "addPrimitive $SYM"
 	fi
 	if [ "$(call "$PERPS" 'pairAsset(uint256)(address)' "$PAIR" | tr '[:upper:]' '[:lower:]')" != "$(echo "$TOKEN" | tr '[:upper:]' '[:lower:]')" ]; then

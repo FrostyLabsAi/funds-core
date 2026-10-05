@@ -9,6 +9,7 @@ import {ERC4626PriceFeed} from '../../src/pricing/ERC4626PriceFeed.sol';
 import {MockERC20} from '../utils/Mocks.sol';
 import {VerantaFundingFixture as Fx} from '../utils/VerantaFundingFixture.sol';
 import {FundsMainnet} from '../../script/mainnet/FundsMainnet.sol';
+import {IValueInterpreterAdmin} from '../../script/mainnet/ListingModuleBook.sol';
 import {YieldListing} from '../../script/mainnet/YieldListing.sol';
 import {TwapListingV2} from '../../script/mainnet/TwapListingV2.sol';
 import {PriceListingModule} from '../../src/pricing/PriceListingModule.sol';
@@ -58,7 +59,7 @@ contract YieldListingForkTest is Test {
 
 	function _list() internal returns (uint256 listed) {
 		vm.startPrank(deployer);
-		listed = YieldListing.listAll(module, feed, YieldListing.nonStockVaults());
+		listed = YieldListing.listAll(IValueInterpreterAdmin(address(module)), d.valueInterpreter, feed, YieldListing.nonStockVaults());
 		vm.stopPrank();
 	}
 
@@ -104,7 +105,7 @@ contract YieldListingForkTest is Test {
 
 	function listExternal(address[] memory vaults) external {
 		vm.startPrank(deployer);
-		YieldListing.listAll(module, feed, vaults);
+		YieldListing.listAll(IValueInterpreterAdmin(address(module)), d.valueInterpreter, feed, vaults);
 		vm.stopPrank();
 	}
 
