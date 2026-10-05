@@ -2,7 +2,8 @@
 # LIST COINBASE TOKENIZED STOCKS (Base mainnet) — while the deployer owns the ValueInterpreter's
 # owner (the PoolPriceRegistrar after the pool-pricing switch-over, the PriceListingModule before
 # it) and the Veranta perp factory:
-#   1. each Coinbase B20 stock becomes a VI primitive on its Chainlink "Coinbase <TICKER>" feed
+#   1. each Coinbase B20 stock (from Coinbase's API, by address) with a Chainlink "Coinbase <TICKER>" feed
+#      becomes a VI primitive on it
 #      (the feed prices ONE token = share price × the token's multiplier, per Chainlink's docs),
 #      with a 5-day staleness limit so weekends/holidays (feeds are 24/5) never block trading;
 #   2. each stock perp on Veranta is mapped onto the same token (setPairAsset), re-pointing a pair
@@ -29,24 +30,42 @@ POOL_PRICING=${POOL_PRICING_FILE:-deployments/base-mainnet-pool-pricing.json}
 VERANTA_PAIR_STORAGE=0x5db3772136e5557EFE028Db05EE95C84D76faEC4
 STALENESS=432000 # 5 days — outlives weekend + holiday closures (longest seen ≈ 92.5h); VI max is 7 days
 
-# symbol · token (base.org/stocks) · Chainlink feed (Base RDD, "Coinbase <TICKER>") · Veranta pair · pair symbol
-# GOOGL token ↔ Veranta's GOOG perp (class C vs class A trade within ~1% — accepted)
-STOCKS=(
-	"NVDAc  0xb20000000000000000000078ee7ce2fE4908108C 0x04689a41629776563E6822F76f2e57D148d28513 81  NVDA"
-	"AAPLc  0xb200000000000000000000C2e324d24d7eEcd1fb 0x787f13dEa48Db0897CbCDD985de77809D837F988 82  AAPL"
-	"AMZNc  0xb200000000000000000000d9192b6B456483C2E8 0x06A8E4b3aBB3B7543d8396FB2B763d22820cB295 83  AMZN"
-	"MSFTc  0xB200000000000000000000Ab99cFa739E253872B 0xeB10A6c9aa7E537aEd766C08c35Dae35B321b18c 84  MSFT"
-	"METAc  0xb2000000000000000000008bC8786B856E61707C 0x6526aE6797A76123638b863AeE4dD27Ba4E4b27D 85  META"
-	"TSLAc  0xb2000000000000000000001e800a7f5189430cD0 0xFaf869185383a24F8cb00e27BdA6b63B9905DCb4 86  TSLA"
-	"GOOGLc 0xb2000000000000000000002D0BA3164cc74f58B7 0x5bF49E0ffA937CE2FfF033c739aD7C634c4D34F2 87  GOOG"
-	"SNDKc  0xb200000000000000000000397293Cb8cda9a10c5 0x388b0dC46C0Fb05A74BeE0994fa5b02c6Fcca2eA 101 SNDK"
-	"SPCXc  0xb2000000000000000000007b9fcbd005511aCBd5 0x6A634B235903C4ad6376892180d6fF8612e3Fa68 105 SPCX"
-	"MSTRc  0xb2000000000000000000004884b426556b92883d 0xB3cE282CD188b35DA0E38D8Bc7d58e33173D202a 108 MSTR"
-	# 2026-10-01: token + Chainlink feed now exist (verified on-chain); their perps were on Veranta markers
-	"COINc  0xb200000000000000000000c85a31389D71F3ecfb 0x408e44f504A7371a345F03a73dDC96A4b48e8aa7 80  COIN"
-	"CRCLc  0xB20000000000000000000019f6E7C675b73C2e4D 0x0231cF2635D1E17bB5c2462cc7504Ba1fBd61f33 106 CRCL"
-	"INTCc  0xB2000000000000000000004AFF16039bA04bdFBc 0xAB657C39bac0D5886250D70849e2E3E008F2EECB 99  INTC"
-)
+# The stock list is no longer hard-coded (2026-10-05). Base's DeFi guide
+# (docs.base.org/build-on-base/integrate-defi/list-tokenized-stocks) says to discover Coinbase stocks from
+# the Coinbase API and identify them by ADDRESS. So: every token in https://api.coinbase.com/v1/tokenized-stocks
+# whose Chainlink "Coinbase <TICKER>" feed exists in Chainlink's Base directory (the STANDARD proxyAddress,
+# never the SVR secondaryProxyAddress) is listed. Stocks without a feed yet are reported and skipped.
+# COINc/INTCc (listed 2026-10-01) are no longer in Coinbase's list (zero supply), so they are no longer
+# touched; their perps stay mapped.
+CB_API=${CB_STOCKS_API:-https://api.coinbase.com/v1/tokenized-stocks}
+CL_DIRECTORY=${CL_DIRECTORY:-https://reference-data-directory.vercel.app/feeds-ethereum-mainnet-base-1.json}
+# Coinbase ticker → Veranta perp symbol where they differ: the GOOGL token ↔ Veranta's GOOG perp
+# (class C vs class A trade within ~1% — accepted 2026-10-01)
+declare -A PERP_SYMBOL=([GOOGL]=GOOG)
+
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+curl -sf -m 60 "$CB_API" -o "$WORK/coinbase.json" || { echo "✗ FAIL: can't read $CB_API"; exit 1; }
+curl -sf -m 60 "$CL_DIRECTORY" -o "$WORK/chainlink.json" || { echo "✗ FAIL: can't read $CL_DIRECTORY"; exit 1; }
+# rows: SYM TOKEN FEED NAV — one per Coinbase stock with a Chainlink feed
+python3 - "$WORK" <<'EOF'
+import json, sys
+work = sys.argv[1]
+tokens = json.load(open(f'{work}/coinbase.json'))['tokens']
+feeds = {f['name']: f['proxyAddress'] for f in json.load(open(f'{work}/chainlink.json'))
+         if (f.get('name') or '').startswith('Coinbase ') and f.get('proxyAddress')}
+with open(f'{work}/rows.txt', 'w') as rows, open(f'{work}/nofeed.txt', 'w') as nofeed:
+    for t in sorted(tokens, key=lambda t: t['symbol']):
+        sym, ticker = t['symbol'], t['symbol'][:-1] if t['symbol'].endswith('c') else t['symbol']
+        feed = feeds.get(f'Coinbase {ticker}')
+        if feed:
+            rows.write(f"{sym} {t['contract_address']} {feed} {t.get('nav_price') or 0}\n")
+        else:
+            nofeed.write(f"{sym}\n")
+EOF
+mapfile -t STOCKS < "$WORK/rows.txt"
+echo "Coinbase lists $(python3 -c "import json; print(len(json.load(open('$WORK/coinbase.json'))['tokens']))") stocks · ${#STOCKS[@]} have a Chainlink feed on Base"
+[ -s "$WORK/nofeed.txt" ] && echo "no Chainlink feed yet (skipped): $(tr '\n' ' ' < "$WORK/nofeed.txt")"
 
 fail() { echo "✗ FAIL: $*"; exit 1; }
 call() { sleep "${THROTTLE:-0}"; cast call "$@" --rpc-url "$RPC"; } # THROTTLE=0.5 on a public RPC
@@ -74,18 +93,33 @@ else
 	echo "no $DEPLOYMENTS yet — checking tokens, feeds and pairs only"
 fi
 
+# Veranta's pair catalog once: perp symbol → pair index (a stock perp is mapped onto its token)
+declare -A PAIR_OF
+N=$(call "$VERANTA_PAIR_STORAGE" 'pairsCount()(uint256)' | awk '{print $1}')
+for ((i = 0; i < N; i++)); do
+	FROM=$(call "$VERANTA_PAIR_STORAGE" 'pairData(uint256)(string,string,uint256)' "$i" | head -1 | unquote)
+	[ -n "$FROM" ] || continue
+	[ -n "${PAIR_OF[$FROM]:-}" ] || PAIR_OF[$FROM]=$i
+done
+
 echo "── on-chain checks"
+ROWS=()
 for row in "${STOCKS[@]}"; do
-	read -r SYM TOKEN FEED PAIR PAIR_SYM <<<"$row"
+	read -r SYM TOKEN FEED NAV <<<"$row"
+	TICKER=${SYM%c}
+	PAIR_SYM=${PERP_SYMBOL[$TICKER]:-$TICKER}
+	PAIR=${PAIR_OF[$PAIR_SYM]:--}
 	[ "$(call "$TOKEN" 'symbol()(string)' | unquote)" = "$SYM" ] || fail "$TOKEN is not $SYM"
 	[ "$(call "$TOKEN" 'decimals()(uint8)')" = "8" ] || fail "$SYM decimals"
 	DESC=$(call "$FEED" 'description()(string)' | unquote)
-	[ "$DESC" = "Coinbase ${PAIR_SYM/GOOG/GOOGL}" ] || fail "$FEED is '$DESC', not Coinbase ${SYM%c}"
+	[ "$DESC" = "Coinbase $TICKER" ] || fail "$FEED is '$DESC', not Coinbase $TICKER"
 	ANSWER=$(call "$FEED" 'latestRoundData()(uint80,int256,uint256,uint256,uint80)' | sed -n 2p | awk '{print $1}')
 	[ "${ANSWER:0:1}" != "-" ] && [ "$ANSWER" != "0" ] || fail "$SYM feed answer $ANSWER"
-	[ "$(call "$VERANTA_PAIR_STORAGE" 'pairData(uint256)(string,string,uint256)' "$PAIR" | head -1 | unquote)" = "$PAIR_SYM" ] \
-		|| fail "Veranta pair $PAIR is not $PAIR_SYM"
-	printf '✓ %-7s token ok · %s = %s · pair %s = %s\n' "$SYM" "$DESC" "$ANSWER" "$PAIR" "$PAIR_SYM"
+	# the feed must agree with the NAV Coinbase publishes for the same token (catches a wrong feed)
+	python3 -c "import sys; a, n = $ANSWER / 1e8, float('$NAV'); sys.exit(0 if n == 0 or abs(a - n) / n < 0.02 else 1)" \
+		|| fail "$SYM feed $ANSWER is more than 2% off Coinbase's NAV $NAV"
+	printf '✓ %-7s token ok · %s = %s · perp %s\n' "$SYM" "$DESC" "$ANSWER" "$([ "$PAIR" = - ] && echo none || echo "pair $PAIR = $PAIR_SYM")"
+	ROWS+=("$SYM $TOKEN $FEED $PAIR")
 done
 
 if [ "${SEND:-0}" != "1" ]; then
@@ -96,17 +130,17 @@ fi
 KEY=${DEPLOYER_KEY:?set DEPLOYER_KEY}
 
 echo "── listing"
-for row in "${STOCKS[@]}"; do
-	read -r SYM TOKEN FEED PAIR PAIR_SYM <<<"$row"
+for row in "${ROWS[@]}"; do
+	read -r SYM TOKEN FEED PAIR <<<"$row"
 	if [ "$(call "$VI" 'isSupportedAsset(address)(bool)' "$TOKEN")" != "true" ]; then
 		cast send "$ADMIN" 'execute(bytes)' "$(cast calldata 'addPrimitive(address,address,uint32)' "$TOKEN" "$FEED" "$STALENESS")" \
 			--rpc-url "$RPC" --private-key "$KEY" >/dev/null || fail "addPrimitive $SYM"
 	fi
-	if [ "$(call "$PERPS" 'pairAsset(uint256)(address)' "$PAIR" | tr '[:upper:]' '[:lower:]')" != "$(echo "$TOKEN" | tr '[:upper:]' '[:lower:]')" ]; then
+	if [ "$PAIR" != - ] && [ "$(call "$PERPS" 'pairAsset(uint256)(address)' "$PAIR" | tr '[:upper:]' '[:lower:]')" != "$(echo "$TOKEN" | tr '[:upper:]' '[:lower:]')" ]; then
 		cast send "$PERPS" 'setPairAsset(uint256,address)' "$PAIR" "$TOKEN" \
 			--rpc-url "$RPC" --private-key "$KEY" >/dev/null || fail "setPairAsset $SYM"
 	fi
 	RATE=$(call "$VI" 'calcUsdRate(address)(uint256)' "$TOKEN" | awk '{print $1}')
-	printf '✓ %-7s listed · VI rate %s · pair %s mapped\n' "$SYM" "$RATE" "$PAIR"
+	printf '✓ %-7s listed · VI rate %s · perp %s\n' "$SYM" "$RATE" "$([ "$PAIR" = - ] && echo none || echo "pair $PAIR mapped")"
 done
-echo "done — every stock priced by the VI and every stock perp tradeable by funds"
+echo "done — every Coinbase stock with a Chainlink feed is priced by the VI, and its perp (if Veranta lists one) is tradeable by funds"
