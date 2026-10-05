@@ -4,18 +4,16 @@ pragma solidity 0.8.24;
 import {Script, console2} from 'forge-std/Script.sol';
 import {ValueInterpreter} from '../../src/core/ValueInterpreter.sol';
 import {FundFactory} from '../../src/core/FundFactory.sol';
-import {PriceListingModule} from '../../src/pricing/PriceListingModule.sol';
 import {VerantaPerpPositionV2Factory} from '../../src/positions/VerantaPerpPositionV2.sol';
 import {CompoundersMainnet} from './CompoundersMainnet.sol';
 
 /// @notice Fee compounders + the fee-taking position types on the LIVE Base genesis — what
-///         test/fork/CompoundersMainnetFork rehearses. Run by the genesis deployer AFTER
-///         DeployTwapListingV2 (the module it wires must own the VI) and BEFORE the governance handoff
-///         (it still owns the FundFactory and the module). CompoundersMainnet lists the steps.
+///         test/fork/CompoundersMainnetFork rehearsed (retired 2026-10-04). Ran 2026-10-01 as the genesis deployer, BEFORE
+///         the governance handoff (it still owns the FundFactory). CompoundersMainnet lists the steps;
+///         since the 2026-10-04 switch-over it no longer wires the retired PriceListingModule.
 ///         Fails closed: it sends nothing unless the founder's referral ops are done — the DAO
 ///         Treasury Safe owns `frostydao` on Veranta's Referral and the V2 perp factory points at it.
-///         Reads deployments/base-mainnet.json (deployer, valueInterpreter, factory, verantaFactory)
-///         and the TWAP v2 book (module).
+///         Reads deployments/base-mainnet.json (deployer, valueInterpreter, factory, verantaFactory).
 ///         Writes deployments/base-mainnet-compounders.json: feed, adapter, compounderFactory (and its
 ///         two vault deployers, made in its constructor), slipstreamLpFactory (type 4),
 ///         slipstream2LpFactory (type 7), perpV3Factory (type 6), creator / compounder (zero when
@@ -26,7 +24,6 @@ import {CompoundersMainnet} from './CompoundersMainnet.sol';
 ///              --sender <deployer> --broadcast --slow [--verify]
 ///         Env: [COMPOUNDER_CREATOR] (the funds-keeper wallet: may create vaults; unset = setCreator later),
 ///              [COMPOUNDER_HARVESTER] (the FrostyFi workflow wallet: may call compound(); unset = setCompounder later),
-///              [TWAP_V2_FILE] (default deployments/base-mainnet-twap-v2.json),
 ///              [DEPLOYMENTS_FILE] (default deployments/base-mainnet-compounders.json)
 contract DeployCompoundersMainnet is Script {
 	string internal constant GENESIS_FILE = 'deployments/base-mainnet.json';
@@ -42,20 +39,16 @@ contract DeployCompoundersMainnet is Script {
 				'DEPLOYMENTS_FILE is another address book'
 			);
 		}
-		string memory twapFile = vm.envOr('TWAP_V2_FILE', string('deployments/base-mainnet-twap-v2.json'));
-		require(vm.exists(twapFile), 'TWAP v2 book not found: run DeployTwapListingV2 first');
-
 		string memory genesis = vm.readFile(GENESIS_FILE);
 		CompoundersMainnet.Config memory cfg = CompoundersMainnet.Config({
 			deployer: vm.parseJsonAddress(genesis, '.deployer'),
 			valueInterpreter: ValueInterpreter(vm.parseJsonAddress(genesis, '.valueInterpreter')),
 			factory: FundFactory(vm.parseJsonAddress(genesis, '.factory')),
-			module: PriceListingModule(vm.parseJsonAddress(vm.readFile(twapFile), '.module')),
 			verantaFactory: VerantaPerpPositionV2Factory(vm.parseJsonAddress(genesis, '.verantaFactory')),
 			creator: vm.envOr('COMPOUNDER_CREATOR', address(0)),
 			compounder: vm.envOr('COMPOUNDER_HARVESTER', address(0))
 		});
-		require(msg.sender == cfg.deployer, 'run as the genesis deployer (it owns the FundFactory and the module)');
+		require(msg.sender == cfg.deployer, 'run as the genesis deployer (it owns the FundFactory)');
 		// fail closed before anything is sent: the founder's referral ops come first (runbook "Fees + referral")
 		string memory problem = CompoundersMainnet.referralProblem(cfg.verantaFactory);
 		require(bytes(problem).length == 0, problem);

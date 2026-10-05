@@ -6,9 +6,6 @@ import {ValueInterpreter} from '../../src/core/ValueInterpreter.sol';
 import {FundFactory} from '../../src/core/FundFactory.sol';
 import {ProtocolFeeReserve} from '../../src/core/ProtocolFeeReserve.sol';
 import {ComptrollerDeployer, SharesVaultDeployer} from '../../src/core/FundComponentDeployers.sol';
-import {IPolicy} from '../../src/interfaces/IPolicy.sol';
-import {IValueInterpreter} from '../../src/interfaces/IValueInterpreter.sol';
-import {AggregatorV3Interface} from '../../src/interfaces/AggregatorV3Interface.sol';
 import {IUniswapV3SwapRouter} from '../../src/interfaces/external/IUniswapV3SwapRouter.sol';
 import {ISlipstreamSwapRouter} from '../../src/interfaces/external/ISlipstreamSwapRouter.sol';
 import {IUniswapV3NonfungiblePositionManager} from '../../src/interfaces/external/IUniswapV3NonfungiblePositionManager.sol';
@@ -27,8 +24,6 @@ import {UniswapV3LPPositionFactory} from '../../src/positions/UniswapV3LPPositio
 import {SlipstreamLPPositionFactory} from '../../src/positions/SlipstreamLPPosition.sol';
 import {VerantaPerpPositionV2Factory} from '../../src/positions/VerantaPerpPositionV2.sol';
 import {ERC4626ExitValueFeed} from '../../src/pricing/ERC4626ExitValueFeed.sol';
-import {TwapListingRegistry, IUniswapV3PoolFactory, ISlipstreamPoolFactory} from '../../src/pricing/TwapListingRegistry.sol';
-import {TwapExposurePolicy} from '../../src/policies/TwapExposurePolicy.sol';
 
 /// @title FundsMainnet
 /// @notice FrostyFunds genesis on Base mainnet as code — one library the broadcast script
@@ -46,6 +41,10 @@ import {TwapExposurePolicy} from '../../src/policies/TwapExposurePolicy.sol';
 ///         later with one timelock batch — `settleFees()` on every live fund, then
 ///         `setProtocolFee(bps, reserve)` — so no fund is charged for the time it was off (each
 ///         fund's fee clock only advances when that fund settles).
+///         2026-10-04 (pool-pricing switch-over): genesis also shipped a TWAP tier, TwapListingRegistry
+///         v1 + TwapExposurePolicy v1 on all four mandatory hooks. Both are retired and their source is
+///         gone; their live addresses stay in deployments/base-mainnet.json (`twapRegistry`, `twapPolicy`),
+///         and a rehearsal deploy of this library makes neither.
 library FundsMainnet {
 	// ─── Base mainnet externals (verified 2026-09-24) ───────────────────────────
 	address internal constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
@@ -72,9 +71,21 @@ library FundsMainnet {
 	address internal constant CL2_SWAP_ROUTER = 0x698Cb2b6dd822994581fEa6eA4Fc755d1363A92F;
 	address internal constant CL2_NPM = 0xe1f8cd9AC4e4A65F54f38a5CdAfCA44f6dD68b53;
 	/// @dev Slipstream-3's NonfungiblePositionManager (aerodrome-finance/slipstream README, "Gauge Caps
-	///      Deployment"); factory() = 0xaDe6…716a, the pool factory TwapListingV2.CL3_FACTORY names
+	///      Deployment"); factory() = 0xaDe6…716a, the pool factory CL3_FACTORY names
 	///      (read 2026-10-01). Not a genesis venue: the fee compounders use it (CompoundersMainnet).
 	address internal constant CL3_NPM = 0xa990C6a764b73BF43cee5Bb40339c3322FB9D55F;
+	// ─── later venues (verified 2026-09-30; moved here from the retired TwapListingV2 2026-10-04) ─
+	/// @dev Aerodrome's third Slipstream deployment; its router's factory() answers CL3_FACTORY.
+	address internal constant CL3_FACTORY = 0xaDe65c38CD4849aDBA595a4323a8C7DdfE89716a;
+	address internal constant CL3_SWAP_ROUTER = 0xcbBb8035cAc7D4B3Ca7aBb74cF7BdF900215Ce0D;
+	/// @dev Uniswap v2 factory = router02 (0x4752…aD24).factory().
+	address internal constant UNI_V2_FACTORY = 0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6;
+	/// @dev Uniswap v2 Router02; its factory() answers UNI_V2_FACTORY.
+	address internal constant UNI_V2_ROUTER = 0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24;
+	/// @dev Aerodrome basic PoolFactory = Router (0xcF77…4E43).defaultFactory().
+	address internal constant AERODROME_POOL_FACTORY = 0x420DD381b31aEf6683db6B902084cB0FFECe40Da;
+	/// @dev Aerodrome Router; its defaultFactory() answers AERODROME_POOL_FACTORY.
+	address internal constant AERODROME_ROUTER = 0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43;
 
 	address internal constant VERANTA_ROUTER = 0x44914408af82bC9983bbb330e3578E1105e11d4e;
 	address internal constant VERANTA_STORAGE = 0x8a311D7048c35985aa31C131B9A13e03a5f7422d;
@@ -109,8 +120,8 @@ library FundsMainnet {
 		ValueInterpreter valueInterpreter;
 		FundFactory factory;
 		ProtocolFeeReserve feeReserve;
-		TwapListingRegistry twapRegistry;
-		TwapExposurePolicy twapPolicy;
+		address twapRegistry; // retired (see the title); zero on a rehearsal deploy
+		address twapPolicy; // retired; zero on a rehearsal deploy
 		VerantaPerpPositionV2Factory verantaFactory;
 		address uniAdapter;
 		address slipstreamAdapter;
@@ -132,7 +143,6 @@ library FundsMainnet {
 		_deployPricing(d, cfg);
 		_deployFactory(d, cfg);
 		_deployVenues(d, cfg);
-		_deployTwapTier(d);
 	}
 
 	function _deployPricing(Deployed memory d, Config memory cfg) private {
@@ -197,28 +207,6 @@ library FundsMainnet {
 		verantaFactory.setPairAsset(VERANTA_BTC_PAIR, CBBTC);
 		factory.registerPositionType(VERANTA_PERP_TYPE, address(verantaFactory));
 		d.verantaFactory = verantaFactory;
-	}
-
-	function _deployTwapTier(Deployed memory d) private {
-		TwapListingRegistry registry = new TwapListingRegistry(
-			IValueInterpreter(address(d.valueInterpreter)),
-			IUniswapV3PoolFactory(UNI_FACTORY),
-			ISlipstreamPoolFactory(CL_FACTORY),
-			ISlipstreamPoolFactory(CL2_FACTORY)
-		);
-		registry.setQuote(USDC, AggregatorV3Interface(CL_USDC_USD), 25 hours);
-		registry.setQuote(WETH, AggregatorV3Interface(CL_ETH_USD), 1 hours);
-		TwapExposurePolicy policy = new TwapExposurePolicy(registry);
-
-		FundFactory.PolicyReg[] memory mandatory = new FundFactory.PolicyReg[](4);
-		mandatory[0] = FundFactory.PolicyReg({hook: IPolicy.PolicyHook.PostCallOnIntegration, policy: address(policy)});
-		mandatory[1] = FundFactory.PolicyReg({hook: IPolicy.PolicyHook.PostDepositRequest, policy: address(policy)});
-		mandatory[2] = FundFactory.PolicyReg({hook: IPolicy.PolicyHook.CreateExternalPosition, policy: address(policy)});
-		mandatory[3] = FundFactory.PolicyReg({hook: IPolicy.PolicyHook.PostCallOnExternalPosition, policy: address(policy)});
-		d.factory.setMandatoryPolicies(mandatory);
-
-		d.twapRegistry = registry;
-		d.twapPolicy = policy;
 	}
 
 }

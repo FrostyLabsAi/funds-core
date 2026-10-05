@@ -10,8 +10,8 @@ import {VerantaFundingFixture as Fx} from '../utils/VerantaFundingFixture.sol';
 import {FundsMainnet} from '../../script/mainnet/FundsMainnet.sol';
 import {VerantaListing, IVerantaPairCatalog} from '../../script/mainnet/VerantaListing.sol';
 import {IValueInterpreterAdmin} from '../../script/mainnet/ListingModuleBook.sol';
-import {TwapListingV2} from '../../script/mainnet/TwapListingV2.sol';
-import {PriceListingModule} from '../../src/pricing/PriceListingModule.sol';
+import {PoolPriceRegistrar} from '../../src/pricing/PoolPriceRegistrar.sol';
+import {FreshPoolPricing} from '../utils/FreshPoolPricing.sol';
 
 /// @notice The Veranta listing batch on the genesis deployment, against Veranta's LIVE pair
 ///         catalog on Base mainnet: every listed, Lazer-priced pair that genesis left unmapped
@@ -27,7 +27,7 @@ contract VerantaListingForkTest is Test {
 	address internal deployer = makeAddr('deployer');
 	FundsMainnet.Deployed internal d;
 	VerantaPriceStore internal store;
-	PriceListingModule internal module;
+	PoolPriceRegistrar internal registrar;
 
 	function setUp() public {
 		string memory rpc = vm.envOr('BASE_MAINNET_RPC', string(''));
@@ -42,28 +42,16 @@ contract VerantaListingForkTest is Test {
 		store = new VerantaPriceStore(
 			IPythLazerVerifier(VerantaListing.PYTH_LAZER_VERIFIER), IVerantaLazerPairs(FundsMainnet.VERANTA_PAIR_STORAGE)
 		);
-		// as on mainnet since 2026-10-01: TWAP listing v2 hands the VI to its PriceListingModule
-		module = _deployTwapV2();
+		// as on mainnet since 2026-10-04: the PoolPriceRegistrar owns the VI
+		registrar = FreshPoolPricing.takeOverVi(d, deployer).registrar;
 		vm.stopPrank();
-		assertEq(d.valueInterpreter.owner(), address(module), 'the module owns the VI');
-	}
-
-	function _deployTwapV2() internal returns (PriceListingModule) {
-		return TwapListingV2.deploy(
-			TwapListingV2.Config({
-				deployer: deployer,
-				valueInterpreter: d.valueInterpreter,
-				factory: d.factory,
-				twapPolicyV1: address(d.twapPolicy),
-				keeper: address(0)
-			})
-		).module;
+		assertEq(d.valueInterpreter.owner(), address(registrar), 'the registrar owns the VI');
 	}
 
 	function test_fork_listsEveryUnmappedLazerPair_withTheRightMaxAge() public {
 		vm.skip(!forked);
 		vm.startPrank(deployer);
-		uint256 listed = VerantaListing.listAll(store, IValueInterpreterAdmin(address(module)), d.verantaFactory);
+		uint256 listed = VerantaListing.listAll(store, IValueInterpreterAdmin(address(registrar)), d.verantaFactory);
 		vm.stopPrank();
 
 		uint256 expected;
@@ -97,7 +85,7 @@ contract VerantaListingForkTest is Test {
 	function test_fork_afterARelay_theViPricesListedMarkersAtVerantasPrice() public {
 		vm.skip(!forked);
 		vm.startPrank(deployer);
-		VerantaListing.listAll(store, IValueInterpreterAdmin(address(module)), d.verantaFactory);
+		VerantaListing.listAll(store, IValueInterpreterAdmin(address(registrar)), d.verantaFactory);
 		vm.stopPrank();
 		store.relayFunding{value: 1 ether}(Fx.calldata_());
 
@@ -116,8 +104,8 @@ contract VerantaListingForkTest is Test {
 	function test_fork_listingTwiceIsANoOp() public {
 		vm.skip(!forked);
 		vm.startPrank(deployer);
-		VerantaListing.listAll(store, IValueInterpreterAdmin(address(module)), d.verantaFactory);
-		assertEq(VerantaListing.listAll(store, IValueInterpreterAdmin(address(module)), d.verantaFactory), 0, 'already-mapped pairs are skipped');
+		VerantaListing.listAll(store, IValueInterpreterAdmin(address(registrar)), d.verantaFactory);
+		assertEq(VerantaListing.listAll(store, IValueInterpreterAdmin(address(registrar)), d.verantaFactory), 0, 'already-mapped pairs are skipped');
 		vm.stopPrank();
 	}
 }

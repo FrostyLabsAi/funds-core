@@ -13,7 +13,6 @@ import {
 } from '../src/yield/CompounderDeployers.sol';
 import {CompounderFactory} from '../src/yield/CompounderFactory.sol';
 import {FundsMainnet} from '../script/mainnet/FundsMainnet.sol';
-import {TwapListingV2} from '../script/mainnet/TwapListingV2.sol';
 import {MockERC20} from './utils/Mocks.sol';
 
 /// @dev A venue's pool factory as the CompounderFactory and the vaults read it: both getPool shapes
@@ -838,7 +837,7 @@ contract CompounderFactoryForkTest is Test {
 		v.slipstreamNpm = FundsMainnet.CL_NPM;
 		v.slipstream2Factory = FundsMainnet.CL2_FACTORY;
 		v.slipstream2Npm = FundsMainnet.CL2_NPM;
-		v.slipstream3Factory = TwapListingV2.CL3_FACTORY;
+		v.slipstream3Factory = FundsMainnet.CL3_FACTORY;
 		v.slipstream3Npm = CL3_NPM;
 	}
 }

@@ -3,9 +3,10 @@ pragma solidity 0.8.24;
 
 import {Ownable2Step} from '@openzeppelin/contracts/access/Ownable2Step.sol';
 import {Ownable} from '@openzeppelin/contracts/access/Ownable.sol';
+import {IPolicy} from '../../src/interfaces/IPolicy.sol';
 import {FundFactory} from '../../src/core/FundFactory.sol';
-import {PriceListingModule} from '../../src/pricing/PriceListingModule.sol';
-import {TwapListingRegistryV2} from '../../src/pricing/TwapListingRegistryV2.sol';
+import {PoolPriceRegistrar} from '../../src/pricing/PoolPriceRegistrar.sol';
+import {MinPoolLiquidityPolicy} from '../../src/policies/MinPoolLiquidityPolicy.sol';
 import {CompounderFactory} from '../../src/yield/CompounderFactory.sol';
 import {SlipstreamLPPositionV2Factory} from '../../src/positions/SlipstreamLPPositionV2.sol';
 import {VerantaPerpPositionV3Factory} from '../../src/positions/VerantaPerpPositionV3.sol';
@@ -21,116 +22,115 @@ import {FundsMainnet} from './FundsMainnet.sol';
 ///         on it later (shared governance, founder decision 2026-09-24).
 ///         The EOA holds no timelock role: the acceptOwnership batch is SCHEDULED BY THE SAFE (a
 ///         proposer) and executed by anyone once the delay passes (the timelock's execution is open).
-///           {start}     (EOA)  hand the listing role to the timelock, drop the EOA's, and begin
-///                              every two-step ownership transfer
+///           {start}     (EOA)  revoke the retired lister's compounder roles, begin every two-step
+///                              ownership transfer
 ///           {acceptBatch}      the calls the timelock must make — the Safe schedules them
 ///           (the timelock delay passes; anyone executes the batch)
-///           {verify}           owners, pending owners, guardian, listers, wiring
-///         TWAP listing v2 (TwapListingV2, when deployed): the PriceListingModule owns the VI, so the
-///         MODULE moves in the VI's place, plus TwapListingRegistryV2. The module stays the registry's
-///         only lister; its keepers are the new owner's (the timelock's) to set. A zero {TwapV2}
-///         means v2 is not deployed: every function then behaves exactly as genesis shipped it.
-///         Fee compounders (CompoundersMainnet, after v2): the CompounderFactory and both
-///         SlipstreamLPPositionV2 factories (types 4 / 7) move too; the V3 perp factory (type 6) is
-///         ownerless and stays out of the list. A zero {Compounders} means not deployed — refused once
-///         the module's compounder listing is wired, so a handoff can't leave them with the deployer.
+///           {verify}           owners, pending owners, guardian, keeper, pricing wiring, fund version
+///         Rebuilt 2026-10-04 for the pool-pricing switch-over (PLAN_GOVERNANCE_HANDOFF_2026-10-04):
+///         the PoolPriceRegistrar owns the VI, so the REGISTRAR moves in the VI's place; new funds are
+///         fund v2 behind MinPoolLiquidityPolicy. The retired TWAP tier (listing module, registries
+///         v1/v2) holds nothing but moves too, by address only (founder 2026-10-04: "the deployer
+///         holds nothing"); its source is gone. Running the handoff stays the LAST launch step
+///         (founder rule 2026-10-01).
+///         Fee compounders (CompoundersMainnet): the CompounderFactory and both SlipstreamLPPositionV2
+///         factories (types 4 / 7) move; the V3 perp factory (type 6) is ownerless and stays out.
 library FundsGovernance {
-	/// @notice TWAP listing v2 (TwapListingV2.Deployed); `module` zero = not deployed.
-	struct TwapV2 {
-		PriceListingModule module;
-		TwapListingRegistryV2 registry;
-		address policy; // the TWAP exposure policy every mandatory entry names: V2, or V3 once DeployTwapPolicyV3 ran
+	/// @notice The pool-pricing switch-over (deployments/base-mainnet-pool-pricing.json).
+	struct PoolPricing {
+		PoolPriceRegistrar registrar; // owns the VI
+		MinPoolLiquidityPolicy policy; // the only mandatory policy, on every hook it implements
+		address fundDeployer; // ComptrollerBlueprintDeployer (fund v2): every new fund
 	}
 
 	/// @notice Fee compounders + re-pointed position types (CompoundersMainnet.Deployed); `factory` zero = not deployed.
 	struct Compounders {
 		CompounderFactory factory;
-		address feed; // CompounderPriceFeed the module lists vaults with
 		SlipstreamLPPositionV2Factory slipstreamLp; // type 4
 		SlipstreamLPPositionV2Factory slipstream2Lp; // type 7
 		VerantaPerpPositionV3Factory perpV3; // type 6, ownerless
 	}
 
+	/// @notice The retired TWAP tier, by address (zero = not deployed): Ownable2Step owners that hold
+	///         nothing since the switch-over, plus the funds-keeper lister wallet that kept roles on it.
+	struct Retired {
+		address registryV1; // genesis TwapListingRegistry
+		address module; // PriceListingModule (owned the VI until 2026-10-04)
+		address registryV2; // TwapListingRegistryV2
+		address lister; // "Keeper · Lister" — its CompounderFactory roles are revoked at {start}
+	}
+
+	error NoPoolPricing();
+	error RegistrarNotViOwner(address owner);
+	error RegistrarNotWired(address valueInterpreter);
 	error NotHandedOff(address target, address owner);
 	error StillPending(address target, address pending);
 	error WrongGuardian(address guardian);
-	error DeployerStillLister();
-	error TimelockNotLister();
 	error DeployerIsKeeper();
-	error MandatoryPoliciesMissing(uint256 count);
+	error MandatoryPoliciesMismatch(uint256 count, uint256 expected);
+	error MandatoryPolicyMismatch(uint256 index, address policy);
+	error NotFundV2(address comptrollerDeployer);
 	error SequencerCheckOff();
-	error ModuleNotViOwner(address owner);
-	error ModuleNotLister();
-	error DeployerStillV2Lister();
-	error DeployerIsModuleKeeper();
-	error MandatoryPolicyNotV2(uint256 index, address policy);
-	error CompoundersNeedTwapV2();
-	error CompounderListingNotWired(address factory, address feed);
-	error DeployerHoldsCompounderRole();
+	error HoldsCompounderRole(address account);
 	error PositionTypeNotRepointed(uint256 typeId, address factory);
 	error PerpFactoryHasOwner(address factory);
 	error PerpConfigMismatch(address config);
 
-	/// @notice Every Ownable2Step owner to hand off — the fee reserve only when genesis made one
-	///         (FROST set); with TWAP v2 the module (which owns the VI) instead of the VI, plus
-	///         the v2 registry; with the fee compounders the CompounderFactory and both Slipstream V2
-	///         position factories.
-	function owned(FundsMainnet.Deployed memory d, TwapV2 memory v2, Compounders memory c)
+	/// @notice Every Ownable2Step owner to hand off: the registrar (owns the VI) instead of the VI,
+	///         the FundFactory, the V2 perp config, the fee reserve only when genesis made one (FROST
+	///         set), the fee compounders' three factories, and the retired TWAP tier.
+	function owned(FundsMainnet.Deployed memory d, PoolPricing memory p, Compounders memory c, Retired memory r)
 		internal
 		pure
 		returns (address[] memory o)
 	{
+		if (address(p.registrar) == address(0)) revert NoPoolPricing();
 		bool reserve = address(d.feeReserve) != address(0);
-		bool twapV2 = address(v2.module) != address(0);
 		bool compounders = address(c.factory) != address(0);
-		o = new address[](4 + (twapV2 ? 1 : 0) + (compounders ? 3 : 0) + (reserve ? 1 : 0));
+		uint256 retired = (r.registryV1 != address(0) ? 1 : 0) + (r.module != address(0) ? 1 : 0) + (r.registryV2 != address(0) ? 1 : 0);
+		o = new address[](3 + (compounders ? 3 : 0) + (reserve ? 1 : 0) + retired);
 		uint256 n;
-		if (twapV2) {
-			o[n++] = address(v2.module);
-			o[n++] = address(v2.registry);
-		} else {
-			o[n++] = address(d.valueInterpreter);
-		}
+		o[n++] = address(p.registrar);
 		o[n++] = address(d.factory);
-		o[n++] = address(d.twapRegistry);
 		o[n++] = address(d.verantaFactory);
 		if (compounders) {
 			o[n++] = address(c.factory);
 			o[n++] = address(c.slipstreamLp);
 			o[n++] = address(c.slipstream2Lp);
 		}
-		if (reserve) o[n] = address(d.feeReserve);
+		if (reserve) o[n++] = address(d.feeReserve);
+		if (r.registryV1 != address(0)) o[n++] = r.registryV1;
+		if (r.module != address(0)) o[n++] = r.module;
+		if (r.registryV2 != address(0)) o[n] = r.registryV2;
 	}
 
-	/// @notice EOA step: listing role → timelock, EOA's listing role dropped, two-step transfers begun.
-	///         With TWAP v2 the module must already own the VI — the VI itself is not transferred.
-	///         The compounders must be exactly the ones the module lists (and need v2).
+	/// @notice EOA step: the retired lister loses its compounder roles, two-step transfers begin.
+	///         The registrar must already own the VI — the VI itself is not transferred.
 	function start(
 		FundsMainnet.Deployed memory d,
-		TwapV2 memory v2,
+		PoolPricing memory p,
 		Compounders memory c,
-		address timelock,
-		address deployer
+		Retired memory r,
+		address timelock
 	) internal {
-		if (address(v2.module) != address(0) && d.valueInterpreter.owner() != address(v2.module)) {
-			revert ModuleNotViOwner(d.valueInterpreter.owner());
+		_requireRegistrarOwnsVi(d, p);
+		if (address(c.factory) != address(0) && r.lister != address(0)) {
+			if (c.factory.creators(r.lister)) c.factory.setCreator(r.lister, false);
+			if (c.factory.compounders(r.lister)) c.factory.setCompounder(r.lister, false);
 		}
-		_requireCompoundersMatch(v2, c);
-		d.twapRegistry.setLister(timelock, true);
-		d.twapRegistry.setLister(deployer, false);
-		address[] memory o = owned(d, v2, c);
+		address[] memory o = owned(d, p, c, r);
 		for (uint256 i; i < o.length; ++i) {
 			Ownable2Step(o[i]).transferOwnership(timelock);
 		}
 	}
 
 	/// @notice The timelock's acceptOwnership calls — the batch the Safe schedules.
-	function acceptBatch(FundsMainnet.Deployed memory d, TwapV2 memory v2, Compounders memory c)
+	function acceptBatch(FundsMainnet.Deployed memory d, PoolPricing memory p, Compounders memory c, Retired memory r)
 		internal
 		pure
 		returns (address[] memory targets, uint256[] memory values, bytes[] memory payloads)
 	{
-		targets = owned(d, v2, c);
+		targets = owned(d, p, c, r);
 		values = new uint256[](targets.length);
 		payloads = new bytes[](targets.length);
 		for (uint256 i; i < targets.length; ++i) {
@@ -141,49 +141,66 @@ library FundsGovernance {
 	/// @notice Revert on the first thing not where governance says it must be.
 	function verify(
 		FundsMainnet.Deployed memory d,
-		TwapV2 memory v2,
+		PoolPricing memory p,
 		Compounders memory c,
+		Retired memory r,
 		address timelock,
 		address safe,
 		address deployer,
 		address keeper
 	) internal view {
-		_requireCompoundersMatch(v2, c);
-		address[] memory o = owned(d, v2, c);
+		address[] memory o = owned(d, p, c, r);
 		for (uint256 i; i < o.length; ++i) {
 			address owner = Ownable(o[i]).owner();
 			if (owner != timelock) revert NotHandedOff(o[i], owner);
 			address pending = Ownable2Step(o[i]).pendingOwner();
 			if (pending != address(0)) revert StillPending(o[i], pending);
 		}
+		_requireRegistrarOwnsVi(d, p);
+		address viPending = d.valueInterpreter.pendingOwner();
+		if (viPending != address(0)) revert StillPending(address(d.valueInterpreter), viPending);
 		if (d.factory.guardian() != safe) revert WrongGuardian(d.factory.guardian());
-		if (d.twapRegistry.listers(deployer)) revert DeployerStillLister();
-		if (!d.twapRegistry.listers(timelock)) revert TimelockNotLister();
 		if (d.verantaFactory.autopilotKeeper() == deployer || keeper == deployer) revert DeployerIsKeeper();
-		uint256 mandatory = d.factory.getMandatoryPolicies().length;
-		if (mandatory != 4) revert MandatoryPoliciesMissing(mandatory);
+		_requireMandatoryPolicy(d.factory, p.policy);
+		address comptrollerDeployer = address(d.factory.comptrollerDeployer());
+		if (comptrollerDeployer != p.fundDeployer) revert NotFundV2(comptrollerDeployer);
 		if (address(d.valueInterpreter.sequencerUptimeFeed()) != FundsMainnet.CL_SEQUENCER_UPTIME) revert SequencerCheckOff();
-		if (address(v2.module) != address(0)) _verifyTwapV2(d, v2, deployer);
-		if (address(c.factory) != address(0)) _verifyCompounders(d, c, deployer);
+		if (address(c.factory) != address(0)) _verifyCompounders(d, c, deployer, r.lister);
 	}
 
-	/// @dev Compounders need v2, and must be exactly what the module lists — a module wired to a
-	///      factory with no compounders given would leave that factory (and the V2 LP factories) behind.
-	function _requireCompoundersMatch(TwapV2 memory v2, Compounders memory c) private view {
-		if (address(v2.module) == address(0)) {
-			if (address(c.factory) != address(0)) revert CompoundersNeedTwapV2();
-			return;
+	/// @dev The registrar owns the VI it was built on (the switch-over ran).
+	function _requireRegistrarOwnsVi(FundsMainnet.Deployed memory d, PoolPricing memory p) private view {
+		if (address(p.registrar) == address(0)) revert NoPoolPricing();
+		address viOwner = d.valueInterpreter.owner();
+		if (viOwner != address(p.registrar)) revert RegistrarNotViOwner(viOwner);
+		address wired = address(p.registrar.valueInterpreter());
+		if (wired != address(d.valueInterpreter)) revert RegistrarNotWired(wired);
+	}
+
+	/// @dev The mandatory list is exactly the long-tail policy on every hook it implements (PoolPricing.setMandatoryPolicy).
+	function _requireMandatoryPolicy(FundFactory factory, MinPoolLiquidityPolicy policy) private view {
+		IPolicy.PolicyHook[] memory hooks = policy.implementedHooks();
+		FundFactory.PolicyReg[] memory mandatory = factory.getMandatoryPolicies();
+		if (mandatory.length != hooks.length) revert MandatoryPoliciesMismatch(mandatory.length, hooks.length);
+		for (uint256 i; i < hooks.length; ++i) {
+			if (mandatory[i].hook != hooks[i] || mandatory[i].policy != address(policy)) {
+				revert MandatoryPolicyMismatch(i, mandatory[i].policy);
+			}
 		}
-		address listed = address(v2.module.compounderFactory());
-		address feed = v2.module.compounderFeed();
-		if (listed != address(c.factory) || feed != c.feed) revert CompounderListingNotWired(listed, feed);
 	}
 
 	/// @dev The compounder end state beyond the owned loop (which proved the CompounderFactory and both
-	///      V2 LP factories owned by the timelock): the deployer holds no vault role, types 4 / 7 / 6
-	///      answer the new factories, and the V3 perp factory has no owner and reads the live V2 config.
-	function _verifyCompounders(FundsMainnet.Deployed memory d, Compounders memory c, address deployer) private view {
-		if (c.factory.creators(deployer) || c.factory.compounders(deployer)) revert DeployerHoldsCompounderRole();
+	///      V2 LP factories owned by the timelock): neither the deployer nor the retired lister holds a
+	///      vault role, types 4 / 7 / 6 answer the new factories, and the V3 perp factory has no owner
+	///      and reads the live V2 config.
+	function _verifyCompounders(FundsMainnet.Deployed memory d, Compounders memory c, address deployer, address lister)
+		private
+		view
+	{
+		if (c.factory.creators(deployer) || c.factory.compounders(deployer)) revert HoldsCompounderRole(deployer);
+		if (lister != address(0) && (c.factory.creators(lister) || c.factory.compounders(lister))) {
+			revert HoldsCompounderRole(lister);
+		}
 		_requireType(d.factory, FundsMainnet.SLIPSTREAM_LP_TYPE, address(c.slipstreamLp));
 		_requireType(d.factory, FundsMainnet.SLIPSTREAM2_LP_TYPE, address(c.slipstream2Lp));
 		_requireType(d.factory, FundsMainnet.VERANTA_PERP_TYPE, address(c.perpV3));
@@ -196,23 +213,5 @@ library FundsGovernance {
 	function _requireType(FundFactory factory, uint256 typeId, address expected) private view {
 		address stored = factory.positionTypeFactories(typeId);
 		if (stored != expected) revert PositionTypeNotRepointed(typeId, stored);
-	}
-
-	/// @dev The v2 end state beyond the owned loop (which proved module + registry owned by the timelock):
-	///      the module owns the VI outright, is the registry's lister, the deployer lists and keeps
-	///      nothing, and every mandatory entry is TwapExposurePolicyV2.
-	function _verifyTwapV2(FundsMainnet.Deployed memory d, TwapV2 memory v2, address deployer) private view {
-		address module = address(v2.module);
-		address viOwner = d.valueInterpreter.owner();
-		if (viOwner != module) revert ModuleNotViOwner(viOwner);
-		address viPending = d.valueInterpreter.pendingOwner();
-		if (viPending != address(0)) revert StillPending(address(d.valueInterpreter), viPending);
-		if (!v2.registry.listers(module)) revert ModuleNotLister();
-		if (v2.registry.listers(deployer)) revert DeployerStillV2Lister();
-		if (v2.module.keepers(deployer)) revert DeployerIsModuleKeeper();
-		FundFactory.PolicyReg[] memory mandatory = d.factory.getMandatoryPolicies();
-		for (uint256 i; i < mandatory.length; ++i) {
-			if (mandatory[i].policy != v2.policy) revert MandatoryPolicyNotV2(i, mandatory[i].policy);
-		}
 	}
 }

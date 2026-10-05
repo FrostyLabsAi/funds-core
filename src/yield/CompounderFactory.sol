@@ -6,7 +6,7 @@ import {Ownable2Step} from '@openzeppelin/contracts/access/Ownable2Step.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {IERC20Metadata} from '@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol';
 import {Strings} from '@openzeppelin/contracts/utils/Strings.sol';
-import {IUniswapV3PoolFactory, ISlipstreamPoolFactory} from '../pricing/TwapListingRegistry.sol';
+import {IUniswapV3PoolFactory, ISlipstreamPoolFactory} from '../interfaces/external/IPoolFactories.sol';
 import {FeeCompounderBase, ICompounderRoles} from './FeeCompounderBase.sol';
 import {
 	CompounderDeployerBase,

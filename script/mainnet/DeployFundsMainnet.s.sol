@@ -8,6 +8,8 @@ import {FundsMainnet} from './FundsMainnet.sol';
 ///         Afterwards the deployer owns everything (run the listing batches — list-coinbase-stocks.sh,
 ///         ListVerantaPairs, ListYieldVaults — now), then TransferFundsGovernance hands off.
 ///         Writes every address to deployments/base-mainnet.json for the governance scripts.
+///         (The live genesis also wrote `twapRegistry` / `twapPolicy`, the TWAP tier retired 2026-10-04;
+///         this library no longer deploys it.)
 ///         Run: forge script script/mainnet/DeployFundsMainnet.s.sol --rpc-url <base> --broadcast \
 ///              --private-key <deployer> [--verify]
 ///         Env: AUTOPILOT_KEEPER (Vault server wallet), [SAFE] (default: the live 2-of-3 on Base),
@@ -41,8 +43,6 @@ contract DeployFundsMainnet is Script {
 		vm.serializeAddress(k, 'valueInterpreter', address(d.valueInterpreter));
 		vm.serializeAddress(k, 'factory', address(d.factory));
 		vm.serializeAddress(k, 'feeReserve', address(d.feeReserve));
-		vm.serializeAddress(k, 'twapRegistry', address(d.twapRegistry));
-		vm.serializeAddress(k, 'twapPolicy', address(d.twapPolicy));
 		vm.serializeAddress(k, 'verantaFactory', address(d.verantaFactory));
 		vm.serializeAddress(k, 'uniAdapter', d.uniAdapter);
 		vm.serializeAddress(k, 'slipstreamAdapter', d.slipstreamAdapter);
