@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
-import {Test, Vm} from 'forge-std/Test.sol';
+import {Vm} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {FundFactory} from '../../src/core/FundFactory.sol';
 import {Comptroller} from '../../src/core/Comptroller.sol';
 import {ValueInterpreter} from '../../src/core/ValueInterpreter.sol';
-import {AggregatorV3Interface} from '../../src/interfaces/AggregatorV3Interface.sol';
 import {IUniswapV2Router02} from '../../src/interfaces/external/IUniswapV2Router02.sol';
 import {IAerodromeRouter} from '../../src/interfaces/external/IAerodromeRouter.sol';
 import {UniswapV2SwapAdapter} from '../../src/adapters/UniswapV2SwapAdapter.sol';
 import {AerodromeBasicSwapAdapter} from '../../src/adapters/AerodromeBasicSwapAdapter.sol';
-import {UniswapV2TwapAdapter} from '../../src/pricing/UniswapV2TwapAdapter.sol';
-import {UniswapV2ObservationRecorder, IUniswapV2Pair} from '../../src/pricing/UniswapV2ObservationRecorder.sol';
-import {AerodromeBasicTwapAdapter, IAerodromeBasicPool} from '../../src/pricing/AerodromeBasicTwapAdapter.sol';
+import {IERC20Metadata} from '@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol';
+import {PoolPriceRegistrar} from '../../src/pricing/PoolPriceRegistrar.sol';
+import {MockAggregator} from '../utils/Mocks.sol';
+import {B20Mirror} from '../utils/B20Mirror.sol';
 
 /// @notice Router02 0x4752…aD24 views (verified Basescan source).
 interface IUniswapV2RouterQuotes {
@@ -32,6 +32,17 @@ interface IAerodromeRouterQuotes {
 	error InsufficientOutputAmount();
 
 	function defaultFactory() external view returns (address);
+}
+
+/// @notice A Uniswap v2 pair's or Aerodrome basic pool's reserves (v2 packs them as uint112/uint32,
+///         which decode as the same three words).
+interface IReservesPool {
+	function token0() external view returns (address);
+	function getReserves() external view returns (uint256 reserve0, uint256 reserve1, uint256 blockTimestampLast);
+}
+
+interface IAerodromeBasicPool {
+	function stable() external view returns (bool);
 }
 
 /// @notice Aerodrome PoolFactory 0x420D…40Da and basic pool's quote (verified Basescan source).
@@ -65,10 +76,14 @@ interface IOfficeX {
 }
 
 /// @notice The two v2-style swap adapters on the LIVE fund, real routers and real pools, Base fork.
-///         The genesis deployer still owns the FundFactory, the ValueInterpreter and the live fund
-///         (Comptroller 0x833A…dE9, ~10 USDC), so the test plays it: register each adapter, price the
-///         bought tokens with the real TWAP adapters (a fund takes in VI-supported assets only),
-///         then trade through `callOnIntegration`.
+///         The genesis deployer owns the live fund (Comptroller 0x833A…dE9, ~10 USDC), so the test
+///         plays it; the FundFactory's and the PoolPriceRegistrar's owners (whoever they are: the
+///         deployer before the governance handoff, the timelock after) register each adapter and
+///         price the bought tokens (a fund takes in VI-supported assets only), then the fund trades
+///         through `callOnIntegration`. 2026-10-04: the TWAP adapters that priced them were retired,
+///         and none of these pools is one the registrar prices (Uniswap v2 pairs aren't a venue), so
+///         each token gets a fixed feed at its pool's spot price at setUp — pricing is not what this
+///         test checks.
 ///         - untaxed: AGNT/USDC on Uniswap v2, AWE/USDC on Aerodrome basic (vAMM) — bought and sold
 ///           back at exactly the router's price for what reached the pool (its quote, plus any
 ///           excess the pool already held);
@@ -81,16 +96,10 @@ interface IOfficeX {
 ///           router pulls its whole balance);
 ///         - after every action the adapter holds none of either token and no allowance.
 ///         Run: BASE_MAINNET_RPC=<url> [BASE_FORK_BLOCK=<n>] forge test --match-path test/fork/V2SwapAdaptersFork.t.sol -vv
-contract V2SwapAdaptersForkTest is Test {
+contract V2SwapAdaptersForkTest is B20Mirror {
 	address internal constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
-	// FundsMainnet.CL_USDC_USD and the registry's USDC quote heartbeat (feed heartbeat 86_400 s)
-	address internal constant USDC_USD = 0x7e860098F58bBFC8648a4311b374B1D669a2bc6B;
-	uint32 internal constant USDC_HEARTBEAT = 90_000;
-	/// @dev PriceListingModule.TWAP_HEARTBEAT; the TWAP adapters answer with updatedAt = now
-	uint32 internal constant TWAP_HEARTBEAT = 3600;
-	uint32 internal constant WINDOW = 30 minutes;
-	uint16 internal constant MAX_DEVIATION_BPS = 500;
-	uint256 internal constant MIN_QUOTE_RESERVE_USD = 25_000;
+	/// @dev the fixed spot feeds are stamped at setUp; no test moves time this far
+	uint32 internal constant FEED_HEARTBEAT = 1 days;
 
 	// global constraints (cast, 2026-09-30)
 	address internal constant UNI_V2_ROUTER = 0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24;
@@ -123,7 +132,7 @@ contract V2SwapAdaptersForkTest is Test {
 	address internal vault;
 	UniswapV2SwapAdapter internal uniV2;
 	AerodromeBasicSwapAdapter internal aero;
-	UniswapV2ObservationRecorder internal recorder;
+	PoolPriceRegistrar internal registrar;
 
 	function setUp() public {
 		string memory rpc = vm.envOr('BASE_MAINNET_RPC', string(''));
@@ -138,36 +147,38 @@ contract V2SwapAdaptersForkTest is Test {
 		vi = ValueInterpreter(vm.parseJsonAddress(book, '.valueInterpreter'));
 		deployer = vm.parseJsonAddress(book, '.deployer');
 		vault = address(FUND.vault());
+		string memory pricing = vm.readFile(string.concat(vm.projectRoot(), '/deployments/base-mainnet-pool-pricing.json'));
+		registrar = PoolPriceRegistrar(vm.parseJsonAddress(pricing, '.registrar'));
+
+		// ALPHA is a throwaway test fund and is being wound down (0.07 USDC on 2026-10-04): top its vault
+		// up to the ~10 USDC these trades were sized for (`deal` funds balances only)
+		if (IERC20(USDC).balanceOf(vault) < 10 * ONE_USDC) deal(USDC, vault, 10 * ONE_USDC);
+		// it also holds B20 stocks (METAc, MSTRc) Foundry can't run: answer them from the chain
+		_mirrorB20s(FUND);
 
 		uniV2 = new UniswapV2SwapAdapter(IUniswapV2Router02(UNI_V2_ROUTER));
 		aero = new AerodromeBasicSwapAdapter(IAerodromeRouter(AERO_ROUTER), AERO_POOL_FACTORY);
 
-		// Uniswap v2 pairs keep no history: record, then let the 30-minute window pass
-		recorder = new UniswapV2ObservationRecorder();
-		recorder.record(AGNT_USDC);
-		recorder.record(B18_USDC);
-		recorder.record(OFFICEX_USDC);
-		skip(31 minutes);
-
-		vm.startPrank(deployer);
+		vm.startPrank(factory.owner());
 		factory.registerAdapter(address(uniV2));
 		factory.registerAdapter(address(aero));
-		vi.addPrimitive(AGNT, address(_v2Twap(AGNT_USDC, AGNT)), TWAP_HEARTBEAT);
-		vi.addPrimitive(B18, address(_v2Twap(B18_USDC, B18)), TWAP_HEARTBEAT);
-		vi.addPrimitive(OFFICEX, address(_v2Twap(OFFICEX_USDC, OFFICEX)), TWAP_HEARTBEAT);
-		vi.addPrimitive(AWE, address(_aeroTwap(AWE_USDC, AWE)), TWAP_HEARTBEAT);
-		vi.addPrimitive(FBOMB, address(_aeroTwap(FBOMB_USDC, FBOMB)), TWAP_HEARTBEAT);
+		vm.stopPrank();
+		vm.startPrank(registrar.owner());
+		_price(AGNT, AGNT_USDC);
+		_price(B18, B18_USDC);
+		_price(OFFICEX, OFFICEX_USDC);
+		_price(AWE, AWE_USDC);
+		_price(FBOMB, FBOMB_USDC);
 		vm.stopPrank();
 	}
 
 	// ─── premises and shape ──────────────────────────────────────────────────────
 
-	/// @notice The deployer owns the factory, the VI and the live fund; the routers' factories,
+	/// @notice The deployer owns the live fund and the registrar owns the VI; the routers' factories,
 	///         pools and token taxes are what the trade tests assume; both adapters are registered.
 	function test_fork_premises() public {
 		vm.skip(!forked);
-		assertEq(factory.owner(), deployer, 'factory owner');
-		assertEq(vi.owner(), deployer, 'VI owner');
+		assertEq(vi.owner(), address(registrar), 'the registrar owns the VI (since 2026-10-04)');
 		assertEq(FUND.fundOwner(), deployer, 'live fund owner');
 		assertEq(address(FUND.valueInterpreter()), address(vi), 'the fund prices with the live VI');
 		assertEq(address(FUND.denominationAsset()), USDC);
@@ -209,7 +220,7 @@ contract V2SwapAdaptersForkTest is Test {
 	// ─── untaxed: buy and sell at exactly the router's quote ─────────────────────
 
 	/// @notice The live fund buys 1 USDC of AGNT on Uniswap v2 with the exact quote as its minimum,
-	///         the TWAP-priced AGNT keeps GAV whole, and the fund sells it all back.
+	///         the AGNT priced at its pool's spot keeps GAV whole, and the fund sells it all back.
 	function test_fork_uniswapV2BuysAndSellsAgnt() public {
 		vm.skip(!forked);
 		uint256 gavBefore = FUND.calcGav();
@@ -384,9 +395,8 @@ contract V2SwapAdaptersForkTest is Test {
 	///      balanceOf(pair) − reserve (any earlier excess included) against the stored reserves —
 	///      router02.getAmountsOut when the pair holds no excess.
 	function _v2Expected(address pair, address tokenIn, uint256 arrives) internal view returns (uint256) {
-		(uint112 r0, uint112 r1,) = IUniswapV2Pair(pair).getReserves();
-		bool inIs0 = IUniswapV2Pair(pair).token0() == tokenIn;
-		(uint256 rIn, uint256 rOut) = inIs0 ? (uint256(r0), uint256(r1)) : (uint256(r1), uint256(r0));
+		(uint256 r0, uint256 r1,) = IReservesPool(pair).getReserves();
+		(uint256 rIn, uint256 rOut) = IReservesPool(pair).token0() == tokenIn ? (r0, r1) : (r1, r0);
 		uint256 amountIn = IERC20(tokenIn).balanceOf(pair) - rIn + arrives;
 		return IUniswapV2RouterQuotes(UNI_V2_ROUTER).getAmountOut(amountIn, rIn, rOut);
 	}
@@ -394,36 +404,19 @@ contract V2SwapAdaptersForkTest is Test {
 	/// @dev The same for an Aerodrome basic pool: the pool's own getAmountOut (fee, then x·y=k on the
 	///      stored reserves) of balanceOf(pool) − reserve.
 	function _aeroExpected(address pool, address tokenIn, uint256 arrives) internal view returns (uint256) {
-		(uint256 r0, uint256 r1,) = IAerodromeBasicPool(pool).getReserves();
-		uint256 rIn = IAerodromeBasicPool(pool).token0() == tokenIn ? r0 : r1;
+		(uint256 r0, uint256 r1,) = IReservesPool(pool).getReserves();
+		uint256 rIn = IReservesPool(pool).token0() == tokenIn ? r0 : r1;
 		return IAerodromePoolQuote(pool).getAmountOut(IERC20(tokenIn).balanceOf(pool) - rIn + arrives, tokenIn);
 	}
 
-	function _v2Twap(address pair, address asset) internal returns (UniswapV2TwapAdapter) {
-		return new UniswapV2TwapAdapter(
-			IUniswapV2Pair(pair),
-			asset,
-			AggregatorV3Interface(USDC_USD),
-			recorder,
-			WINDOW,
-			MIN_QUOTE_RESERVE_USD,
-			MAX_DEVIATION_BPS,
-			USDC_HEARTBEAT,
-			'v2 swap test'
-		);
-	}
-
-	function _aeroTwap(address pool, address asset) internal returns (AerodromeBasicTwapAdapter) {
-		return new AerodromeBasicTwapAdapter(
-			IAerodromeBasicPool(pool),
-			asset,
-			AggregatorV3Interface(USDC_USD),
-			WINDOW,
-			MIN_QUOTE_RESERVE_USD,
-			MAX_DEVIATION_BPS,
-			USDC_HEARTBEAT,
-			'aerodrome swap test'
-		);
+	/// @dev A VI primitive for `asset` on a fixed 8-dp USD feed at `pool`'s spot price (USDC ≈ $1),
+	///      added through the registrar's `execute` (caller pranks as its owner).
+	function _price(address asset, address pool) internal {
+		(uint256 r0, uint256 r1,) = IReservesPool(pool).getReserves();
+		(uint256 assetReserve, uint256 usdcReserve) = IReservesPool(pool).token0() == asset ? (r0, r1) : (r1, r0);
+		uint256 answer = usdcReserve * 10 ** IERC20Metadata(asset).decimals() * 1e8 / (assetReserve * 1e6);
+		MockAggregator feed = new MockAggregator(8, int256(answer));
+		registrar.execute(abi.encodeCall(ValueInterpreter.addPrimitive, (asset, address(feed), FEED_HEARTBEAT)));
 	}
 
 	function _assertShape(UniswapV2SwapAdapter adapter, bytes memory data) internal view {

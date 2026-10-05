@@ -8,6 +8,7 @@ import {Ownable} from '@openzeppelin/contracts/access/Ownable.sol';
 import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
 import {FundFactory} from '../../src/core/FundFactory.sol';
 import {Comptroller} from '../../src/core/Comptroller.sol';
+import {ComptrollerV2} from '../../src/core/ComptrollerV2.sol';
 import {ValueInterpreter} from '../../src/core/ValueInterpreter.sol';
 import {IValueInterpreter} from '../../src/interfaces/IValueInterpreter.sol';
 import {IUniswapV3SwapRouter} from '../../src/interfaces/external/IUniswapV3SwapRouter.sol';
@@ -18,7 +19,7 @@ import {
 	ISlipstreamNonfungiblePositionManager,
 	ISlipstreamPoolLookup
 } from '../../src/interfaces/external/ISlipstreamNonfungiblePositionManager.sol';
-import {IUniswapV3PoolFactory} from '../../src/pricing/TwapListingRegistry.sol';
+import {IUniswapV3PoolFactory} from '../../src/interfaces/external/IPoolFactories.sol';
 import {TickMath} from '../../src/libraries/TickMath.sol';
 import {LiquidityAmounts} from '../../src/libraries/LiquidityAmounts.sol';
 import {CompounderAdapter} from '../../src/adapters/CompounderAdapter.sol';
@@ -92,10 +93,15 @@ contract FeeCompounderForkTest is Test {
 	address internal constant SLIP1_WETH_USDC_100 = 0xb2cc224c1c9feE385f8ad6a55b4d94E92359DC59;
 	/// @dev Slipstream-2 getPool(WETH, USDC, 50): fee 425, unstakedFee 5%; 1,441 WETH + 5.67M USDC
 	address internal constant SLIP2_WETH_USDC_50 = 0x3FE04A59Ebd38cF06080a6F60a98D124eb59392A;
+	/// @dev Slipstream-3 getPool(WETH, USDC, 50): factory() = FundsMainnet.CL3_FACTORY; thin (0.45 WETH +
+	///      4.3k USDC, cast 2026-10-04) — the fund's own deposit is the liquidity its churn pays. Added
+	///      2026-10-04 when CompoundersMainnetFork (which covered this venue) was retired.
+	address internal constant SLIP3_WETH_USDC_50 = 0xc758d81B9b81A6FCDAd075bD471874A2c46B54e0;
 
 	uint8 internal constant UNI = 0;
 	uint8 internal constant SLIP1 = 1;
 	uint8 internal constant SLIP2 = 2;
+	uint8 internal constant SLIP3 = 3;
 	uint16 internal constant FEE_BPS = 1000;
 	int24 internal constant MAX_TICK = 887_272;
 
@@ -165,8 +171,8 @@ contract FeeCompounderForkTest is Test {
 
 	function test_fork_venuesAreTheCanonicalDeployments() public {
 		vm.skip(!forked);
-		Venue[3] memory venues = [_uni(), _slip1(), _slip2()];
-		for (uint256 i; i < 3; ++i) {
+		Venue[4] memory venues = [_uni(), _slip1(), _slip2(), _slip3()];
+		for (uint256 i; i < 4; ++i) {
 			Venue memory v = venues[i];
 			assertEq(IVenueLinked(v.npm).factory(), v.poolFactory, 'the NPM mints into this venue');
 			assertEq(IVenueLinked(v.router).factory(), v.poolFactory, 'the router swaps on this venue');
@@ -185,8 +191,8 @@ contract FeeCompounderForkTest is Test {
 
 	function test_fork_fullRangeTicksAlignToEachVenue() public {
 		vm.skip(!forked);
-		Venue[3] memory venues = [_uni(), _slip1(), _slip2()];
-		for (uint256 i; i < 3; ++i) {
+		Venue[4] memory venues = [_uni(), _slip1(), _slip2(), _slip3()];
+		for (uint256 i; i < 4; ++i) {
 			Venue memory v = venues[i];
 			FeeCompounderBase vault = _deploy(v, FEE_BPS);
 			assertEq(vault.tickUpper(), v.fullRange, 'upper = the widest spacing-aligned tick');
@@ -324,12 +330,17 @@ contract FeeCompounderForkTest is Test {
 		_fundRoundTrip(_slip2(), 'Fee Compounder Fork Fund SLIP2');
 	}
 
+	function test_fork_slip3_fundThroughDeployedShapeAdapterAndFeed() public {
+		vm.skip(!forked);
+		_fundRoundTrip(_slip3(), 'Fee Compounder Fork Fund SLIP3');
+	}
+
 	// ─── fee bounds, owner, roles ────────────────────────────────────────────────
 
 	function test_fork_feeBoundsAndOwnerControls() public {
 		vm.skip(!forked);
-		Venue[3] memory venues = [_uni(), _slip1(), _slip2()];
-		for (uint256 i; i < 3; ++i) {
+		Venue[4] memory venues = [_uni(), _slip1(), _slip2(), _slip3()];
+		for (uint256 i; i < 4; ++i) {
 			Venue memory v = venues[i];
 			vm.expectRevert(abi.encodeWithSelector(FeeCompounderBase.PerfFeeOutOfBounds.selector, uint16(499)));
 			_deploy(v, 499);
@@ -1078,6 +1089,21 @@ contract FeeCompounderForkTest is Test {
 		});
 	}
 
+	function _slip3() internal pure returns (Venue memory) {
+		return Venue({
+			label: 'Slipstream-3 WETH/USDC ts50',
+			kind: SLIP3,
+			npm: FundsMainnet.CL3_NPM,
+			router: FundsMainnet.CL3_SWAP_ROUTER,
+			pool: SLIP3_WETH_USDC_50,
+			poolFactory: FundsMainnet.CL3_FACTORY,
+			spacing: 50,
+			fee: 0,
+			fullRange: 887_250,
+			churnWeth: 1 ether
+		});
+	}
+
 	function _deploy(Venue memory v, uint16 bps) internal returns (FeeCompounderBase) {
 		return _deployWith(v, bps, TREASURY, roles, WETH, USDC);
 	}
@@ -1375,7 +1401,8 @@ contract FeeCompounderForkTest is Test {
 		deal(USDC, investor, amount);
 		vm.startPrank(investor);
 		IERC20(USDC).approve(address(fund), amount);
-		fund.requestDeposit(amount);
+		// new funds are fund v2 since 2026-10-04: the request carries a max share price (none here)
+		ComptrollerV2(address(fund)).requestDeposit(amount, type(uint256).max);
 		vm.stopPrank();
 		skip(1 minutes);
 		fund.executeDepositRequest(investor);

@@ -10,13 +10,11 @@ import {ISlipstreamNonfungiblePositionManager} from
 	'../../src/interfaces/external/ISlipstreamNonfungiblePositionManager.sol';
 import {CompounderAdapter} from '../../src/adapters/CompounderAdapter.sol';
 import {CompounderPriceFeed} from '../../src/pricing/CompounderPriceFeed.sol';
-import {PriceListingModule} from '../../src/pricing/PriceListingModule.sol';
 import {CompounderFactory, IPositionManagerFactory} from '../../src/yield/CompounderFactory.sol';
 import {SlipstreamLPPositionV2Factory} from '../../src/positions/SlipstreamLPPositionV2.sol';
 import {VerantaPerpPositionV2Factory} from '../../src/positions/VerantaPerpPositionV2.sol';
 import {VerantaPerpPositionV3Factory} from '../../src/positions/VerantaPerpPositionV3.sol';
 import {FundsMainnet} from './FundsMainnet.sol';
-import {TwapListingV2} from './TwapListingV2.sol';
 
 /// @notice The live Veranta Referral's code registry (proxy 0x1A11…E82D, Referral.sol verified on Blockscout).
 interface IVerantaReferralCodes {
@@ -26,14 +24,14 @@ interface IVerantaReferralCodes {
 /// @title CompoundersMainnet
 /// @notice Fee compounders and the fee-taking position types wired into the LIVE Base genesis as
 ///         code — one library the broadcast script (DeployCompoundersMainnet) and the fork acceptance
-///         test (test/fork/CompoundersMainnetFork) both run, so what is rehearsed is exactly what ships.
-///         Runs AFTER TwapListingV2: the PriceListingModule owns the VI and the genesis deployer owns
-///         the module and the FundFactory. As that deployer it:
+///         test (test/fork/CompoundersMainnetFork, retired 2026-10-04 with the TWAP tier it was built on;
+///         the vaults, LP V2 and perp V3 keep their own fork suites) both ran, so what was rehearsed shipped.
+///         Ran 2026-10-01, after TwapListingV2, as the genesis deployer (owner of the FundFactory). It:
 ///           1. deploys a CompounderPriceFeed (on the VI) and a CompounderAdapter (existing code, new
 ///              addresses) and the CompounderFactory over Uniswap v3 and Slipstream 1/2/3 (perf fee
 ///              10%, treasury = the FrostyDAO Treasury Safe), and grants its creator / compounder
 ///              roles when given;
-///           2. registers the adapter on the FundFactory and wires the module's compounder listing;
+///           2. registers the adapter on the FundFactory;
 ///           3. re-points position types 4 and 7 to SlipstreamLPPositionV2 factories (10% AERO claim
 ///              fee to the Safe) and type 6 to the VerantaPerpPositionV3 factory over the live V2
 ///              factory (perp accounts link the DAO's referral code at creation). Only
@@ -43,6 +41,10 @@ interface IVerantaReferralCodes {
 ///         {verify} then proves the end state or reverts. The deployer ends as owner of the
 ///         CompounderFactory and both Slipstream V2 factories; FundsGovernance moves them on, as the
 ///         last launch step — nothing here transfers ownership.
+///         2026-10-04 (pool-pricing switch-over): step 2 also wired the PriceListingModule's keeper
+///         listing of new vaults (`setCompounderListing`). The module no longer owns the VI and its
+///         source is gone, so that step and its check are removed; a vault is listed in the VI by the
+///         VI's owner (the PoolPriceRegistrar's `execute`, YieldListing / ListYieldVaults).
 library CompoundersMainnet {
 	/// @notice FrostyDAO Treasury Safe (Safe v1.4.1, 2-of-3): every fee lands here and it owns `frostydao`.
 	address internal constant DAO_TREASURY = 0x47b7702a4789912d0dfFDadC07c50395c293fF0A;
@@ -52,10 +54,9 @@ library CompoundersMainnet {
 	uint16 internal constant AERO_FEE_BPS = 1000;
 
 	struct Config {
-		address deployer; // the broadcasting EOA — owns the FundFactory and the module until the handoff
+		address deployer; // the broadcasting EOA — owns the FundFactory until the handoff
 		ValueInterpreter valueInterpreter;
 		FundFactory factory;
-		PriceListingModule module; // TwapListingV2's; owns the VI
 		VerantaPerpPositionV2Factory verantaFactory; // the live type-6 factory: V3 accounts' config
 		address creator; // CompounderFactory creator (the funds-keeper wallet); zero = set later
 		address compounder; // CompounderFactory compounder role (the FrostyFi workflow wallet); zero = set later
@@ -75,7 +76,6 @@ library CompoundersMainnet {
 	error WrongOwner(address target, address owner);
 	error StillPending(address target, address pending);
 	error AdapterNotRegistered(address adapter);
-	error CompounderListingMismatch(address factory, address feed);
 	error FeedMismatch(address valueInterpreter);
 	error VenueMismatch(string venue, address stored, address expected);
 	error NpmFactoryMismatch(address npm, address factory);
@@ -95,7 +95,6 @@ library CompoundersMainnet {
 		d.adapter = new CompounderAdapter();
 		d.compounderFactory = new CompounderFactory(venues());
 		cfg.factory.registerAdapter(address(d.adapter));
-		cfg.module.setCompounderListing(d.compounderFactory, address(d.feed));
 		if (cfg.creator != address(0)) d.compounderFactory.setCreator(cfg.creator, true);
 		if (cfg.compounder != address(0)) d.compounderFactory.setCompounder(cfg.compounder, true);
 
@@ -117,7 +116,7 @@ library CompoundersMainnet {
 		v.slipstreamNpm = FundsMainnet.CL_NPM;
 		v.slipstream2Factory = FundsMainnet.CL2_FACTORY;
 		v.slipstream2Npm = FundsMainnet.CL2_NPM;
-		v.slipstream3Factory = TwapListingV2.CL3_FACTORY;
+		v.slipstream3Factory = FundsMainnet.CL3_FACTORY;
 		v.slipstream3Npm = FundsMainnet.CL3_NPM;
 	}
 
@@ -147,10 +146,6 @@ library CompoundersMainnet {
 	function verify(Config memory cfg, Deployed memory d) internal view {
 		_requireReferralReady(cfg.verantaFactory);
 		if (!cfg.factory.isAdapterRegistered(address(d.adapter))) revert AdapterNotRegistered(address(d.adapter));
-		address listedFactory = address(cfg.module.compounderFactory());
-		if (listedFactory != address(d.compounderFactory) || cfg.module.compounderFeed() != address(d.feed)) {
-			revert CompounderListingMismatch(listedFactory, cfg.module.compounderFeed());
-		}
 		address feedVi = address(d.feed.valueInterpreter());
 		if (feedVi != address(cfg.valueInterpreter)) revert FeedMismatch(feedVi);
 		_checkCompounderFactory(cfg, d.compounderFactory);
@@ -167,16 +162,12 @@ library CompoundersMainnet {
 	function _checkPreconditions(Config memory cfg) private view {
 		if (
 			cfg.deployer == address(0) || address(cfg.valueInterpreter) == address(0) || address(cfg.factory) == address(0)
-				|| address(cfg.module) == address(0) || address(cfg.verantaFactory) == address(0)
+				|| address(cfg.verantaFactory) == address(0)
 		) revert BadConfig();
 		// the deployer's powers all move to governance; it must not keep a compounder role
 		if (cfg.creator == cfg.deployer || cfg.compounder == cfg.deployer) revert BadConfig();
 		_requireReferralReady(cfg.verantaFactory);
-		// TwapListingV2 ran: the module owns the VI, and the deployer still owns the module and the factory
-		if (cfg.valueInterpreter.owner() != address(cfg.module)) {
-			revert WrongOwner(address(cfg.valueInterpreter), cfg.valueInterpreter.owner());
-		}
-		if (cfg.module.owner() != cfg.deployer) revert WrongOwner(address(cfg.module), cfg.module.owner());
+		// the deployer still owns the factory (before the handoff)
 		if (cfg.factory.owner() != cfg.deployer) revert WrongOwner(address(cfg.factory), cfg.factory.owner());
 	}
 
