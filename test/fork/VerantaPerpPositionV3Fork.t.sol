@@ -710,7 +710,81 @@ contract VerantaPerpPositionV3ForkTest is Test {
 		emit log_named_uint('created accounts probed, all linked', probes);
 	}
 
+	// ─── 5. the autopilot keeper's margin top-up (perps review 2026-10-05) ─────────
+
+	/// "Margin top-up is probably broken" (perps review 2026-10-05) — confirmed. The autopilot keeper
+	/// deposits margin with delegatedAction → updateMargin, which Veranta fulfils at once against the
+	/// price it is handed. On mainnet the keeper sent no payload with PYTH_CORE sourcing: Veranta's
+	/// aggregator reverts StalePrice() (0x19abf40e), and an empty PYTH_LAZER payload reverts too. A
+	/// signed Lazer packet (PYTH_LAZER, the verifier's 1 wei fee) deposits while it is under 30 s old:
+	/// 29 s passes, 30 s reverts. funds-keeper now fetches one from Veranta's feed-v3
+	/// /v2/pairs/{index}/price-update-data right before each top-up (the source Veranta's SDK uses).
+	function test_fork_keeperMarginTopUpNeedsAFreshLazerPacket() public {
+		vm.skip(!forked || block.number != PINNED_BLOCK);
+		_repoint();
+		Comptroller fund = _fund('V3 margin');
+		address p = _create(fund);
+		_openTrade(fund, p, true, ETH_PACKET_PRICE, 1e10, 200e6);
+		vm.roll(block.number + (ETH_PACKET_TS + 2 - block.timestamp) / 2);
+		vm.warp(ETH_PACKET_TS + 2);
+		_fill(p);
+		vm.prank(manager);
+		fund.callOnExternalPosition(
+			p, new address[](0), new uint256[](0), new address[](0), abi.encode(SET_AUTOPILOT, abi.encode(block.timestamp + 30 days))
+		);
+		address keeper = v2Factory.autopilotKeeper();
+		// the account's idle USDC, which the top-up spends (the manager sends it there)
+		deal(USDC, p, 50e6);
+		uint256 collateral0 = _collateral(p);
+		bytes[] memory lazer = new bytes[](1);
+		lazer[0] = ETH_LAZER_PACKET;
+
+		// what the keeper sent until now: no payload, PYTH_CORE
+		uint256 snap = vm.snapshotState();
+		(bool ok,) = _topUp(keeper, p, new bytes[](0), 0, 0);
+		assertFalse(ok, 'no payload + PYTH_CORE: reverts');
+		vm.prank(p); // the cause, undisguised by delegatedAction's bare revert
+		vm.expectRevert(bytes4(0x19abf40e)); // StalePrice()
+		IVerantaTradingRouter(ROUTER).updateMargin(ETH_PAIR, 0, 0, 50e6, new bytes[](0), 0);
+		(ok,) = _topUp(keeper, p, new bytes[](0), PYTH_LAZER, 0);
+		assertFalse(ok, 'no payload + PYTH_LAZER: reverts');
+		assertEq(_collateral(p), collateral0);
+		vm.revertToState(snap);
+
+		// a signed Lazer packet 29 s old deposits the 50 USDC, all of it from the account
+		snap = vm.snapshotState();
+		vm.warp(ETH_PACKET_TS + 29);
+		(ok,) = _topUp(keeper, p, lazer, PYTH_LAZER, 1);
+		assertTrue(ok, 'fresh Lazer packet: deposits');
+		assertEq(_collateral(p), collateral0 + 50e6, 'collateral +50 USDC');
+		assertEq(IERC20(USDC).balanceOf(p), 0, 'paid from the account, nothing from the keeper');
+		vm.revertToState(snap);
+
+		// 30 s old: refused, so the keeper must fetch the packet right before sending
+		vm.warp(ETH_PACKET_TS + 30);
+		(ok,) = _topUp(keeper, p, lazer, PYTH_LAZER, 1);
+		assertFalse(ok, '30 s old: reverts');
+		assertEq(_collateral(p), collateral0);
+		emit log_named_decimal_uint('collateral before top-up', collateral0, 6);
+	}
+
 	// ─── helpers ─────────────────────────────────────────────────────────────────
+
+	/// @dev The autopilot keeper's margin DEPOSIT of 50 USDC into the account's first ETH trade, sent
+	///      the way funds-keeper src/veranta/hedge.ts executeTopUp sends it.
+	function _topUp(address keeper, address position, bytes[] memory update, uint8 sourcing, uint256 fee)
+		internal
+		returns (bool ok, bytes memory ret)
+	{
+		bytes memory inner = abi.encodeCall(IVerantaTradingRouter.updateMargin, (ETH_PAIR, 0, 0, 50e6, update, sourcing));
+		vm.deal(keeper, 1 ether);
+		vm.prank(keeper);
+		(ok, ret) = ROUTER.call{value: fee}(abi.encodeWithSignature('delegatedAction(address,bytes)', position, inner));
+	}
+
+	function _collateral(address position) internal view returns (uint256) {
+		return IVerantaTradingStorage(TRADING_STORAGE).openTrades(position, ETH_PAIR, 0).initialPosToken;
+	}
 
 	/// @dev Founder op 3 (Task 4): type 6 now deploys V3 accounts.
 	function _repoint() internal {
