@@ -1,0 +1,96 @@
+{
+  "note": "Coinbase stock token -> the Veranta perp that hedges it (founder 2026-10-06). The perps are valued at Veranta's own price (markers, script/mainnet/RepointStockPerps.s.sol), so this table is the only token<->perp link: the terminal (hedge buttons, live prices, hedge exposure) and funds-keeper (STOCK_HEDGES: Protect, autopilot) read it. Hedges are sized in shares: tokens x the token's on-chain multiplier() (Coinbase raises it for dividends and splits; balances never change). GOOGLc hedges Veranta's GOOG perp (class A vs class C, ~0.9% apart on 2026-10-06; Veranta lists no GOOGL).",
+  "hedges": [
+    {
+      "pairIndex": 80,
+      "perp": "COIN",
+      "token": "0xb200000000000000000000c85a31389D71F3ecfb",
+      "symbol": "COINc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 81,
+      "perp": "NVDA",
+      "token": "0xb20000000000000000000078ee7ce2fE4908108C",
+      "symbol": "NVDAc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 82,
+      "perp": "AAPL",
+      "token": "0xb200000000000000000000C2e324d24d7eEcd1fb",
+      "symbol": "AAPLc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 83,
+      "perp": "AMZN",
+      "token": "0xb200000000000000000000d9192b6B456483C2E8",
+      "symbol": "AMZNc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 84,
+      "perp": "MSFT",
+      "token": "0xB200000000000000000000Ab99cFa739E253872B",
+      "symbol": "MSFTc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 85,
+      "perp": "META",
+      "token": "0xb2000000000000000000008bC8786B856E61707C",
+      "symbol": "METAc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 86,
+      "perp": "TSLA",
+      "token": "0xb2000000000000000000001e800a7f5189430cD0",
+      "symbol": "TSLAc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 87,
+      "perp": "GOOG",
+      "token": "0xb2000000000000000000002D0BA3164cc74f58B7",
+      "symbol": "GOOGLc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 99,
+      "perp": "INTC",
+      "token": "0xB2000000000000000000004AFF16039bA04bdFBc",
+      "symbol": "INTCc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 101,
+      "perp": "SNDK",
+      "token": "0xb200000000000000000000397293Cb8cda9a10c5",
+      "symbol": "SNDKc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 105,
+      "perp": "SPCX",
+      "token": "0xb2000000000000000000007b9fcbd005511aCBd5",
+      "symbol": "SPCXc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 106,
+      "perp": "CRCL",
+      "token": "0xB20000000000000000000019f6E7C675b73C2e4D",
+      "symbol": "CRCLc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 108,
+      "perp": "MSTR",
+      "token": "0xb2000000000000000000004884b426556b92883d",
+      "symbol": "MSTRc",
+      "decimals": 8
+    }
+  ]
+}

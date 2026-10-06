@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
+import {Strings} from '@openzeppelin/contracts/utils/Strings.sol';
 import {ValueInterpreter} from '../../src/core/ValueInterpreter.sol';
 import {VerantaPerpPositionV2Factory} from '../../src/positions/VerantaPerpPositionV2.sol';
 import {PriceMarker} from '../../src/pricing/PriceMarker.sol';
@@ -46,17 +47,60 @@ library VerantaListing {
 		uint256 count = CATALOG.pairsCount();
 		for (uint256 i; i < count; ++i) {
 			if (factory.pairAsset(i) != address(0)) continue;
-			(string memory from, string memory to,) = CATALOG.pairData(i);
+			(string memory from,,) = CATALOG.pairData(i);
 			if (bytes(from).length == 0 || CATALOG.getLazerFeedId(i) == 0) continue;
-
-			string memory pair = string.concat(from, '/', to);
-			string memory symbol = keccak256(bytes(to)) == keccak256('USD') ? string.concat('vm', from) : string.concat('vm', from, to);
-			PriceMarker marker = new PriceMarker(string.concat('Veranta ', pair), symbol);
-			VerantaPriceAdapter adapter = new VerantaPriceAdapter(store, i, PRICE_LIFETIME, string.concat(pair, ' (Veranta)'));
-			admin.execute(abi.encodeCall(ValueInterpreter.addPrimitive, (address(marker), address(adapter), PRICE_LIFETIME)));
-			factory.setPairAsset(i, address(marker));
+			_listPair(store, admin, factory, i);
 			++listed;
 		}
+	}
+
+	/// @notice Stock perps priced at Veranta's own price (founder 2026-10-06): each pair in `pairs`, still
+	///         mapped to its Coinbase stock token `tokens[k]` (deployments/base-mainnet-stock-hedges.json),
+	///         is listed like every other pair (marker + store adapter + 10-minute primitive) and re-pointed
+	///         to the marker. Its perp is then valued at the price it settles at, not the token's Chainlink
+	///         feed (which lags Veranta by up to ~0.4% in market hours, and prices GOOGL against Veranta's
+	///         GOOG perp: ~0.9% on 2026-10-06), and a stock split no longer mis-values it.
+	///         A pair already on a store marker is skipped, so a second run is a no-op. Anything else
+	///         (unmapped, mapped elsewhere, no Lazer feed) reverts, so a stale table can't re-point a pair.
+	///         It can't see fund holdings: re-pointing a pair a fund holds drops that trade's coin leg
+	///         from NAV (perps review 2026-10-05, must-fix 2), so the caller checks every pair is clear
+	///         first (funds-keeper src/tools/pair-holders.ts).
+	function repointToStore(
+		VerantaPriceStore store,
+		IValueInterpreterAdmin admin,
+		VerantaPerpPositionV2Factory factory,
+		ValueInterpreter vi,
+		uint256[] memory pairs,
+		address[] memory tokens
+	) internal returns (uint256 repointed) {
+		require(pairs.length == tokens.length, 'pairs/tokens length');
+		for (uint256 k; k < pairs.length; ++k) {
+			uint256 i = pairs[k];
+			address current = factory.pairAsset(i);
+			if (current != address(0)) {
+				(address aggregator,,,) = vi.getAssetInfo(current);
+				if (_isStoreAdapter(aggregator, store, i)) continue;
+			}
+			require(current == tokens[k], string.concat('pair ', Strings.toString(i), ' is not mapped to its stock token'));
+			require(CATALOG.getLazerFeedId(i) != 0, string.concat('pair ', Strings.toString(i), ' has no Lazer feed'));
+			_listPair(store, admin, factory, i);
+			++repointed;
+		}
+	}
+
+	/// @dev Marker + store adapter (10-minute lifetime) + VI primitive, then the pair is mapped to the marker.
+	function _listPair(VerantaPriceStore store, IValueInterpreterAdmin admin, VerantaPerpPositionV2Factory factory, uint256 i)
+		private
+		returns (address)
+	{
+		(string memory from, string memory to,) = CATALOG.pairData(i);
+		string memory pair = string.concat(from, '/', to);
+		string memory symbol = keccak256(bytes(to)) == keccak256('USD') ? string.concat('vm', from) : string.concat('vm', from, to);
+		PriceMarker marker = new PriceMarker(string.concat('Veranta ', pair), symbol);
+		VerantaPriceAdapter adapter = new VerantaPriceAdapter(store, i, PRICE_LIFETIME, string.concat(pair, ' (Veranta)'));
+		admin.execute(abi.encodeCall(ValueInterpreter.addPrimitive, (address(marker), address(adapter), PRICE_LIFETIME)));
+		factory.setPairAsset(i, address(marker));
+		return address(marker);
 	}
 
 	/// @notice Prices on demand (founder 2026-10-05): every pair priced from `store` gets a
