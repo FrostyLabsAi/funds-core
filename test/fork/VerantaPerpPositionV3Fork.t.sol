@@ -768,7 +768,83 @@ contract VerantaPerpPositionV3ForkTest is Test {
 		emit log_named_decimal_uint('collateral before top-up', collateral0, 6);
 	}
 
+	// ─── 6. account value vs a real close (perps review 2026-10-05) ─────────────────
+
+	/// "Close costs aren't in NAV" (perps review 2026-10-05), measured. Valuation counts a trade as
+	/// collateral + P&L − rollover − funding; a real close also pays the close fee and the close
+	/// spread. A 5× ETH long of 199.57 USDC collateral (≈ $998 notional), valued at the close's own
+	/// price, reads 199.472724 USDC; Veranta's operator closes it at that price and pays 199.278151.
+	/// NAV is high by 0.194573 USDC: 1.95 bps of notional, ≈ 0.1% of the collateral. A floor, not a
+	/// ceiling: the close here uses the spread of Veranta's real open tx, and real closes take the
+	/// operator's dynamic spread (a "profit share" and the max-gain cap, which this flat trade doesn't
+	/// touch, add more on winning trades).
+	function test_fork_navIsAboveTheRealClosePayoutByTheCloseCosts() public {
+		vm.skip(!forked || block.number != PINNED_BLOCK);
+		_repoint();
+		Comptroller fund = _fund('V3 close');
+		address p = _create(fund);
+		_openTrade(fund, p, true, ETH_PACKET_PRICE, 1e10, 200e6);
+		vm.roll(block.number + (ETH_PACKET_TS + 2 - block.timestamp) / 2);
+		vm.warp(ETH_PACKET_TS + 2);
+		_fill(p);
+		uint256 collateral = _collateral(p);
+		int256 value = _valueAt(p, ETH_PACKET_PRICE);
+		(bool ok, uint256 payout) = _closeAll(fund, p, collateral);
+		assertTrue(ok, 'the operator executed the close');
+		assertEq(IVerantaTradingStorage(TRADING_STORAGE).openTradesCount(p, ETH_PAIR), 0, 'fully closed');
+
+		int256 gap = value - int256(payout);
+		assertEq(value, 199_472_724, 'NAV at the close price');
+		assertEq(payout, 199_278_151, 'what the close paid');
+		assertEq(gap, 194_573, 'NAV is high by the close costs');
+		// small: under 2 bps of the ≈ $998 notional
+		uint256 notional = collateral * 5;
+		assertLt(uint256(gap) * 10_000, notional * 2);
+		emit log_named_decimal_int('NAV at the close price', value, 6);
+		emit log_named_decimal_uint('close payout', payout, 6);
+		emit log_named_decimal_int('NAV above payout', gap, 6);
+	}
+
 	// ─── helpers ─────────────────────────────────────────────────────────────────
+
+	/// @dev The account as NAV counts it, with its WETH leg at `price` (1e10) instead of the VI's.
+	function _valueAt(address position, uint256 price) internal returns (int256 value) {
+		(address[] memory m, uint256[] memory ma) = IExternalPosition(position).getManagedAssets();
+		(address[] memory d, uint256[] memory da) = IExternalPosition(position).getDebtAssets();
+		for (uint256 i; i < m.length; ++i) {
+			if (m[i] == USDC) value += int256(ma[i]);
+			else if (m[i] == WETH) value += int256(ma[i] * price / 1e10 / 1e12);
+		}
+		for (uint256 i; i < d.length; ++i) {
+			if (d[i] == USDC) value -= int256(da[i]);
+		}
+	}
+
+	/// @dev Close the account's ETH trade through the fund, then fill the close as Veranta's operator
+	///      does, at the real packet. Returns the USDC the close paid the account.
+	function _closeAll(Comptroller fund, address position, uint256 collateral) internal returns (bool ok, uint256 payout) {
+		uint256 usdc0 = IERC20(USDC).balanceOf(position);
+		bytes memory close = abi.encode(
+			uint8(VerantaPerpPositionV3.Action.CloseTrade), abi.encode(ETH_PAIR, uint256(0), collateral, ETH_PACKET_PRICE)
+		);
+		vm.prank(manager);
+		fund.callOnExternalPosition(position, new address[](0), new uint256[](0), new address[](0), close);
+		IVerantaMulticall.PendingOrder[] memory pending = IVerantaMulticall(MULTICALL).getPendingOrder(position);
+		if (pending.length == 0) return (false, 0);
+		bytes[] memory update = new bytes[](1);
+		update[0] = ETH_LAZER_PACKET;
+		IVerantaOperatorRouter.OffChainSpreadParams memory spread = IVerantaOperatorRouter.OffChainSpreadParams({
+			spreadP: 1e8, bookDepth: 0, impactParam: 0, byPass: true, maxSpreadP: 0, slot1: false, slot3: 0
+		});
+		vm.deal(VERANTA_OPERATOR, 1 ether);
+		vm.prank(VERANTA_OPERATOR);
+		bytes memory ret;
+		(ok, ret) = ROUTER.call{value: 1}(
+			abi.encodeCall(IVerantaOperatorRouter.executeMarketOrder, (pending[0].orderId, update, PYTH_LAZER, spread))
+		);
+		if (!ok) emit log_named_bytes('close revert', ret);
+		payout = IERC20(USDC).balanceOf(position) - usdc0;
+	}
 
 	/// @dev The autopilot keeper's margin DEPOSIT of 50 USDC into the account's first ETH trade, sent
 	///      the way funds-keeper src/veranta/hedge.ts executeTopUp sends it.
