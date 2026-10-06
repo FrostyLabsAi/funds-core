@@ -453,27 +453,6 @@ contract MockAggregator {
 	}
 }
 
-import {IPyth} from '../../src/interfaces/external/IPyth.sol';
-
-/// @dev Faithful Pyth Core stand-in for the adapter tests: per-id stored prices with the
-///      real failure mode (unknown id reverts, like PythErrors.PriceFeedNotFound).
-contract MockPyth {
-	mapping(bytes32 => IPyth.Price) private prices;
-	mapping(bytes32 => bool) private exists;
-
-	error PriceFeedNotFound();
-
-	function setPrice(bytes32 id, int64 price, uint64 conf, int32 expo, uint256 publishTime) external {
-		prices[id] = IPyth.Price({price: price, conf: conf, expo: expo, publishTime: publishTime});
-		exists[id] = true;
-	}
-
-	function getPriceUnsafe(bytes32 id) external view returns (IPyth.Price memory price) {
-		if (!exists[id]) revert PriceFeedNotFound();
-		return prices[id];
-	}
-}
-
 import {IExternalPosition} from '../../src/interfaces/IExternalPosition.sol';
 import {IExternalPositionTypeFactory} from '../../src/interfaces/IExternalPositionTypeFactory.sol';
 
