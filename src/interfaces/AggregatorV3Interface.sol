@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
-/// @notice Minimal Chainlink-compatible aggregator interface (also matched by Pyth/Redstone shims).
+/// @notice Minimal Chainlink-compatible aggregator interface (also matched by the pool-price, RedStone and Veranta store shims).
 interface AggregatorV3Interface {
 	function decimals() external view returns (uint8);
 
