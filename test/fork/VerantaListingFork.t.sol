@@ -48,7 +48,7 @@ contract VerantaListingForkTest is Test {
 		assertEq(d.valueInterpreter.owner(), address(registrar), 'the registrar owns the VI');
 	}
 
-	function test_fork_listsEveryUnmappedLazerPair_withTheRightMaxAge() public {
+	function test_fork_listsEveryUnmappedLazerPair_withTheTenMinuteLifetime() public {
 		vm.skip(!forked);
 		vm.startPrank(deployer);
 		uint256 listed = VerantaListing.listAll(store, IValueInterpreterAdmin(address(registrar)), d.verantaFactory);
@@ -74,9 +74,9 @@ contract VerantaListingForkTest is Test {
 			(address aggregator, uint32 heartbeat,,) = d.valueInterpreter.getAssetInfo(asset);
 			VerantaPriceAdapter adapter = VerantaPriceAdapter(aggregator);
 			assertEq(adapter.pairIndex(), i);
-			bool crypto = VerantaListing.isCryptoGroup(CATALOG.pairGroupIndex(i));
-			assertEq(adapter.maxPushAge(), crypto ? 1 hours : 5 days);
-			assertEq(heartbeat, adapter.maxPushAge());
+			// prices on demand (2026-10-05): every group, crypto or closed-market, 10 minutes
+			assertEq(adapter.maxPushAge(), 10 minutes);
+			assertEq(heartbeat, 10 minutes);
 		}
 		assertEq(listed, expected, 'listed exactly the Lazer pairs genesis left unmapped');
 		assertGt(listed, 150, 'the long tail is covered');
