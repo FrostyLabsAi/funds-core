@@ -10,6 +10,11 @@ import {VerantaPerpPositionV3} from '../../src/positions/VerantaPerpPositionV3.s
 import {VerantaPriceStore} from '../../src/pricing/VerantaPriceStore.sol';
 import {VerantaPriceAdapter} from '../../src/pricing/VerantaPriceAdapter.sol';
 import {FundsMainnet} from '../../script/mainnet/FundsMainnet.sol';
+import {ValueInterpreter} from '../../src/core/ValueInterpreter.sol';
+import {VerantaPerpPositionV2Factory} from '../../src/positions/VerantaPerpPositionV2.sol';
+import {VerantaListing, IVerantaPairCatalog} from '../../script/mainnet/VerantaListing.sol';
+import {IValueInterpreterAdmin} from '../../script/mainnet/ListingModuleBook.sol';
+import {Ownable} from '@openzeppelin/contracts/access/Ownable.sol';
 
 interface IVerantaOperator {
 	struct OffChainSpreadParams {
@@ -62,6 +67,9 @@ contract VerantaUnpushedPairForkTest is Test {
 
 	bool internal forked;
 	FundFactory internal factory;
+	address internal uniAdapter; // the genesis Uniswap v3 swap adapter
+	ValueInterpreter internal vi;
+	VerantaPerpPositionV2Factory internal pairConfig;
 	address internal manager = makeAddr('manager');
 	address internal investor = makeAddr('investor');
 
@@ -70,7 +78,11 @@ contract VerantaUnpushedPairForkTest is Test {
 		if (bytes(rpc).length == 0) return;
 		vm.createSelectFork(rpc, FORK_BLOCK);
 		forked = true;
-		factory = FundFactory(vm.parseJsonAddress(vm.readFile(GENESIS_FILE), '.factory'));
+		string memory genesis = vm.readFile(GENESIS_FILE);
+		factory = FundFactory(vm.parseJsonAddress(genesis, '.factory'));
+		uniAdapter = vm.parseJsonAddress(genesis, '.uniAdapter');
+		vi = ValueInterpreter(vm.parseJsonAddress(genesis, '.valueInterpreter'));
+		pairConfig = VerantaPerpPositionV2Factory(vm.parseJsonAddress(genesis, '.verantaFactory'));
 	}
 
 	/// Until the pair is pushed, NAV can't be computed: deposits can't execute and cash redemptions
@@ -130,6 +142,114 @@ contract VerantaUnpushedPairForkTest is Test {
 		assertTrue(STORE.submit{value: 1}(PAIR, PACKET));
 		_fill(account);
 		assertApproxEqRel(fund.calcGrossShareValue(), 1e6, 0.002e18);
+	}
+
+	/// Option 3 audit (founder 2026-10-05: price perps only when money moves). With a filled trade on
+	/// a pair that has no usable stored price, which fund operations still work? Each runs from the
+	/// same frozen state. Needs the price: anything that values the perp account — NAV reads, fee
+	/// settlement, deposit execution, cash redemption, and adding to the account. Doesn't: cutting
+	/// risk (close, return cash to the vault), the in-kind exit, spot trades of a fund without a
+	/// NAV-based rule (MaxConcentration and CumulativeSlippage call calcGav, so a fund with either
+	/// needs the price to trade spot too), opening another account, moving shares.
+	function test_fork_whichOperationsNeedAFreshPerpPrice() public {
+		vm.skip(!forked);
+		(ComptrollerV2 fund, address account) = _fundWithPendingOpen();
+		_fill(account);
+		bytes memory neverPushed = abi.encodeWithSelector(VerantaPriceAdapter.NeverPushed.selector, PAIR);
+		address[] memory none = new address[](0);
+		uint256[] memory zero = new uint256[](0);
+
+		// ── needs the perp's price ──
+		_expectFrozen(address(fund), abi.encodeCall(ComptrollerV2.calcGav, ()), neverPushed, 'calcGav');
+		_expectFrozen(address(fund), abi.encodeCall(ComptrollerV2.settleFees, ()), neverPushed, 'settleFees');
+		address[] memory usdc = new address[](1);
+		usdc[0] = USDC;
+		uint256[] memory hundred = new uint256[](1);
+		hundred[0] = 100e6;
+		bytes memory addTrade = abi.encode(
+			uint8(VerantaPerpPositionV3.Action.OpenTrade),
+			abi.encode(PAIR, uint256(100e6), uint256(5e10), true, PACKET_PRICE, uint256(1e10), uint8(0), uint256(0), uint256(0))
+		);
+		vm.prank(manager);
+		_expectFrozen(address(fund), abi.encodeCall(ComptrollerV2.callOnExternalPosition, (account, usdc, hundred, none, addTrade)), neverPushed, 'add to the perp');
+
+		// ── works without it ──
+		uint256 snap = vm.snapshotState();
+		bytes memory close = abi.encode(uint8(VerantaPerpPositionV3.Action.CloseTrade), abi.encode(PAIR, uint256(0), uint256(1e6), PACKET_PRICE));
+		vm.prank(manager);
+		fund.callOnExternalPosition(account, none, zero, none, close); // risk-reducing: priced never
+		vm.prank(manager);
+		fund.callOnExternalPosition(account, none, zero, none, abi.encode(uint8(VerantaPerpPositionV3.Action.ReturnToVault), abi.encode(uint256(0))));
+		vm.prank(manager);
+		fund.callOnIntegration(uniAdapter, abi.encode(USDC, FundsMainnet.WETH, uint24(500), uint256(100e6), uint256(0)));
+		vm.prank(manager);
+		fund.createExternalPosition(PERP_TYPE, '');
+		fund.calcAssetGav(USDC);
+		IERC20 shareToken = IERC20(address(fund.shares()));
+		vm.prank(investor);
+		shareToken.transfer(makeAddr('friend'), 1e18);
+		vm.prank(investor);
+		fund.redeemSharesInKind(1e18);
+		vm.revertToState(snap);
+	}
+
+	/// Rehearsal of the mainnet step (PLAN_PERP_PULL_PRICING step 6) on the live listings: every pair
+	/// priced from the store gets a 10-minute heartbeat in the VI, its adapter unchanged, in one call
+	/// per pair; Chainlink-priced pairs are untouched; a second run does nothing. Then a stored price
+	/// values the fund for 10 minutes and not a second longer — where the old heartbeat (1 hour for
+	/// crypto, 5 days for closed-market pairs like 129) still accepted it.
+	function test_fork_tenMinutePriceLifetime() public {
+		vm.skip(!forked);
+		IVerantaPairCatalog catalog = IVerantaPairCatalog(FundsMainnet.VERANTA_PAIR_STORAGE);
+		uint256 count = catalog.pairsCount();
+		address[] memory aggregatorBefore = new address[](count);
+		uint32[] memory heartbeatBefore = new uint32[](count);
+		uint256 storePriced;
+		for (uint256 i; i < count; ++i) {
+			address marker = pairConfig.pairAsset(i);
+			if (marker == address(0)) continue;
+			(aggregatorBefore[i], heartbeatBefore[i],,) = vi.getAssetInfo(marker);
+			(bool ok, bytes memory s) = aggregatorBefore[i].staticcall(abi.encodeWithSignature('store()'));
+			if (ok && s.length == 32 && abi.decode(s, (address)) == address(STORE)) ++storePriced;
+		}
+		assertGt(storePriced, 150, 'the long tail is store-priced');
+
+		// as the registrar's owner (the deployer until the governance handoff)
+		IValueInterpreterAdmin admin = IValueInterpreterAdmin(vi.owner());
+		vm.startPrank(Ownable(address(admin)).owner());
+		uint256 updated = VerantaListing.setPriceLifetime(STORE, admin, pairConfig, vi, 10 minutes);
+		assertEq(VerantaListing.setPriceLifetime(STORE, admin, pairConfig, vi, 10 minutes), 0, 'a second run is a no-op');
+		vm.stopPrank();
+		assertEq(updated, storePriced, 'every store-priced pair, nothing else');
+
+		for (uint256 i; i < count; ++i) {
+			address marker = pairConfig.pairAsset(i);
+			if (marker == address(0)) continue;
+			(address aggregator, uint32 heartbeat,,) = vi.getAssetInfo(marker);
+			assertEq(aggregator, aggregatorBefore[i], 'same adapter');
+			(bool ok, bytes memory s) = aggregator.staticcall(abi.encodeWithSignature('store()'));
+			bool fromStore = ok && s.length == 32 && abi.decode(s, (address)) == address(STORE);
+			assertEq(heartbeat, fromStore ? 10 minutes : heartbeatBefore[i], fromStore ? 'store pair: 10 minutes' : 'Chainlink pair untouched');
+		}
+
+		// pair 129's price, stored at its publication: good for 600 s, refused at 601
+		address marker129 = pairConfig.pairAsset(PAIR);
+		vm.warp(PACKET_TS + 2);
+		vm.deal(address(this), 1 ether);
+		assertTrue(STORE.submit{value: 1}(PAIR, PACKET));
+		vm.warp(PACKET_TS + 600);
+		assertGt(vi.calcUsdRate(marker129), 0);
+		vm.warp(PACKET_TS + 601);
+		vm.expectRevert(abi.encodeWithSelector(ValueInterpreter.StalePrice.selector, marker129, PACKET_TS));
+		vi.calcUsdRate(marker129);
+		assertEq(heartbeatBefore[PAIR], 5 days, 'before: a 5-day-old price still valued the fund (a closed-market pair)');
+	}
+
+	/// @dev The call must revert with exactly `reason` (the perp's missing price), nothing else.
+	function _expectFrozen(address target, bytes memory call, bytes memory reason, string memory what) internal {
+		(bool ok, bytes memory ret) = target.call(call);
+		assertFalse(ok, string.concat(what, ': should need the price'));
+		assertEq(ret, reason, string.concat(what, ': reverts for the perp price'));
 	}
 
 	/// @dev A ComptrollerV2 fund with 10,000 USDC in, a V3 perp account, and a pending 5× long market

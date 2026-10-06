@@ -716,8 +716,8 @@ contract VerantaPerpPositionV3ForkTest is Test {
 	/// deposits margin with delegatedAction → updateMargin, which Veranta fulfils at once against the
 	/// price it is handed. On mainnet the keeper sent no payload with PYTH_CORE sourcing: Veranta's
 	/// aggregator reverts StalePrice() (0x19abf40e), and an empty PYTH_LAZER payload reverts too. A
-	/// signed Lazer packet (PYTH_LAZER, the verifier's 1 wei fee) deposits while it is under 30 s old:
-	/// 29 s passes, 30 s reverts. funds-keeper now fetches one from Veranta's feed-v3
+	/// signed Lazer packet (PYTH_LAZER, the verifier's 1 wei fee) deposits while it is under 30 s old
+	/// and not newer than the block: 29 s passes, 30 s reverts, 1 s in the future reverts. funds-keeper now fetches one from Veranta's feed-v3
 	/// /v2/pairs/{index}/price-update-data right before each top-up (the source Veranta's SDK uses).
 	function test_fork_keeperMarginTopUpNeedsAFreshLazerPacket() public {
 		vm.skip(!forked || block.number != PINNED_BLOCK);
@@ -761,9 +761,19 @@ contract VerantaPerpPositionV3ForkTest is Test {
 		vm.revertToState(snap);
 
 		// 30 s old: refused, so the keeper must fetch the packet right before sending
+		snap = vm.snapshotState();
 		vm.warp(ETH_PACKET_TS + 30);
 		(ok,) = _topUp(keeper, p, lazer, PYTH_LAZER, 1);
 		assertFalse(ok, '30 s old: reverts');
+		assertEq(_collateral(p), collateral0);
+		vm.revertToState(snap);
+
+		// newer than the block: refused too, and a fresh packet is a second or two ahead of the latest
+		// block, where gas is estimated — so the keeper waits for the chain's clock (price-store.ts
+		// untilChainTime) before sending (2026-10-05)
+		vm.warp(ETH_PACKET_TS - 1);
+		(ok,) = _topUp(keeper, p, lazer, PYTH_LAZER, 1);
+		assertFalse(ok, 'from the future: reverts');
 		assertEq(_collateral(p), collateral0);
 		emit log_named_decimal_uint('collateral before top-up', collateral0, 6);
 	}
