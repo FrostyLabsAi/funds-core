@@ -799,7 +799,7 @@ contract VerantaPerpPositionV3ForkTest is Test {
 		_fill(p);
 		uint256 collateral = _collateral(p);
 		int256 value = _valueAt(p, ETH_PACKET_PRICE);
-		(bool ok, uint256 payout) = _closeAll(fund, p, collateral);
+		(bool ok, uint256 payout) = _close(fund, p, collateral);
 		assertTrue(ok, 'the operator executed the close');
 		assertEq(IVerantaTradingStorage(TRADING_STORAGE).openTradesCount(p, ETH_PAIR), 0, 'fully closed');
 
@@ -813,6 +813,56 @@ contract VerantaPerpPositionV3ForkTest is Test {
 		emit log_named_decimal_int('NAV at the close price', value, 6);
 		emit log_named_decimal_uint('close payout', payout, 6);
 		emit log_named_decimal_int('NAV above payout', gap, 6);
+	}
+
+	// ─── 7. partial close (founder 2026-10-06: "take partial profits") ───────────────
+
+	/// A partial market close is the V3 account's own CloseTrade with less than the full collateral:
+	/// no new action. Closing half of a 5× ETH long of 199.5725 USDC leaves the other half open at the
+	/// same leverage and entry price and pays exactly half of what a full close pays (99.639075 of
+	/// 199.278151, test_fork_navIsAboveTheRealClosePayoutByTheCloseCosts). NAV keeps both legs: the
+	/// payout idle in the account plus the trade still open.
+	/// Veranta has no on-chain floor on what a close leaves: closing all but 0.000001 USDC executes and
+	/// leaves that dust open (it can still be closed). So the terminal refuses a partial close that
+	/// leaves less than the pair's minimum position (the catalog's minLevPosUSDC, $100 of size) and
+	/// offers a full close instead (frosty-terminal lib/perpClose.ts).
+	function test_fork_partialCloseKeepsTheRestOpen() public {
+		vm.skip(!forked || block.number != PINNED_BLOCK);
+		_repoint();
+		Comptroller fund = _fund('V3 partial');
+		address p = _create(fund);
+		_openTrade(fund, p, true, ETH_PACKET_PRICE, 1e10, 200e6);
+		vm.roll(block.number + (ETH_PACKET_TS + 2 - block.timestamp) / 2);
+		vm.warp(ETH_PACKET_TS + 2);
+		_fill(p);
+		IVerantaTradingRouter.Trade memory before = IVerantaTradingStorage(TRADING_STORAGE).openTrades(p, ETH_PAIR, 0);
+		assertEq(before.initialPosToken, 199_572_500);
+		uint256 half = before.initialPosToken / 2;
+
+		uint256 snap = vm.snapshotState();
+		(bool ok, uint256 payout) = _close(fund, p, half);
+		assertTrue(ok, 'the operator executed the partial close');
+		assertEq(payout, 99_639_075, 'half of the full-close payout');
+		assertEq(IVerantaTradingStorage(TRADING_STORAGE).openTradesCount(p, ETH_PAIR), 1, 'the rest stays open');
+		IVerantaTradingRouter.Trade memory rest = IVerantaTradingStorage(TRADING_STORAGE).openTrades(p, ETH_PAIR, 0);
+		assertEq(rest.initialPosToken, before.initialPosToken - half, 'collateral left = collateral - closed');
+		assertEq(rest.leverage, before.leverage, 'same leverage');
+		assertEq(rest.openPrice, before.openPrice, 'same entry price');
+		assertEq(_valueAt(p, ETH_PACKET_PRICE), 199_375_437, 'NAV: the payout + the open half');
+
+		(ok, payout) = _close(fund, p, rest.initialPosToken);
+		assertTrue(ok);
+		assertEq(payout, 99_639_075, 'the second half pays the same');
+		assertEq(IVerantaTradingStorage(TRADING_STORAGE).openTradesCount(p, ETH_PAIR), 0, 'fully closed');
+		vm.revertToState(snap);
+
+		// no on-chain floor: all but 0.000001 USDC closes, and the dust stays open
+		(ok,) = _close(fund, p, before.initialPosToken - 1);
+		assertTrue(ok, 'Veranta executes a close that leaves dust');
+		assertEq(IVerantaTradingStorage(TRADING_STORAGE).openTrades(p, ETH_PAIR, 0).initialPosToken, 1, 'dust left open');
+		(ok,) = _close(fund, p, 1);
+		assertTrue(ok, 'the dust can still be closed');
+		assertEq(IVerantaTradingStorage(TRADING_STORAGE).openTradesCount(p, ETH_PAIR), 0);
 	}
 
 	// ─── helpers ─────────────────────────────────────────────────────────────────
@@ -830,12 +880,13 @@ contract VerantaPerpPositionV3ForkTest is Test {
 		}
 	}
 
-	/// @dev Close the account's ETH trade through the fund, then fill the close as Veranta's operator
-	///      does, at the real packet. Returns the USDC the close paid the account.
-	function _closeAll(Comptroller fund, address position, uint256 collateral) internal returns (bool ok, uint256 payout) {
+	/// @dev Close `amount` of the account's ETH trade's collateral (all of it = a full close) through the
+	///      fund, then fill the close as Veranta's operator does, at the real packet. Returns the USDC the
+	///      close paid the account.
+	function _close(Comptroller fund, address position, uint256 amount) internal returns (bool ok, uint256 payout) {
 		uint256 usdc0 = IERC20(USDC).balanceOf(position);
 		bytes memory close = abi.encode(
-			uint8(VerantaPerpPositionV3.Action.CloseTrade), abi.encode(ETH_PAIR, uint256(0), collateral, ETH_PACKET_PRICE)
+			uint8(VerantaPerpPositionV3.Action.CloseTrade), abi.encode(ETH_PAIR, uint256(0), amount, ETH_PACKET_PRICE)
 		);
 		vm.prank(manager);
 		fund.callOnExternalPosition(position, new address[](0), new uint256[](0), new address[](0), close);
