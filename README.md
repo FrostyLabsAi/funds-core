@@ -49,11 +49,11 @@ different signature, do not swap it in). Then:
 ## Hard rules (from the post-mortems and spec — see living doc for sources)
 
 1. Share pricing comes from oracle feeds via ValueInterpreter ONLY — never pool spot state / currentTick (Gamma, Jan 2024).
-2. Deposits and redemptions are async (request → execute at a NAV epoch inside market-hours windows). Nothing mints or burns shares atomically with a deposit (kills flash-loan loops and weekend NAV gaming).
+2. Deposits are async (request → execute at the next NAV). Nothing mints shares atomically with a deposit (kills flash-loan loops and weekend NAV gaming). Redemptions of a fund holding external positions (perps, LPs) are async too: request → settle through the RedemptionQueue once the vault can pay (fund v3, 2026-10-06); a pure-spot fund redeems at once.
 3. Tokenized-stock wrappers are never priced 1:1 with their underlying — every wrapper gets its own feed; depeg is a modeled state.
 4. Every asset state (idle, in-range, out-of-range, in-flight, external) is explicitly in or out of GAV. No silent residue.
 5. Risk parameters get bytecode-level hard caps (frosty-core discipline). Config is attack surface.
-6. Funds holding external positions use specific-assets redemption as canonical exit; in-kind forfeits external-position value.
+6. Funds holding external positions exit through the RedemptionQueue (cash or in kind, at the NAV of settlement; a switched-off fallback can unwind an overdue request's share of the perps). In kind (`redeemSharesInKind`) stays open to everyone, always, and forfeits external-position value. Exits are never gated by the protocol, a pause, the guardian or an oracle (a token whose price can't be read is paid in kind); a manager can delay a queued redemption, and past its 4-day deadline the manager's fees stop. The fallback never forfeits: what the vault can't cover stays queued.
 
 ## melon-v1 coverage — every file accounted for (65/65)
 
