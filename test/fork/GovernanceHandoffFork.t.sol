@@ -20,6 +20,9 @@ import {CompounderFactory} from '../../src/yield/CompounderFactory.sol';
 import {FundsMainnet} from '../../script/mainnet/FundsMainnet.sol';
 import {FundsGovernance} from '../../script/mainnet/FundsGovernance.sol';
 import {FinishFundsGovernance, VerifyFundsGovernance} from '../../script/mainnet/TransferFundsGovernance.s.sol';
+import {RedemptionDeploy} from '../../script/mainnet/RedemptionDeploy.sol';
+import {RedemptionQueue} from '../../src/redemption/RedemptionQueue.sol';
+import {VerantaPriceStore} from '../../src/pricing/VerantaPriceStore.sol';
 
 /// @notice THE LAUNCH-DAY HANDOFF, rehearsed on the LIVE Base deployment (PLAN_GOVERNANCE_HANDOFF_2026-10-04),
 ///         pinned after the pool-pricing switch-over and before any handoff: the deployer runs
@@ -172,6 +175,49 @@ contract GovernanceHandoffForkTest is Test {
 		c.factory.setCreator(LISTER, true);
 		vm.expectRevert(abi.encodeWithSelector(FundsGovernance.HoldsCompounderRole.selector, LISTER));
 		this.verifyExternal();
+	}
+
+	/// The redemption queue (founder 2026-10-06), deployed and switched to before the handoff, moves to
+	/// the timelock with the rest; verify accepts fund v3 as the new-fund version and checks the
+	/// queue's wiring. Afterwards the guardian may still switch the approved unwinder on, only the
+	/// timelock switches it off, and the deployer can do neither.
+	function test_fork_handoffIncludesTheRedemptionQueue() public {
+		vm.skip(!forked);
+		VerantaPriceStore store =
+			VerantaPriceStore(vm.parseJsonAddress(vm.readFile('deployments/base-mainnet-veranta.json'), '.store'));
+		vm.startPrank(deployer);
+		RedemptionDeploy.Deployed memory q =
+			RedemptionDeploy.deploy(deployer, address(d.factory), address(d.verantaFactory), p.registrar, store);
+		d.factory.setComptrollerDeployer(q.fundV3Deployer);
+		p.redemptionQueue = address(q.queue);
+		p.fundV3Deployer = address(q.fundV3Deployer);
+		FundsGovernance.start(d, p, c, r, address(TIMELOCK));
+		vm.stopPrank();
+
+		address[] memory owned = FundsGovernance.owned(d, p, c, r);
+		assertEq(owned.length, 10, 'the nine plus the queue');
+		assertEq(owned[9], address(q.queue));
+		(address[] memory targets, uint256[] memory values, bytes[] memory payloads) = FundsGovernance.acceptBatch(d, p, c, r);
+		vm.prank(SAFE);
+		TIMELOCK.scheduleBatch(targets, values, payloads, bytes32(0), SALT, 2 days);
+		skip(2 days);
+		_restamp(FundsMainnet.USDC);
+		_restamp(FundsMainnet.WETH);
+		TIMELOCK.executeBatch(targets, values, payloads, bytes32(0), SALT);
+		this.verifyExternal();
+		assertEq(q.queue.owner(), address(TIMELOCK));
+
+		vm.prank(d.factory.guardian());
+		q.queue.setUnwinderOn(address(q.perpUnwinder), true);
+		vm.prank(deployer);
+		vm.expectRevert(RedemptionQueue.OnlyOwnerSwitchesOff.selector);
+		q.queue.setUnwinderOn(address(q.perpUnwinder), false);
+		vm.prank(deployer);
+		vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, deployer));
+		q.queue.approveUnwinder(address(1), true);
+		vm.prank(address(TIMELOCK));
+		q.queue.setUnwinderOn(address(q.perpUnwinder), false);
+		assertFalse(q.queue.isUnwinderOn(address(q.perpUnwinder)));
 	}
 
 	/// @dev external so a revert can be expected (library calls are inlined)

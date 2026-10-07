@@ -32,6 +32,14 @@ library FundValuation {
 		bool[] inKind; // pool-priced, or its price can't be read now
 	}
 
+	/// @dev Each holding's balance and value and the positions' total, from the same pass: what
+	///      fund v3's redemption queue pays from (2026-10-07: one valuation per settlement).
+	struct Detail {
+		uint256[] balances;
+		uint256[] values; // 0 where unreadable
+		uint256 positionsValue;
+	}
+
 	/// @dev Unrealized long-tail gains don't count toward the fee GAV until sold; losses count at
 	///      once. A price that can't be read bubbles its revert unless `tolerant`, which marks the
 	///      holding in kind and the valuation incomplete instead. Positions always revert.
@@ -42,18 +50,43 @@ library FundValuation {
 		Context memory ctx,
 		bool tolerant
 	) external returns (Valuation memory v) {
+		(v,) = _value(trackedAssets, externalPositions, costBasis, ctx, tolerant);
+	}
+
+	/// @notice `value` plus each holding's balance and value and the positions' total.
+	function valueDetailed(
+		EnumerableSet.AddressSet storage trackedAssets,
+		EnumerableSet.AddressSet storage externalPositions,
+		mapping(address => uint256) storage costBasis,
+		Context memory ctx,
+		bool tolerant
+	) external returns (Valuation memory v, Detail memory d) {
+		return _value(trackedAssets, externalPositions, costBasis, ctx, tolerant);
+	}
+
+	function _value(
+		EnumerableSet.AddressSet storage trackedAssets,
+		EnumerableSet.AddressSet storage externalPositions,
+		mapping(address => uint256) storage costBasis,
+		Context memory ctx,
+		bool tolerant
+	) private returns (Valuation memory v, Detail memory d) {
 		v.assets = trackedAssets.values();
 		v.inKind = new bool[](v.assets.length);
+		d.balances = new uint256[](v.assets.length);
+		d.values = new uint256[](v.assets.length);
 		v.complete = true;
 		for (uint256 i; i < v.assets.length; ++i) {
 			address asset = v.assets[i];
 			uint256 balance = IERC20(asset).balanceOf(ctx.vault);
+			d.balances[i] = balance;
 			if (balance == 0) continue;
 			bool poolPriced = ctx.registrar.poolPricedAdapter(asset) != address(0);
 			v.inKind[i] = poolPriced;
 			try ctx.valueInterpreter.calcCanonicalAssetValue(asset, balance, ctx.denominationAsset) returns (
 				uint256 assetValue
 			) {
+				d.values[i] = assetValue;
 				v.gav += assetValue;
 				v.feeGav += poolPriced ? Math.min(assetValue, costBasis[asset]) : assetValue;
 				if (!poolPriced) v.cashValue += assetValue;
@@ -70,11 +103,11 @@ library FundValuation {
 
 		uint256 positionCount = externalPositions.length();
 		for (uint256 i; i < positionCount; ++i) {
-			uint256 positionsValue = positionValue(IExternalPosition(externalPositions.at(i)), ctx);
-			v.gav += positionsValue;
-			v.feeGav += positionsValue;
-			v.cashValue += positionsValue;
+			d.positionsValue += positionValue(IExternalPosition(externalPositions.at(i)), ctx);
 		}
+		v.gav += d.positionsValue;
+		v.feeGav += d.positionsValue;
+		v.cashValue += d.positionsValue;
 	}
 
 	/// @notice Keep long-tail cost bases in step with a trade: bought pool-priced units add their

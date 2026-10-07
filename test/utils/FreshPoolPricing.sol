@@ -23,6 +23,8 @@ library FreshPoolPricing {
 		PoolPricing.Deployment memory p = takeOverVi(d, owner);
 		PoolPricing.setMandatoryPolicy(d.factory, p.policy);
 		PoolPricing.setFundVersion(d.factory, p.fundDeployer);
-		g = FundsGovernance.PoolPricing({registrar: p.registrar, policy: p.policy, fundDeployer: address(p.fundDeployer)});
+		g = FundsGovernance.PoolPricing({
+			registrar: p.registrar, policy: p.policy, fundDeployer: address(p.fundDeployer), fundV3Deployer: address(0), redemptionQueue: address(0)
+		});
 	}
 }

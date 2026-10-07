@@ -10,6 +10,7 @@ import {MinPoolLiquidityPolicy} from '../../src/policies/MinPoolLiquidityPolicy.
 import {CompounderFactory} from '../../src/yield/CompounderFactory.sol';
 import {SlipstreamLPPositionV2Factory} from '../../src/positions/SlipstreamLPPositionV2.sol';
 import {VerantaPerpPositionV3Factory} from '../../src/positions/VerantaPerpPositionV3.sol';
+import {RedemptionQueue} from '../../src/redemption/RedemptionQueue.sol';
 import {FundsMainnet} from './FundsMainnet.sol';
 
 /// @title FundsGovernance
@@ -41,6 +42,9 @@ library FundsGovernance {
 		PoolPriceRegistrar registrar; // owns the VI
 		MinPoolLiquidityPolicy policy; // the only mandatory policy, on every hook it implements
 		address fundDeployer; // ComptrollerBlueprintDeployer (fund v2): every new fund
+		// the redemption queue (deployments/base-mainnet-redemption.json, founder 2026-10-06); zero until deployed
+		address fundV3Deployer; // ComptrollerBlueprintDeployer (fund v3, bound to the queue)
+		address redemptionQueue; // Ownable2Step: hands off with the rest
 	}
 
 	/// @notice Fee compounders + re-pointed position types (CompoundersMainnet.Deployed); `factory` zero = not deployed.
@@ -75,6 +79,7 @@ library FundsGovernance {
 	error PositionTypeNotRepointed(uint256 typeId, address factory);
 	error PerpFactoryHasOwner(address factory);
 	error PerpConfigMismatch(address config);
+	error QueueNotWired(address factory);
 
 	/// @notice Every Ownable2Step owner to hand off: the registrar (owns the VI) instead of the VI,
 	///         the FundFactory, the V2 perp config, the fee reserve only when genesis made one (FROST
@@ -88,7 +93,8 @@ library FundsGovernance {
 		bool reserve = address(d.feeReserve) != address(0);
 		bool compounders = address(c.factory) != address(0);
 		uint256 retired = (r.registryV1 != address(0) ? 1 : 0) + (r.module != address(0) ? 1 : 0) + (r.registryV2 != address(0) ? 1 : 0);
-		o = new address[](3 + (compounders ? 3 : 0) + (reserve ? 1 : 0) + retired);
+		bool queue = p.redemptionQueue != address(0);
+		o = new address[](3 + (compounders ? 3 : 0) + (reserve ? 1 : 0) + retired + (queue ? 1 : 0));
 		uint256 n;
 		o[n++] = address(p.registrar);
 		o[n++] = address(d.factory);
@@ -101,7 +107,8 @@ library FundsGovernance {
 		if (reserve) o[n++] = address(d.feeReserve);
 		if (r.registryV1 != address(0)) o[n++] = r.registryV1;
 		if (r.module != address(0)) o[n++] = r.module;
-		if (r.registryV2 != address(0)) o[n] = r.registryV2;
+		if (r.registryV2 != address(0)) o[n++] = r.registryV2;
+		if (queue) o[n] = p.redemptionQueue;
 	}
 
 	/// @notice EOA step: the retired lister loses its compounder roles, two-step transfers begin.
@@ -163,7 +170,13 @@ library FundsGovernance {
 		if (d.verantaFactory.autopilotKeeper() == deployer || keeper == deployer) revert DeployerIsKeeper();
 		_requireMandatoryPolicy(d.factory, p.policy);
 		address comptrollerDeployer = address(d.factory.comptrollerDeployer());
-		if (comptrollerDeployer != p.fundDeployer) revert NotFundV2(comptrollerDeployer);
+		// new funds are fund v2, or fund v3 once the redemption queue is deployed and switched to
+		if (comptrollerDeployer != p.fundDeployer && (p.fundV3Deployer == address(0) || comptrollerDeployer != p.fundV3Deployer)) {
+			revert NotFundV2(comptrollerDeployer);
+		}
+		if (p.redemptionQueue != address(0) && address(RedemptionQueue(p.redemptionQueue).factory()) != address(d.factory)) {
+			revert QueueNotWired(address(RedemptionQueue(p.redemptionQueue).factory()));
+		}
 		if (address(d.valueInterpreter.sequencerUptimeFeed()) != FundsMainnet.CL_SEQUENCER_UPTIME) revert SequencerCheckOff();
 		if (address(c.factory) != address(0)) _verifyCompounders(d, c, deployer, r.lister);
 	}

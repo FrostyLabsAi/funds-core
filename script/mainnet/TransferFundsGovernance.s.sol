@@ -27,6 +27,8 @@ abstract contract FundsGovernanceBase is Script {
 	string internal constant COMPOUNDERS_FILE = 'deployments/base-mainnet-compounders.json';
 	/// @dev The retired TWAP listing v2 (module + registry); absent = never deployed.
 	string internal constant TWAP_V2_FILE = 'deployments/base-mainnet-twap-v2.json';
+	/// @dev The redemption queue (DeployRedemptionQueue), handed off with the rest once it exists.
+	string internal constant REDEMPTION_FILE = 'deployments/base-mainnet-redemption.json';
 	/// @dev "Keeper · Lister", the funds-keeper lister's Engine wallet (removed 2026-10-04): it still
 	///      holds the CompounderFactory creator role, which {FundsGovernance.start} revokes.
 	address internal constant RETIRED_LISTER = 0x9B2C5B835eAeA359A7871e58be857D57277E646F;
@@ -57,6 +59,14 @@ abstract contract FundsGovernanceBase is Script {
 		p.registrar = PoolPriceRegistrar(vm.parseJsonAddress(json, '.registrar'));
 		p.policy = MinPoolLiquidityPolicy(vm.parseJsonAddress(json, '.policy'));
 		p.fundDeployer = vm.parseJsonAddress(json, '.fundDeployer');
+		if (vm.exists(REDEMPTION_FILE)) {
+			string memory redemption = vm.readFile(REDEMPTION_FILE);
+			p.redemptionQueue = vm.parseJsonAddress(redemption, '.queue');
+			p.fundV3Deployer = vm.parseJsonAddress(redemption, '.fundV3Deployer');
+			console2.log('redemption queue:', REDEMPTION_FILE);
+			console2.log('  RedemptionQueue (hands off)', p.redemptionQueue);
+			console2.log('  fund v3 deployer', p.fundV3Deployer);
+		}
 		console2.log('pool pricing:', file);
 		console2.log('  PoolPriceRegistrar (owns the ValueInterpreter)', address(p.registrar));
 		console2.log('  MinPoolLiquidityPolicy (every mandatory entry)', address(p.policy));
@@ -152,6 +162,7 @@ contract StartFundsGovernance is FundsGovernanceBase {
 			'PoolPriceRegistrar (owns the ValueInterpreter), FundFactory, VerantaPerpPositionV2Factory',
 			address(c.factory) != address(0) ? ', CompounderFactory, SlipstreamLPPositionV2Factory x2 (types 4, 7)' : '',
 			address(d.feeReserve) != address(0) ? ', ProtocolFeeReserve' : '',
+			p.redemptionQueue != address(0) ? ', RedemptionQueue' : '',
 			' and the retired TWAP tier (TwapListingRegistry, PriceListingModule, TwapListingRegistryV2). ',
 			'Execute after the delay with FinishFundsGovernance (anyone).","createdFromSafeAddress":"',
 			vm.toString(safe),
