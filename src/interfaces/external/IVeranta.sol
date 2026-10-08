@@ -156,3 +156,50 @@ interface IVerantaReferral {
 	function setTraderReferralCodeByUser(bytes32 code) external;
 	function traderReferralCodes(address trader) external view returns (bytes32);
 }
+
+/// @notice Veranta TradingStorage pending-order reads (impl 0x7175…6c64, verified source, read 2026-10-08).
+///         Market orders waiting for the operator live in two mappings: plain opens/closes (what
+///         Multicall.getPendingOrder decodes) and coin-sized opens (openTradeWithCoinExposure), which
+///         getPendingOrder returns zeroed. The per-pair counters cover both.
+interface IVerantaPendingOrders {
+	/// @dev TradingStorage.PendingMarketOrderWithCoinExposure; escrowed collateral in trade.positionSizeUSDC.
+	struct PendingCoinOrder {
+		IVerantaTradingRouter.Trade trade;
+		uint256 blockNumber;
+		uint256 wantedPrice;
+		uint256 slippageP;
+		uint256 coinExposure;
+		uint256 maxLeverage;
+		uint256 minLeverage;
+	}
+
+	function pendingMarketOpenCount(address trader, uint256 pairIndex) external view returns (uint256);
+	function pendingMarketCloseCount(address trader, uint256 pairIndex) external view returns (uint256);
+	function reqIdPendingMarketOrderWithCoinExposure(uint256 orderId) external view returns (PendingCoinOrder memory);
+}
+
+/// @notice Veranta PairStorage cost reads (impl 0x2511…cad0, verified source, read 2026-10-08). 1e10 = 1%.
+interface IVerantaPairCosts {
+	/// @dev The public `additionalPairParams2` getter's leading fields (AdditionalPairParams2: the open/close
+	///      maker and taker fee rates). Veranta's pairCloseFeeP picks maker, taker or a blend from live
+	///      open-interest skew (PairStorageExtension 0xbfB5…cC1b, `_makerOrTakerFee`); the rates themselves
+	///      are plain storage on PairStorage.
+	function additionalPairParams2(uint256 pairIndex)
+		external
+		view
+		returns (uint256 openMakerFeeP, uint256 closeMakerFeeP, uint256 openTakerFeeP, uint256 closeTakerFeeP);
+
+	/// @dev The public `pairs` getter's leading static fields (Feed{maxOpenDeviationP, maxCloseDeviationP,
+	///      feedId}, BackupFeed{maxDeviationP, feedId}, spreadP); the fields after spreadP are ignored.
+	function pairs(uint256 pairIndex)
+		external
+		view
+		returns (
+			uint256 maxOpenDeviationP,
+			uint256 maxCloseDeviationP,
+			bytes32 feedId,
+			uint256 backupMaxDeviationP,
+			address backupFeed,
+			uint256 spreadP
+		);
+}

@@ -108,6 +108,7 @@ contract MockVeranta is
 		external
 		payable
 	{
+		marginFeesPaid += msg.value;
 		address trader = _trader();
 		for (uint256 i; i < _trades.length; ++i) {
 			Trade storage t = _trades[i].trade;
@@ -228,6 +229,43 @@ contract MockVeranta is
 
 	function setFundingFee(uint256 pairIndex, uint256 index, int256 fee) external {
 		fundingFee[pairIndex][index] = fee;
+	}
+
+	/// @dev Veranta PairStorage cost reads (IVerantaPairCosts): per-pair close maker/taker fee rates and base
+	///      spread, 1e10 = 1%
+	mapping(uint256 => uint256) public closeMakerFeeOf;
+	mapping(uint256 => uint256) public closeTakerFeeOf;
+	mapping(uint256 => uint256) public spreadOf;
+	/// @dev msg.value the margin path received (the Lazer verification fee)
+	uint256 public marginFeesPaid;
+
+	function setCloseFees(uint256 pairIndex, uint256 makerP, uint256 takerP) external {
+		closeMakerFeeOf[pairIndex] = makerP;
+		closeTakerFeeOf[pairIndex] = takerP;
+	}
+
+	function setSpreadP(uint256 pairIndex, uint256 p) external {
+		spreadOf[pairIndex] = p;
+	}
+
+	/// @dev Veranta TradingStorage per-pair pending counters (IVerantaPendingOrders): the mock fills closes
+	///      instantly, so only opens are ever pending; it has no coin-sized orders.
+	function pendingMarketOpenCount(address trader, uint256 pairIndex) external view returns (uint256 count) {
+		for (uint256 i; i < _pending.length; ++i) {
+			if (_pending[i].orderInfo.trade.trader == trader && _pending[i].orderInfo.trade.pairIndex == pairIndex) ++count;
+		}
+	}
+
+	function pendingMarketCloseCount(address, uint256) external pure returns (uint256) {
+		return 0;
+	}
+
+	function additionalPairParams2(uint256 pairIndex) external view returns (uint256, uint256, uint256, uint256) {
+		return (0, closeMakerFeeOf[pairIndex], 0, closeTakerFeeOf[pairIndex]);
+	}
+
+	function pairs(uint256 pairIndex) external view returns (uint256, uint256, bytes32, uint256, address, uint256) {
+		return (0, 0, bytes32(0), 0, address(0), spreadOf[pairIndex]);
 	}
 
 	function pushLimitOrder(address trader, uint256 pairIndex, uint256 index, uint256 positionSize) external {
