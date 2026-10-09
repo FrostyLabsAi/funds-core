@@ -61,7 +61,7 @@ contract ComptrollerV3Test is Test {
 	address internal attacker = makeAddr('attacker');
 	uint256 internal nonce;
 
-	function setUp() public {
+	function setUp() public virtual {
 		vm.warp(30 days);
 		usdc = new MockERC20('USD Coin', 'USDC', 6);
 		weth = new MockERC20('Wrapped Ether', 'WETH', 18);
@@ -543,7 +543,7 @@ contract ComptrollerV3Test is Test {
 		fund.redeemShares(1e18);
 	}
 
-	function test_inKindExit_staysOpenWithPositionsHeld() public {
+	function test_inKindExit_staysOpenWithPositionsHeld() public virtual {
 		(ComptrollerV3 fund,) = _fundWithUnwindPosition();
 		uint256 tenth = _sharesOf(fund, alice) / 10;
 		uint256 expected = 6_000e6 * tenth / fund.shares().totalSupply(); // the vault's 6,000 only
