@@ -8,6 +8,8 @@ import {FundFactory} from '../../src/core/FundFactory.sol';
 import {ProtocolFeeReserve} from '../../src/core/ProtocolFeeReserve.sol';
 import {VerantaPerpPositionV2Factory} from '../../src/positions/VerantaPerpPositionV2.sol';
 import {PoolPriceRegistrar} from '../../src/pricing/PoolPriceRegistrar.sol';
+import {PoolPriceRegistrarV2} from '../../src/pricing/PoolPriceRegistrarV2.sol';
+import {V4PriceSampler} from '../../src/pricing/V4PriceSampler.sol';
 import {MinPoolLiquidityPolicy} from '../../src/policies/MinPoolLiquidityPolicy.sol';
 import {CompounderFactory} from '../../src/yield/CompounderFactory.sol';
 import {SlipstreamLPPositionV2Factory} from '../../src/positions/SlipstreamLPPositionV2.sol';
@@ -29,6 +31,8 @@ abstract contract FundsGovernanceBase is Script {
 	string internal constant TWAP_V2_FILE = 'deployments/base-mainnet-twap-v2.json';
 	/// @dev The redemption queue (DeployRedemptionQueue), handed off with the rest once it exists.
 	string internal constant REDEMPTION_FILE = 'deployments/base-mainnet-redemption.json';
+	/// @dev Uniswap v4 pricing (DeployV4Pricing); once it exists, registrar V2 hands off in the registrar's place.
+	string internal constant V4_FILE = 'deployments/base-mainnet-v4.json';
 	/// @dev "Keeper · Lister", the funds-keeper lister's Engine wallet (removed 2026-10-04): it still
 	///      holds the CompounderFactory creator role, which {FundsGovernance.start} revokes.
 	address internal constant RETIRED_LISTER = 0x9B2C5B835eAeA359A7871e58be857D57277E646F;
@@ -71,6 +75,29 @@ abstract contract FundsGovernanceBase is Script {
 		console2.log('  PoolPriceRegistrar (owns the ValueInterpreter)', address(p.registrar));
 		console2.log('  MinPoolLiquidityPolicy (every mandatory entry)', address(p.policy));
 		console2.log('  fund v2 deployer (new funds)', p.fundDeployer);
+		_loadV4(p);
+	}
+
+	/// @dev Uniswap v4 pricing from V4_FILE when it exists; otherwise its fields stay zero (not deployed).
+	function _loadV4(FundsGovernance.PoolPricing memory p) internal view {
+		string memory file = vm.envOr('V4_FILE', string(V4_FILE));
+		if (!vm.exists(file)) return;
+		string memory json = vm.readFile(file);
+		p.registrarV2 = PoolPriceRegistrarV2(vm.parseJsonAddress(json, '.registrar'));
+		p.sampler = V4PriceSampler(vm.parseJsonAddress(json, '.sampler'));
+		p.v4Adapters[0] = vm.parseJsonAddress(json, '.v4Adapter');
+		p.v4Adapters[1] = vm.parseJsonAddress(json, '.uniAdapter');
+		p.v4Adapters[2] = vm.parseJsonAddress(json, '.slipstreamAdapter');
+		p.v4Adapters[3] = vm.parseJsonAddress(json, '.slipstream2Adapter');
+		p.v4Adapters[4] = vm.parseJsonAddress(json, '.slipstream3Adapter');
+		p.v4Adapters[5] = vm.parseJsonAddress(json, '.aerodromeBasicAdapter');
+		p.policyV2 = MinPoolLiquidityPolicy(vm.parseJsonAddress(json, '.policy'));
+		p.registrarV2FundDeployer = vm.parseJsonAddress(json, '.fundDeployer');
+		console2.log('uniswap v4:', file);
+		console2.log('  PoolPriceRegistrarV2 (owns the PoolPriceRegistrar; hands off in its place)', address(p.registrarV2));
+		console2.log('  V4PriceSampler (hands off)', address(p.sampler));
+		console2.log('  MinPoolLiquidityPolicy on registrar V2 (every mandatory entry)', address(p.policyV2));
+		console2.log('  fund v3 deployer on registrar V2 (new funds)', p.registrarV2FundDeployer);
 	}
 
 	/// @dev The fee compounders from COMPOUNDERS_FILE when it exists; otherwise the zero struct.
@@ -158,13 +185,9 @@ contract StartFundsGovernance is FundsGovernanceBase {
 			abi.encodeCall(TimelockController.scheduleBatch, (targets, values, payloads, bytes32(0), SALT, timelock.getMinDelay()));
 		string memory out = string.concat(
 			'{"version":"1.0","chainId":"', vm.toString(block.chainid),
-			'","meta":{"name":"FrostyFunds governance handoff - schedule acceptOwnership","description":"Timelock accepts ownership of ',
-			'PoolPriceRegistrar (owns the ValueInterpreter), FundFactory, VerantaPerpPositionV2Factory',
-			address(c.factory) != address(0) ? ', CompounderFactory, SlipstreamLPPositionV2Factory x2 (types 4, 7)' : '',
-			address(d.feeReserve) != address(0) ? ', ProtocolFeeReserve' : '',
-			p.redemptionQueue != address(0) ? ', RedemptionQueue' : '',
-			' and the retired TWAP tier (TwapListingRegistry, PriceListingModule, TwapListingRegistryV2). ',
-			'Execute after the delay with FinishFundsGovernance (anyone).","createdFromSafeAddress":"',
+			'","meta":{"name":"FrostyFunds governance handoff - schedule acceptOwnership","description":"',
+			_description(d, p, c),
+			'","createdFromSafeAddress":"',
 			vm.toString(safe),
 			'"},"transactions":[{"to":"', vm.toString(address(timelock)), '","value":"0","data":"', vm.toString(schedule),
 			'","contractMethod":null,"contractInputsValues":null}]}'
@@ -173,6 +196,26 @@ contract StartFundsGovernance is FundsGovernanceBase {
 		vm.writeFile(safeFile, out);
 		console2.log('Safe batch written to', safeFile);
 		console2.log('then after the delay (seconds):', timelock.getMinDelay());
+	}
+
+	/// @dev The batch's description (its own frame: stack depth).
+	function _description(
+		FundsMainnet.Deployed memory d,
+		FundsGovernance.PoolPricing memory p,
+		FundsGovernance.Compounders memory c
+	) internal pure returns (string memory) {
+		return string.concat(
+			'Timelock accepts ownership of ',
+			address(p.registrarV2) != address(0)
+				? 'PoolPriceRegistrarV2 (owns the PoolPriceRegistrar, which owns the ValueInterpreter), V4PriceSampler, the six fee-taking spot adapters, '
+				: 'PoolPriceRegistrar (owns the ValueInterpreter), ',
+			'FundFactory, VerantaPerpPositionV2Factory',
+			address(c.factory) != address(0) ? ', CompounderFactory, SlipstreamLPPositionV2Factory x2 (types 4, 7)' : '',
+			address(d.feeReserve) != address(0) ? ', ProtocolFeeReserve' : '',
+			p.redemptionQueue != address(0) ? ', RedemptionQueue' : '',
+			' and the retired TWAP tier (TwapListingRegistry, PriceListingModule, TwapListingRegistryV2). ',
+			'Execute after the delay with FinishFundsGovernance (anyone).'
+		);
 	}
 }
 

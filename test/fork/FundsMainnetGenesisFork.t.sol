@@ -218,13 +218,9 @@ contract FundsMainnetGenesisForkTest is Test {
 	function test_fork_handoffRefusesBeforeTheRegistrarOwnsTheVi() public {
 		vm.skip(!forked);
 		vm.startPrank(deployer);
-		FundsGovernance.PoolPricing memory notYet = FundsGovernance.PoolPricing({
-			registrar: FreshPoolPricing.takeOverVi(d, deployer).registrar,
-			policy: pp.policy,
-			fundDeployer: address(0),
-			fundV3Deployer: address(0),
-			redemptionQueue: address(0)
-		});
+		FundsGovernance.PoolPricing memory notYet;
+		notYet.registrar = FreshPoolPricing.takeOverVi(d, deployer).registrar;
+		notYet.policy = pp.policy;
 		// the registrar exists but hands the VI back (a takeover undone): start refuses, nothing moves
 		notYet.registrar.execute(abi.encodeCall(Ownable2Step.transferOwnership, (deployer)));
 		d.valueInterpreter.acceptOwnership();
