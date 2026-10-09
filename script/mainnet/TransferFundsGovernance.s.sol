@@ -33,6 +33,8 @@ abstract contract FundsGovernanceBase is Script {
 	string internal constant REDEMPTION_FILE = 'deployments/base-mainnet-redemption.json';
 	/// @dev Uniswap v4 pricing (DeployV4Pricing); once it exists, registrar V2 hands off in the registrar's place.
 	string internal constant V4_FILE = 'deployments/base-mainnet-v4.json';
+	/// @dev DeployComptrollerV5.s.sol (fund v5: in kind pays the whole value, 2026-10-09); absent = new funds stay v4.
+	string internal constant V5_FILE = 'deployments/base-mainnet-comptroller-v5.json';
 	/// @dev "Keeper · Lister", the funds-keeper lister's Engine wallet (removed 2026-10-04): it still
 	///      holds the CompounderFactory creator role, which {FundsGovernance.start} revokes.
 	address internal constant RETIRED_LISTER = 0x9B2C5B835eAeA359A7871e58be857D57277E646F;
@@ -93,11 +95,13 @@ abstract contract FundsGovernanceBase is Script {
 		p.v4Adapters[5] = vm.parseJsonAddress(json, '.aerodromeBasicAdapter');
 		p.policyV2 = MinPoolLiquidityPolicy(vm.parseJsonAddress(json, '.policy'));
 		p.registrarV2FundDeployer = vm.parseJsonAddress(json, '.fundDeployer');
+		// fund v5 (in kind pays the whole value, 2026-10-09) replaces the v4 rollout's deployer once deployed
+		if (vm.exists(V5_FILE)) p.registrarV2FundDeployer = vm.parseJsonAddress(vm.readFile(V5_FILE), '.fundV5Deployer');
 		console2.log('uniswap v4:', file);
 		console2.log('  PoolPriceRegistrarV2 (owns the PoolPriceRegistrar; hands off in its place)', address(p.registrarV2));
 		console2.log('  V4PriceSampler (hands off)', address(p.sampler));
 		console2.log('  MinPoolLiquidityPolicy on registrar V2 (every mandatory entry)', address(p.policyV2));
-		console2.log('  fund v3 deployer on registrar V2 (new funds)', p.registrarV2FundDeployer);
+		console2.log('  fund deployer on registrar V2 (new funds: v4, or v5 from base-mainnet-comptroller-v5.json)', p.registrarV2FundDeployer);
 	}
 
 	/// @dev The fee compounders from COMPOUNDERS_FILE when it exists; otherwise the zero struct.

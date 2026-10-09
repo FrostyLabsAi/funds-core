@@ -108,7 +108,7 @@ contract ComptrollerV3 is ReentrancyGuard {
 	bool public ownerDepositsPaused; // toggle, fundOwner: subscriptions closed
 	bool public guardianDepositsPaused; // set via factory: guardian pauses instantly, only factory owner unpauses
 
-	EnumerableSet.AddressSet private trackedAssets;
+	EnumerableSet.AddressSet internal trackedAssets;
 	EnumerableSet.AddressSet internal externalPositions;
 
 	uint256 public highWaterMark; // gross share price (denomination units per SHARES_UNIT)
@@ -393,7 +393,7 @@ contract ComptrollerV3 is ReentrancyGuard {
 
 	/// @notice Guaranteed exit: a pro-rata slice of every tracked asset. Needs no prices and runs
 	///         no policies; skips the performance fee and forfeits external-position value.
-	function redeemSharesInKind(uint256 sharesAmount) external nonReentrant {
+	function redeemSharesInKind(uint256 sharesAmount) external virtual nonReentrant {
 		_redeemSharesInKind(sharesAmount, new address[](0));
 	}
 
@@ -401,6 +401,7 @@ contract ComptrollerV3 is ReentrancyGuard {
 	///         asset can't block the exit. Skipped value stays with the remaining holders.
 	function redeemSharesInKindWithSkips(uint256 sharesAmount, address[] calldata assetsToSkip)
 		external
+		virtual
 		nonReentrant
 	{
 		_redeemSharesInKind(sharesAmount, assetsToSkip);
@@ -546,7 +547,7 @@ contract ComptrollerV3 is ReentrancyGuard {
 	///      holders); the in-kind exit stays open.
 	/// @dev Fees as a redemption settles them: the performance fee waits while a price can't be read
 	///      (the valuation marks that holding in kind instead of reverting).
-	function _settleFeesTolerant() private returns (FundValuation.Valuation memory v, bytes memory snapshot) {
+	function _settleFeesTolerant() internal returns (FundValuation.Valuation memory v, bytes memory snapshot) {
 		_settleManagementFee();
 		(v, snapshot) = ComptrollerV3Lib.redemptionValue(trackedAssets, externalPositions, costBasis, _context());
 		if (v.complete) _settlePerformanceFee(v.feeGav, shares.totalSupply());
@@ -572,7 +573,7 @@ contract ComptrollerV3 is ReentrancyGuard {
 	}
 
 	/// @dev sharesDue = (rpow(scaledPerSecondRate, dt, 1e27) - 1e27) * totalSupply / 1e27
-	function _settleManagementFee() private {
+	function _settleManagementFee() internal {
 		uint256 rate = feeConfig.mgmtScaledPerSecondRate;
 		uint256 elapsed = block.timestamp - lastMgmtFeeSettled;
 		lastMgmtFeeSettled = block.timestamp;
@@ -623,7 +624,7 @@ contract ComptrollerV3 is ReentrancyGuard {
 	/// @dev Protocol AUM fee: factory-set bps/yr of share supply, minted to the factory's
 	///      recipient (rate read live, capped at 1%/yr by the factory). The clock advances only
 	///      when this fund settles, so a fee turned on later charges since the last settlement.
-	function _settleProtocolFee() private {
+	function _settleProtocolFee() internal {
 		uint256 elapsed = block.timestamp - lastProtocolFeeSettled;
 		if (elapsed == 0) return;
 		lastProtocolFeeSettled = block.timestamp;
@@ -790,7 +791,7 @@ contract ComptrollerV3 is ReentrancyGuard {
 		}
 	}
 
-	function _checkTimelockAndBalance(address holder, uint256 sharesAmount) private view {
+	function _checkTimelockAndBalance(address holder, uint256 sharesAmount) internal view {
 		if (sharesAmount == 0) revert ZeroAmount();
 		if (shares.balanceOf(holder) < sharesAmount) revert InsufficientSharesBalance();
 		if (block.timestamp < lastDepositTimestamp[holder] + sharesActionTimelock) {

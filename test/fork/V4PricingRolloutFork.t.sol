@@ -38,6 +38,8 @@ import {V4PricingOwnerSteps} from '../../script/mainnet/V4PricingOwnerSteps.s.so
 ///         are still registered (deregistering them is a later step).
 ///         Run: BASE_MAINNET_RPC=<url> forge test --match-path test/fork/V4PricingRolloutFork.t.sol -vv
 contract V4PricingRolloutForkTest is Test {
+	uint256 internal constant FORK_BLOCK = 52_382_000;
+
 	address internal constant STFY = 0xC6405D7a226e1C18E559Be2F335F74C01Ad07bF5;
 	/// @dev A fund on today's registrar (owner: the deployer).
 	address internal constant TEST_FUND_4 = 0xd989D464E8bD518AF14151cb0F95a4f970F365DA;
@@ -69,7 +71,9 @@ contract V4PricingRolloutForkTest is Test {
 	function setUp() public {
 		string memory rpc = vm.envOr('BASE_MAINNET_RPC', string(''));
 		if (bytes(rpc).length == 0) return;
-		vm.createSelectFork(rpc);
+		// pinned to the block before the live rollout (DeployV4Pricing started at 52,382,039 on 2026-10-09): at the latest
+		// block the rollout is done and this rehearses nothing
+		vm.createSelectFork(rpc, FORK_BLOCK);
 		forked = true;
 		string memory genesis = vm.readFile('deployments/base-mainnet.json');
 		string memory pricing = vm.readFile('deployments/base-mainnet-pool-pricing.json');

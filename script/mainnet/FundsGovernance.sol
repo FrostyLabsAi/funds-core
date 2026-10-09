@@ -56,7 +56,7 @@ library FundsGovernance {
 		V4PriceSampler sampler; // Ownable2Step: approves the keeper
 		address[6] v4Adapters; // V4Pricing.adaptersOf: Ownable2Step, the protocol fee is theirs to set
 		MinPoolLiquidityPolicy policyV2; // the mandatory policy once v4 is live
-		address registrarV2FundDeployer; // ComptrollerBlueprintDeployer (fund v3 on registrar V2): every new fund
+		address registrarV2FundDeployer; // ComptrollerBlueprintDeployer on registrar V2 (fund v4, then v5): every new fund
 	}
 
 	/// @notice Fee compounders + re-pointed position types (CompoundersMainnet.Deployed); `factory` zero = not deployed.
