@@ -6,11 +6,14 @@ import {Ownable} from '@openzeppelin/contracts/access/Ownable.sol';
 import {IPolicy} from '../../src/interfaces/IPolicy.sol';
 import {FundFactory} from '../../src/core/FundFactory.sol';
 import {PoolPriceRegistrar} from '../../src/pricing/PoolPriceRegistrar.sol';
+import {PoolPriceRegistrarV2} from '../../src/pricing/PoolPriceRegistrarV2.sol';
+import {V4PriceSampler} from '../../src/pricing/V4PriceSampler.sol';
 import {MinPoolLiquidityPolicy} from '../../src/policies/MinPoolLiquidityPolicy.sol';
 import {CompounderFactory} from '../../src/yield/CompounderFactory.sol';
 import {SlipstreamLPPositionV2Factory} from '../../src/positions/SlipstreamLPPositionV2.sol';
 import {VerantaPerpPositionV3Factory} from '../../src/positions/VerantaPerpPositionV3.sol';
 import {RedemptionQueue} from '../../src/redemption/RedemptionQueue.sol';
+import {ComptrollerBlueprintDeployer} from '../../src/core/FundComponentDeployers.sol';
 import {FundsMainnet} from './FundsMainnet.sol';
 
 /// @title FundsGovernance
@@ -36,6 +39,9 @@ import {FundsMainnet} from './FundsMainnet.sol';
 ///         (founder rule 2026-10-01).
 ///         Fee compounders (CompoundersMainnet): the CompounderFactory and both SlipstreamLPPositionV2
 ///         factories (types 4 / 7) move; the V3 perp factory (type 6) is ownerless and stays out.
+///         Uniswap v4 (V4Pricing, 2026-10-08): once deployed, registrar V2 owns the registrar and moves in its place,
+///         with the price sampler and the six fee-taking spot adapters (setting the protocol fee is an owner
+///         power); new funds must then be ComptrollerV4 on registrar V2 behind its long-tail policy.
 library FundsGovernance {
 	/// @notice The pool-pricing switch-over (deployments/base-mainnet-pool-pricing.json).
 	struct PoolPricing {
@@ -45,6 +51,12 @@ library FundsGovernance {
 		// the redemption queue (deployments/base-mainnet-redemption.json, founder 2026-10-06); zero until deployed
 		address fundV3Deployer; // ComptrollerBlueprintDeployer (fund v3, bound to the queue)
 		address redemptionQueue; // Ownable2Step: hands off with the rest
+		// Uniswap v4 (deployments/base-mainnet-v4.json); zero until deployed
+		PoolPriceRegistrarV2 registrarV2; // owns `registrar`; hands off in its place
+		V4PriceSampler sampler; // Ownable2Step: approves the keeper
+		address[6] v4Adapters; // V4Pricing.adaptersOf: Ownable2Step, the protocol fee is theirs to set
+		MinPoolLiquidityPolicy policyV2; // the mandatory policy once v4 is live
+		address registrarV2FundDeployer; // ComptrollerBlueprintDeployer (fund v3 on registrar V2): every new fund
 	}
 
 	/// @notice Fee compounders + re-pointed position types (CompoundersMainnet.Deployed); `factory` zero = not deployed.
@@ -80,10 +92,16 @@ library FundsGovernance {
 	error PerpFactoryHasOwner(address factory);
 	error PerpConfigMismatch(address config);
 	error QueueNotWired(address factory);
+	error RegistrarNotUnderV2(address owner);
+	error NotOnRegistrarV2(address comptrollerDeployer);
+	error V4NotWired(address target);
+	error DeployerIsPoolApprover();
+	error SafeNotPoolApprover(address safe);
 
-	/// @notice Every Ownable2Step owner to hand off: the registrar (owns the VI) instead of the VI,
-	///         the FundFactory, the V2 perp config, the fee reserve only when genesis made one (FROST
-	///         set), the fee compounders' three factories, and the retired TWAP tier.
+	/// @notice Every Ownable2Step owner to hand off: the registrar (owns the VI) instead of the VI — or registrar V2
+	///         (owns the registrar) once v4 is deployed —, the FundFactory, the V2 perp config, the fee reserve
+	///         only when genesis made one (FROST set), the fee compounders' three factories, the retired TWAP
+	///         tier, the redemption queue, and v4's sampler and six spot adapters.
 	function owned(FundsMainnet.Deployed memory d, PoolPricing memory p, Compounders memory c, Retired memory r)
 		internal
 		pure
@@ -94,9 +112,10 @@ library FundsGovernance {
 		bool compounders = address(c.factory) != address(0);
 		uint256 retired = (r.registryV1 != address(0) ? 1 : 0) + (r.module != address(0) ? 1 : 0) + (r.registryV2 != address(0) ? 1 : 0);
 		bool queue = p.redemptionQueue != address(0);
-		o = new address[](3 + (compounders ? 3 : 0) + (reserve ? 1 : 0) + retired + (queue ? 1 : 0));
+		bool v4 = address(p.registrarV2) != address(0);
+		o = new address[](3 + (compounders ? 3 : 0) + (reserve ? 1 : 0) + retired + (queue ? 1 : 0) + (v4 ? 7 : 0));
 		uint256 n;
-		o[n++] = address(p.registrar);
+		o[n++] = v4 ? address(p.registrarV2) : address(p.registrar);
 		o[n++] = address(d.factory);
 		o[n++] = address(d.verantaFactory);
 		if (compounders) {
@@ -108,7 +127,13 @@ library FundsGovernance {
 		if (r.registryV1 != address(0)) o[n++] = r.registryV1;
 		if (r.module != address(0)) o[n++] = r.module;
 		if (r.registryV2 != address(0)) o[n++] = r.registryV2;
-		if (queue) o[n] = p.redemptionQueue;
+		if (queue) o[n++] = p.redemptionQueue;
+		if (v4) {
+			o[n++] = address(p.sampler);
+			for (uint256 i; i < p.v4Adapters.length; ++i) {
+				o[n++] = p.v4Adapters[i];
+			}
+		}
 	}
 
 	/// @notice EOA step: the retired lister loses its compounder roles, two-step transfers begin.
@@ -168,12 +193,7 @@ library FundsGovernance {
 		if (viPending != address(0)) revert StillPending(address(d.valueInterpreter), viPending);
 		if (d.factory.guardian() != safe) revert WrongGuardian(d.factory.guardian());
 		if (d.verantaFactory.autopilotKeeper() == deployer || keeper == deployer) revert DeployerIsKeeper();
-		_requireMandatoryPolicy(d.factory, p.policy);
-		address comptrollerDeployer = address(d.factory.comptrollerDeployer());
-		// new funds are fund v2, or fund v3 once the redemption queue is deployed and switched to
-		if (comptrollerDeployer != p.fundDeployer && (p.fundV3Deployer == address(0) || comptrollerDeployer != p.fundV3Deployer)) {
-			revert NotFundV2(comptrollerDeployer);
-		}
+		_requireNewFunds(d.factory, p, deployer, safe);
 		if (p.redemptionQueue != address(0) && address(RedemptionQueue(p.redemptionQueue).factory()) != address(d.factory)) {
 			revert QueueNotWired(address(RedemptionQueue(p.redemptionQueue).factory()));
 		}
@@ -181,13 +201,57 @@ library FundsGovernance {
 		if (address(c.factory) != address(0)) _verifyCompounders(d, c, deployer, r.lister);
 	}
 
-	/// @dev The registrar owns the VI it was built on (the switch-over ran).
+	/// @dev New funds: fund v2, or fund v3 once the redemption queue is deployed and switched to, behind the
+	///      long-tail policy; once v4 is deployed, fund v4 on registrar V2 behind its policy (V4Pricing.ownerSteps),
+	///      with the deployer no sampler keeper and no v4 pool approver, and the Safe one (founder 2026-10-08: approvals
+	///      without the timelock).
+	function _requireNewFunds(FundFactory factory, PoolPricing memory p, address deployer, address safe) private view {
+		address comptrollerDeployer = address(factory.comptrollerDeployer());
+		if (address(p.registrarV2) != address(0)) {
+			if (p.sampler.isKeeper(deployer)) revert DeployerIsKeeper();
+			if (p.registrarV2.isPoolApprover(deployer)) revert DeployerIsPoolApprover();
+			if (!p.registrarV2.isPoolApprover(safe)) revert SafeNotPoolApprover(safe);
+			_requireMandatoryPolicy(factory, p.policyV2);
+			if (comptrollerDeployer != p.registrarV2FundDeployer) revert NotOnRegistrarV2(comptrollerDeployer);
+			_requireV4Wired(p);
+			return;
+		}
+		_requireMandatoryPolicy(factory, p.policy);
+		if (comptrollerDeployer != p.fundDeployer && (p.fundV3Deployer == address(0) || comptrollerDeployer != p.fundV3Deployer)) {
+			revert NotFundV2(comptrollerDeployer);
+		}
+	}
+
+	/// @dev The v4 book's contracts are wired to registrar V2, not merely listed in it: the v4 adapter's and the
+	///      policy's registrar, the sampler registrar V2 reads, and the registrar (and queue) the fund deployer builds
+	///      funds on (final review 2026-10-08, I3).
+	function _requireV4Wired(PoolPricing memory p) private view {
+		address registrar = address(p.registrarV2);
+		(bool ok, bytes memory ret) = p.v4Adapters[0].staticcall(abi.encodeWithSignature('registrar()'));
+		if (!ok || ret.length != 32 || abi.decode(ret, (address)) != registrar) revert V4NotWired(p.v4Adapters[0]);
+		if (address(p.policyV2.registrar()) != registrar) revert V4NotWired(address(p.policyV2));
+		if (address(p.registrarV2.sampler()) != address(p.sampler)) revert V4NotWired(address(p.sampler));
+		(address built, address queue) =
+			abi.decode(ComptrollerBlueprintDeployer(p.registrarV2FundDeployer).extraConstructorArgs(), (address, address));
+		if (built != registrar || (p.redemptionQueue != address(0) && queue != p.redemptionQueue)) {
+			revert V4NotWired(p.registrarV2FundDeployer);
+		}
+	}
+
+	/// @dev The registrar owns the VI it was built on (the switch-over ran); once v4 is deployed, registrar V2
+	///      (built on that registrar) owns the registrar, with no transfer pending (V4Pricing.ownerSteps ran).
 	function _requireRegistrarOwnsVi(FundsMainnet.Deployed memory d, PoolPricing memory p) private view {
 		if (address(p.registrar) == address(0)) revert NoPoolPricing();
 		address viOwner = d.valueInterpreter.owner();
 		if (viOwner != address(p.registrar)) revert RegistrarNotViOwner(viOwner);
 		address wired = address(p.registrar.valueInterpreter());
 		if (wired != address(d.valueInterpreter)) revert RegistrarNotWired(wired);
+		if (address(p.registrarV2) == address(0)) return;
+		if (p.registrarV2.oldRegistrar() != p.registrar) revert RegistrarNotWired(address(p.registrarV2.oldRegistrar()));
+		address registrarOwner = p.registrar.owner();
+		if (registrarOwner != address(p.registrarV2)) revert RegistrarNotUnderV2(registrarOwner);
+		address pending = p.registrar.pendingOwner();
+		if (pending != address(0)) revert StillPending(address(p.registrar), pending);
 	}
 
 	/// @dev The mandatory list is exactly the long-tail policy on every hook it implements (PoolPricing.setMandatoryPolicy).
