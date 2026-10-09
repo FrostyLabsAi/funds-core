@@ -109,7 +109,7 @@ contract ComptrollerV3 is ReentrancyGuard {
 	bool public guardianDepositsPaused; // set via factory: guardian pauses instantly, only factory owner unpauses
 
 	EnumerableSet.AddressSet private trackedAssets;
-	EnumerableSet.AddressSet private externalPositions;
+	EnumerableSet.AddressSet internal externalPositions;
 
 	uint256 public highWaterMark; // gross share price (denomination units per SHARES_UNIT)
 	uint256 public lastMgmtFeeSettled;
@@ -406,7 +406,7 @@ contract ComptrollerV3 is ReentrancyGuard {
 		_redeemSharesInKind(sharesAmount, assetsToSkip);
 	}
 
-	function _redeemSharesInKind(uint256 sharesAmount, address[] memory assetsToSkip) private {
+	function _redeemSharesInKind(uint256 sharesAmount, address[] memory assetsToSkip) internal virtual {
 		_checkTimelockAndBalance(msg.sender, sharesAmount);
 
 		_settleManagementFee();
