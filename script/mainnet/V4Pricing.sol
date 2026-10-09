@@ -2,7 +2,7 @@
 pragma solidity 0.8.24;
 
 import {FundFactory} from '../../src/core/FundFactory.sol';
-import {ComptrollerV3} from '../../src/core/ComptrollerV3.sol';
+import {ComptrollerV4} from '../../src/core/ComptrollerV4.sol';
 import {ComptrollerBlueprintDeployer} from '../../src/core/FundComponentDeployers.sol';
 import {IV4PoolManager, IV4StateView} from '../../src/interfaces/external/IUniswapV4.sol';
 import {IUniswapV3SwapRouter} from '../../src/interfaces/external/IUniswapV3SwapRouter.sol';
@@ -25,7 +25,8 @@ import {FundsMainnet} from './FundsMainnet.sol';
 ///         1. `deploy` — the keeper-only price sampler, PoolPriceRegistrarV2 (v4 pools + stock-token quotes, on top of
 ///            today's registrar), the v4 swap adapter and the three fee-taking V2 spot adapters (Uniswap v3, the three
 ///            Slipstream deployments, Aerodrome basic; 5 bps to the Treasury Safe, owner-set 0–10), the long-tail policy
-///            on registrar V2, and the blueprint deployer that makes new funds ComptrollerV3 on registrar V2.
+///            on registrar V2, and the blueprint deployer that makes new funds ComptrollerV4 (no in-kind exit that
+///            forfeits, founder 2026-10-09) on registrar V2.
 ///         2. `ownerSteps` — today's registrar (owner of the VI) moves under registrar V2; the hooks, quotes and keeper
 ///            are approved; the Admin Safe becomes a pool approver and the launch v4 pools are approved; the adapters are
 ///            registered; new funds get the new policy and fund deployer. Each step skips what is already done, so a
@@ -123,11 +124,11 @@ library V4Pricing {
 		d.aerodromeBasicAdapter = new AerodromeBasicSwapAdapterV2(
 			IAerodromeRouter(FundsMainnet.AERODROME_ROUTER), FundsMainnet.AERODROME_POOL_FACTORY, TREASURY, FEE_BPS, owner
 		);
-		// the policy and ComptrollerV3 only call poolPricedAdapter and MIN_LIQUIDITY_USD, which registrar V2 answers
+		// the policy and ComptrollerV4 only call poolPricedAdapter and MIN_LIQUIDITY_USD, which registrar V2 answers
 		PoolPriceRegistrar asRegistrar = PoolPriceRegistrar(address(d.registrar));
 		d.policy = new MinPoolLiquidityPolicy(asRegistrar);
 		d.fundDeployer =
-			new ComptrollerBlueprintDeployer(type(ComptrollerV3).creationCode, abi.encode(asRegistrar, redemptionQueue));
+			new ComptrollerBlueprintDeployer(type(ComptrollerV4).creationCode, abi.encode(asRegistrar, redemptionQueue));
 	}
 
 	/// @param oldPolicy today's mandatory long-tail policy (on today's registrar), replaced wherever it is listed

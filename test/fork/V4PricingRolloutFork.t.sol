@@ -33,7 +33,7 @@ import {V4PricingOwnerSteps} from '../../script/mainnet/V4PricingOwnerSteps.s.so
 /// @notice Rehearsal of the v4 rollout on live Base at the latest block (spec
 ///         docs/superpowers/specs/2026-10-08-uniswap-v4-memestocks-design.md §6): DeployV4Pricing's library call and
 ///         address book, then V4PricingOwnerSteps from the genesis deployer. Afterwards a fresh fund is a
-///         ComptrollerV3 on registrar V2 with the new long-tail policy, STFY registers, governance still reaches
+///         ComptrollerV4 on registrar V2 with the new long-tail policy, STFY registers, governance still reaches
 ///         the ValueInterpreter through registrar V2, TestFund4 values exactly as before, and today's spot adapters
 ///         are still registered (deregistering them is a later step).
 ///         Run: BASE_MAINNET_RPC=<url> forge test --match-path test/fork/V4PricingRolloutFork.t.sol -vv
@@ -147,7 +147,8 @@ contract V4PricingRolloutForkTest is Test {
 	}
 
 	/// New funds get the policy on registrar V2 in the old one's place, on the same hooks; a fresh fund is a
-	/// ComptrollerV3 on registrar V2 and the redemption queue, carrying it.
+	/// ComptrollerV4 (no in-kind exit that forfeits, founder 2026-10-09) on registrar V2 and the redemption queue,
+	/// carrying it.
 	function test_fork_newFundsAreBuiltOnRegistrarV2() public {
 		vm.skip(!forked);
 		FundFactory.PolicyReg[] memory regs = factory.getMandatoryPolicies();
@@ -190,6 +191,12 @@ contract V4PricingRolloutForkTest is Test {
 			if (postTrade[i] == address(d.policy)) carries = true;
 		}
 		assertTrue(carries, 'the long-tail policy checks its trades');
+
+		// fund v4: in kind is refused while the fund holds a position (checked before the redeemer's balance)
+		vm.prank(manager);
+		fund.createExternalPosition(FundsMainnet.VERANTA_PERP_TYPE, '');
+		vm.expectRevert(ComptrollerV3.UseRedemptionQueue.selector);
+		fund.redeemSharesInKind(1);
 	}
 
 	/// The owner's cast transaction after the owner steps prices BLUECHIP from its USDC pool on Slipstream (founder

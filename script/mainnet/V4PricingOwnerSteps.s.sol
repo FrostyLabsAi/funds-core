@@ -18,7 +18,7 @@ import {V4Pricing} from './V4Pricing.sol';
 ///         V2; StockifyFeeHook and o1's two LaunchHooks (Treasury as referrer), the NVDAc/SPCXc/AAPLc/GOOGLc/METAc quotes
 ///         and the keeper are approved; the Admin Safe becomes a v4 pool approver and the launch pools (STFY, BLUECHIP,
 ///         RAWR, MOONBASE, BASEASS) are approved; the six adapters are registered; new funds get the long-tail policy on registrar V2 and
-///         the ComptrollerV3 deployer on registrar V2. Each step skips what is already done, so a re-run sends only
+///         the ComptrollerV4 deployer on registrar V2. Each step skips what is already done, so a re-run sends only
 ///         what is missing. Rehearsed in test/fork/V4PricingRolloutFork.t.sol.
 ///         forge script script/mainnet/V4PricingOwnerSteps.s.sol --rpc-url <base> --account frosty-main \
 ///              --sender <deployer> [--broadcast --slow]

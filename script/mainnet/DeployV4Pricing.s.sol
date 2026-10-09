@@ -37,7 +37,7 @@ contract DeployV4Pricing is Script {
 		console2.log('AerodromeSlipstreamSwapAdapterV2 (CL3)', address(d.slipstream3Adapter));
 		console2.log('AerodromeBasicSwapAdapterV2', address(d.aerodromeBasicAdapter));
 		console2.log('MinPoolLiquidityPolicy (registrar V2)', address(d.policy));
-		console2.log('ComptrollerV3 blueprint deployer (registrar V2)', address(d.fundDeployer));
+		console2.log('ComptrollerV4 blueprint deployer (registrar V2)', address(d.fundDeployer));
 		// a dry run's simulated addresses must never reach the address book
 		if (!vm.isContext(VmSafe.ForgeContext.ScriptBroadcast)) return d;
 		vm.writeJson(serialize(d, startBlock), 'deployments/base-mainnet-v4.json');

@@ -41,7 +41,7 @@ import {FundsMainnet} from './FundsMainnet.sol';
 ///         factories (types 4 / 7) move; the V3 perp factory (type 6) is ownerless and stays out.
 ///         Uniswap v4 (V4Pricing, 2026-10-08): once deployed, registrar V2 owns the registrar and moves in its place,
 ///         with the price sampler and the six fee-taking spot adapters (setting the protocol fee is an owner
-///         power); new funds must then be ComptrollerV3 on registrar V2 behind its long-tail policy.
+///         power); new funds must then be ComptrollerV4 on registrar V2 behind its long-tail policy.
 library FundsGovernance {
 	/// @notice The pool-pricing switch-over (deployments/base-mainnet-pool-pricing.json).
 	struct PoolPricing {
@@ -202,7 +202,7 @@ library FundsGovernance {
 	}
 
 	/// @dev New funds: fund v2, or fund v3 once the redemption queue is deployed and switched to, behind the
-	///      long-tail policy; once v4 is deployed, fund v3 on registrar V2 behind its policy (V4Pricing.ownerSteps),
+	///      long-tail policy; once v4 is deployed, fund v4 on registrar V2 behind its policy (V4Pricing.ownerSteps),
 	///      with the deployer no sampler keeper and no v4 pool approver, and the Safe one (founder 2026-10-08: approvals
 	///      without the timelock).
 	function _requireNewFunds(FundFactory factory, PoolPricing memory p, address deployer, address safe) private view {
