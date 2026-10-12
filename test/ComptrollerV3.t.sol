@@ -177,7 +177,7 @@ contract ComptrollerV3Test is Test {
 
 	// ─── rule 1: redemptions ─────────────────────────────────────────────────────
 
-	function test_redeemPaysCashForPricedHoldingsAndTheLongTailSliceInKind() public {
+	function test_redeemPaysCashForPricedHoldingsAndTheLongTailSliceInKind() public virtual {
 		ComptrollerV3 fund = _fund(0);
 		_swap(fund, usdc, tkn, 2_000e6, 2_000e6); // 8,000 USDC + 2,000 TKN ($1)
 
@@ -190,7 +190,7 @@ contract ComptrollerV3Test is Test {
 		assertApproxEqRel(tkn.balanceOf(alice), 1_000e6, 1e15);
 	}
 
-	function test_aPumpedLongTailPriceAddsNoCashToARedemption() public {
+	function test_aPumpedLongTailPriceAddsNoCashToARedemption() public virtual {
 		ComptrollerV3 fund = _fund(0);
 		_swap(fund, usdc, tkn, 2_000e6, 2_000e6);
 		uint256 half = _sharesOf(fund, alice) / 2;
@@ -206,7 +206,7 @@ contract ComptrollerV3Test is Test {
 		assertApproxEqAbs(usdc.balanceOf(alice) - cashAtFairPrice, cashAtFairPrice, 1);
 	}
 
-	function test_aTokenWhosePriceCannotBeReadIsPaidInKind() public {
+	function test_aTokenWhosePriceCannotBeReadIsPaidInKind() public virtual {
 		ComptrollerV3 fund = _fund(0);
 		_swap(fund, usdc, weth, 2_000e6, 1e18); // 8,000 USDC + 1 WETH
 		skip(2 hours); // WETH's 1-hour feed is now stale; USDC's 25-hour one is not
@@ -315,7 +315,7 @@ contract ComptrollerV3Test is Test {
 		assertEq(_sharesOf(fund, manager), 0);
 	}
 
-	function test_costBasisFollowsBuysSalesAndInKindPayouts() public {
+	function test_costBasisFollowsBuysSalesAndInKindPayouts() public virtual {
 		ComptrollerV3 fund = _fund(0);
 		_swap(fund, usdc, tkn, 2_000e6, 2_000e6);
 		assertEq(fund.costBasis(address(tkn)), 2_000e6); // TKN's pool value at the buy
@@ -331,7 +331,7 @@ contract ComptrollerV3Test is Test {
 		assertApproxEqRel(fund.costBasis(address(tkn)), 1_500e6 - 1_500e6 * (shares / 2) / supply, 1e12);
 	}
 
-	function test_inKindRedemptionTakesItsShareOfTheCostBasis() public {
+	function test_inKindRedemptionTakesItsShareOfTheCostBasis() public virtual {
 		ComptrollerV3 fund = _fund(0);
 		_swap(fund, usdc, tkn, 2_000e6, 2_000e6);
 		uint256 shares = _sharesOf(fund, alice);
@@ -343,7 +343,7 @@ contract ComptrollerV3Test is Test {
 		assertApproxEqRel(fund.costBasis(address(tkn)), 2_000e6 - 2_000e6 * (shares / 2) / supply, 1e12);
 	}
 
-	function test_aPriceThatCannotBeReadSkipsThePerformanceFeeNotTheExit() public {
+	function test_aPriceThatCannotBeReadSkipsThePerformanceFeeNotTheExit() public virtual {
 		ComptrollerV3 fund = _fund(2_000);
 		_swap(fund, usdc, weth, 2_000e6, 1e18);
 		wethFeed.setAnswer(3000e8); // +$1,000
@@ -450,14 +450,14 @@ contract ComptrollerV3Test is Test {
 		amounts[0] = amount;
 	}
 
-	function test_payOutRedemption_onlyTheQueue() public {
+	function test_payOutRedemption_onlyTheQueue() public virtual {
 		ComptrollerV3 fund = _fund(0);
 		(address[] memory assets, uint256[] memory amounts) = _usdc(1);
 		vm.expectRevert(ComptrollerV3.OnlyRedemptionQueue.selector);
 		fund.payOutRedemption(alice, 1, assets, amounts);
 	}
 
-	function test_payOutRedemption_burnsTheEscrowAndPaysTheAmounts() public {
+	function test_payOutRedemption_burnsTheEscrowAndPaysTheAmounts() public virtual {
 		ComptrollerV3 fund = _fund(0);
 		uint256 half = _sharesOf(fund, alice) / 2;
 		Shares fundShares = fund.shares();
@@ -472,7 +472,7 @@ contract ComptrollerV3Test is Test {
 		assertEq(_held(fund, usdc), 5_000e6);
 	}
 
-	function test_payOutRedemption_aPaidLongTailSliceTakesItsCostBasis() public {
+	function test_payOutRedemption_aPaidLongTailSliceTakesItsCostBasis() public virtual {
 		ComptrollerV3 fund = _fund(0);
 		_swap(fund, usdc, tkn, 2_000e6, 2_000e6);
 		assertEq(fund.costBasis(address(tkn)), 2_000e6);
@@ -488,25 +488,25 @@ contract ComptrollerV3Test is Test {
 		assertEq(fund.costBasis(address(tkn)), 1_500e6, 'a quarter of the TKN left with a quarter of its cost');
 	}
 
-	function test_forwardUnwind_onlyTheQueue() public {
+	function test_forwardUnwind_onlyTheQueue() public virtual {
 		(ComptrollerV3 fund, MockUnwindPosition position) = _fundWithUnwindPosition();
 		vm.expectRevert(ComptrollerV3.OnlyRedemptionQueue.selector);
 		fund.forwardUnwind(address(position), abi.encode(uint8(1), abi.encode(uint256(1))));
 	}
 
-	function test_forwardUnwind_refusesAnActionThatIsNotRiskReducing() public {
+	function test_forwardUnwind_refusesAnActionThatIsNotRiskReducing() public virtual {
 		(ComptrollerV3 fund, MockUnwindPosition position) = _fundWithUnwindPosition();
 		vm.expectRevert(abi.encodeWithSelector(ComptrollerV3.NotRiskReducing.selector, address(position)));
 		queue.forward(fund, address(position), abi.encode(uint8(0), abi.encode(uint256(1))));
 	}
 
-	function test_forwardUnwind_refusesAPositionTheFundDoesNotHold() public {
+	function test_forwardUnwind_refusesAPositionTheFundDoesNotHold() public virtual {
 		(ComptrollerV3 fund,) = _fundWithUnwindPosition();
 		vm.expectRevert(abi.encodeWithSelector(ComptrollerV3.NotActiveExternalPosition.selector, address(0xbeef)));
 		queue.forward(fund, address(0xbeef), abi.encode(uint8(1), abi.encode(uint256(1))));
 	}
 
-	function test_forwardUnwind_closesAndReturnsTheUsdcToTheVault() public {
+	function test_forwardUnwind_closesAndReturnsTheUsdcToTheVault() public virtual {
 		(ComptrollerV3 fund, MockUnwindPosition position) = _fundWithUnwindPosition();
 		uint256 vaultBefore = _held(fund, usdc);
 		queue.forward(fund, address(position), abi.encode(uint8(1), abi.encode(uint256(400e6))));
@@ -524,7 +524,7 @@ contract ComptrollerV3Test is Test {
 
 	/// The queue's one valuation per settlement (2026-10-07): each holding's balance and value and
 	/// the positions' total, from the pass that settled the fees.
-	function test_settleFeesForRedemption_returnsTheSnapshotOfThatValuation() public {
+	function test_settleFeesForRedemption_returnsTheSnapshotOfThatValuation() public virtual {
 		(ComptrollerV3 fund,) = _fundWithUnwindPosition(); // vault 6,000 USDC; position 4,000
 		(address[] memory assets, uint256[] memory balances, uint256[] memory values, bool[] memory inKind, uint256 positionsValue) =
 			abi.decode(queue.settleFees(fund), (address[], uint256[], uint256[], bool[], uint256));
