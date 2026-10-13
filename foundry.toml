@@ -8,7 +8,7 @@ optimizer = true
 optimizer_runs = 200
 evm_version = "cancun"
 # genesis + governance scripts read/write their address book here (script/mainnet)
-fs_permissions = [{ access = "read-write", path = "./deployments" }]
+fs_permissions = [{ access = "read-write", path = "./deployments" }, { access = "read", path = "../funds-yield/out" }]
 
 [fuzz]
 runs = 256
