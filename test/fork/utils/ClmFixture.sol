@@ -52,6 +52,11 @@ contract MockClmVi {
 		decimalsOf[token] = decimals;
 	}
 
+	/// @dev Like ValueInterpreter.getAssetInfo: a non-zero aggregator means a priced token.
+	function getAssetInfo(address asset) external view returns (address aggregator, uint32, uint8, uint8) {
+		aggregator = usdRate[asset] == 0 ? address(0) : address(1);
+	}
+
 	function calcUsdRate(address asset) external view returns (uint256) {
 		require(usdRate[asset] != 0, 'no rate');
 		return usdRate[asset];

@@ -22,7 +22,7 @@ library ClmFundsDeploy {
 
 	/// @notice Deploys the feed (for `strategyFactory`'s vaults) and the adapter, and registers the adapter.
 	function deploy(address strategyFactory) internal returns (ClmVaultPriceFeed feed, ClmVaultAdapter adapter) {
-		feed = new ClmVaultPriceFeed(IValueInterpreter(VALUE_INTERPRETER), strategyFactory);
+		feed = new ClmVaultPriceFeed(IValueInterpreter(VALUE_INTERPRETER), strategyFactory, REGISTRAR_V2);
 		adapter = new ClmVaultAdapter(SLIPSTREAM1_ROUTER, SLIPSTREAM2_ROUTER, SLIPSTREAM3_ROUTER);
 		FundFactory(FUND_FACTORY).registerAdapter(address(adapter));
 	}

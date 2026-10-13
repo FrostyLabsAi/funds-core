@@ -51,7 +51,7 @@ contract ClmVaultAdapterForkTest is ClmFixture {
 		address strategyFactory;
 		(strategyFactory, poolDeployer) = _deployClm(keeper, address(new MockClmVi()));
 		(clmVault, clmStrategy) = _deployCbBtcVault(poolDeployer);
-		feed = new ClmVaultPriceFeed(IValueInterpreter(vi), strategyFactory);
+		feed = new ClmVaultPriceFeed(IValueInterpreter(vi), strategyFactory, registrarV2);
 		adapter = new ClmVaultAdapter(SLIPSTREAM1_ROUTER, SLIPSTREAM2_ROUTER, SLIPSTREAM3_ROUTER);
 
 		vm.startPrank(deployer);

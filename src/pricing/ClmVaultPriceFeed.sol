@@ -10,6 +10,19 @@ import {IFrostyClmVault, IFrostyClmStrategy} from '../interfaces/external/IFrost
 import {TickMath} from '../libraries/TickMath.sol';
 import {LiquidityAmounts} from '../libraries/LiquidityAmounts.sol';
 
+/// @notice ValueInterpreter.getAssetInfo (not in IValueInterpreter): a non-zero aggregator means a priced primitive.
+interface IViAssetInfo {
+	function getAssetInfo(address asset)
+		external
+		view
+		returns (address aggregator, uint32 heartbeat, uint8 assetDecimals, uint8 rateDecimals);
+}
+
+/// @notice PoolPriceRegistrarV2.poolPricedAdapter: non-zero when `asset` is pool-priced there or in today's registrar.
+interface IPoolPricedLookup {
+	function poolPricedAdapter(address asset) external view returns (address);
+}
+
 /// @title ClmVaultPriceFeed
 /// @notice Derivative feed for FrostyFi CLM vault shares (funds-yield; plan 2, 2026-10-13). A share amount resolves to
 ///         what a withdrawal of it would pay, valued at oracle prices (hard rule 1):
@@ -18,6 +31,9 @@ import {LiquidityAmounts} from '../libraries/LiquidityAmounts.sol';
 ///         - minus harvest proceeds not yet released (they reach the share price over LOCK_DURATION).
 ///         Not counted, because a withdrawal doesn't pay them: claimed AERO waiting to be sold, AERO unclaimed in the
 ///         gauge (hard rule 4: explicitly out of GAV). One instance serves every vault of `strategyFactory`.
+///         Only vaults whose two tokens are oracle-fed (final review I1, founder 2026-10-13): a pool-priced token inside a
+///         vault share would slip past the fund rules made for long-tail tokens, and an unpriced one would make NAV
+///         revert.
 /// @dev Never reads the pool's spot price: not `slot0`, and not the strategy's `balances()`/`lockedProfit()`, which do.
 contract ClmVaultPriceFeed is IDerivativePriceFeed {
 	uint256 private constant Q96 = 0x1000000000000000000000000;
@@ -29,13 +45,18 @@ contract ClmVaultPriceFeed is IDerivativePriceFeed {
 	/// @notice FrostyFi's strategy factory. Only its vaults are priced: anyone can deploy the same bytecode with their
 	///         own factory and fee settings.
 	address public immutable strategyFactory;
+	/// @notice Registrar V2, which answers for both registrars whether a token is pool-priced.
+	IPoolPricedLookup public immutable registrar;
 
 	error ZeroAddress();
 
-	constructor(IValueInterpreter valueInterpreter_, address strategyFactory_) {
-		if (address(valueInterpreter_) == address(0) || strategyFactory_ == address(0)) revert ZeroAddress();
+	constructor(IValueInterpreter valueInterpreter_, address strategyFactory_, address registrar_) {
+		if (address(valueInterpreter_) == address(0) || strategyFactory_ == address(0) || registrar_ == address(0)) {
+			revert ZeroAddress();
+		}
 		valueInterpreter = valueInterpreter_;
 		strategyFactory = strategyFactory_;
+		registrar = IPoolPricedLookup(registrar_);
 	}
 
 	/// @inheritdoc IDerivativePriceFeed
@@ -63,7 +84,14 @@ contract ClmVaultPriceFeed is IDerivativePriceFeed {
 		address strategy = _addressCall(asset, abi.encodeCall(IFrostyClmVault.strategy, ()));
 		if (strategy == address(0)) return false;
 		if (_addressCall(strategy, abi.encodeCall(IFrostyClmStrategy.factory, ())) != strategyFactory) return false;
-		return _addressCall(strategy, abi.encodeCall(IFrostyClmStrategy.vault, ())) == asset;
+		if (_addressCall(strategy, abi.encodeCall(IFrostyClmStrategy.vault, ())) != asset) return false;
+		return _oracleFed(IFrostyClmStrategy(strategy).lpToken0()) && _oracleFed(IFrostyClmStrategy(strategy).lpToken1());
+	}
+
+	/// @dev A priced primitive that isn't pool-priced: a Chainlink-style feed (or Veranta/Redstone/Pyth store).
+	function _oracleFed(address token) private view returns (bool) {
+		(address aggregator,,,) = IViAssetInfo(address(valueInterpreter)).getAssetInfo(token);
+		return aggregator != address(0) && registrar.poolPricedAdapter(token) == address(0);
 	}
 
 	/// @notice Harvest proceeds of `vault` not yet released to its share price (before the cap at what it holds).

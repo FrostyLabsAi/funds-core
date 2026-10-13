@@ -12,6 +12,8 @@ import {ClmFixture, MockClmVi, IClmHarvest} from './utils/ClmFixture.sol';
 contract ClmVaultPriceFeedForkTest is ClmFixture {
 	address internal constant REAL_VI = 0x3CDbaBE5Bf4E6cfE10A2A326E0ad31b2d16398D4;
 	address internal constant BEEFY_MSTRC_VAULT = 0x7ec3a9cB1E2512f6318a18aA69eBF113cb1759f0; // same bytecode, Beefy's factory
+	address internal constant REGISTRAR_V2 = 0x60338a74c63EDeC7EC020cB9208DD234D9a2146F;
+	address internal poolDeployer;
 	bool internal ready;
 	MockClmVi internal vi;
 	ClmVaultPriceFeed internal feed;
@@ -29,9 +31,10 @@ contract ClmVaultPriceFeedForkTest is ClmFixture {
 		vi.set(USDC, IValueInterpreter(REAL_VI).calcUsdRate(USDC), 6);
 		vi.set(CBBTC, IValueInterpreter(REAL_VI).calcUsdRate(CBBTC), 8);
 		vi.set(AERO, IValueInterpreter(REAL_VI).calcUsdRate(AERO), 18);
-		(address strategyFactory, address poolDeployer) = _deployClm(keeper, address(vi));
+		address strategyFactory;
+		(strategyFactory, poolDeployer) = _deployClm(keeper, address(vi));
 		(vault, strategy) = _deployCbBtcVault(poolDeployer);
-		feed = new ClmVaultPriceFeed(IValueInterpreter(address(vi)), strategyFactory);
+		feed = new ClmVaultPriceFeed(IValueInterpreter(address(vi)), strategyFactory, REGISTRAR_V2);
 
 		deal(USDC, address(this), 50_000e6);
 		_buyCbBtc(address(this), 0.5e8);
@@ -116,6 +119,19 @@ contract ClmVaultPriceFeedForkTest is ClmFixture {
 		assertFalse(feed.isSupportedAsset(USDC));
 		assertFalse(feed.isSupportedAsset(makeAddr('nobody')));
 		assertFalse(feed.isSupportedAsset(strategy), 'the strategy is not a vault');
+	}
+
+	/// @dev Final review I1 (founder 2026-10-13): only vaults whose two tokens are oracle-fed. A pool-priced token
+	///      (cbLTC: its price is its pool's 30-minute average) would slip past the fund rules made for long-tail tokens;
+	///      an unpriced one would make NAV revert.
+	function test_isSupportedAsset_refusesPoolPricedAndUnpricedTokens() public {
+		vm.skip(!ready);
+		(address s1Vault,) = _deployWethCbLtcVault(poolDeployer);
+		vi.set(WETH, IValueInterpreter(REAL_VI).calcUsdRate(WETH), 18);
+		assertFalse(feed.isSupportedAsset(s1Vault), 'cbLTC has no rate here: unpriced');
+		vi.set(CBLTC, IValueInterpreter(REAL_VI).calcUsdRate(CBLTC), 8);
+		assertFalse(feed.isSupportedAsset(s1Vault), 'cbLTC is pool-priced (registrar V2)');
+		assertTrue(feed.isSupportedAsset(vault), 'USDC/cbBTC: both oracle-fed');
 	}
 
 	function test_feed_zeroForZero() public {

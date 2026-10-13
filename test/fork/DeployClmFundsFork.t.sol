@@ -6,6 +6,7 @@ import {IValueInterpreter} from '../../src/interfaces/IValueInterpreter.sol';
 import {ClmVaultAdapter} from '../../src/adapters/ClmVaultAdapter.sol';
 import {ClmVaultPriceFeed} from '../../src/pricing/ClmVaultPriceFeed.sol';
 import {ClmFundsDeploy} from '../../script/mainnet/ClmFundsDeploy.sol';
+import {ValueInterpreter} from '../../src/core/ValueInterpreter.sol';
 import {ClmFixture, MockClmVi} from './utils/ClmFixture.sol';
 
 /// @notice Rehearses DeployClmFunds on a Base fork: the feed and adapter deploy, the adapter registers on the real
@@ -31,10 +32,14 @@ contract DeployClmFundsForkTest is ClmFixture {
 
 		vm.startPrank(deployer);
 		(ClmVaultPriceFeed feed, ClmVaultAdapter adapter) = ClmFundsDeploy.deploy(strategyFactory);
-		address[] memory vaults = new address[](2);
+		address[] memory vaults = new address[](1);
 		vaults[0] = vault;
-		vaults[1] = s1Vault;
 		ClmFundsDeploy.list(feed, vaults);
+		// Final review I1: WETH/cbLTC holds a pool-priced token (cbLTC), so the VI refuses to list it.
+		address[] memory longTail = new address[](1);
+		longTail[0] = s1Vault;
+		vm.expectRevert(abi.encodeWithSelector(ValueInterpreter.FeedDoesNotSupportAsset.selector, s1Vault));
+		ClmFundsDeploy.list(feed, longTail);
 		vm.stopPrank();
 
 		assertEq(feed.strategyFactory(), strategyFactory);
@@ -44,6 +49,6 @@ contract DeployClmFundsForkTest is ClmFixture {
 		assertEq(adapter.router3(), ClmFundsDeploy.SLIPSTREAM3_ROUTER);
 		assertTrue(FundFactory(ClmFundsDeploy.FUND_FACTORY).isAdapterRegistered(address(adapter)));
 		assertTrue(IValueInterpreter(ClmFundsDeploy.VALUE_INTERPRETER).isSupportedAsset(vault), 'the USDC/cbBTC share is priced');
-		assertTrue(IValueInterpreter(ClmFundsDeploy.VALUE_INTERPRETER).isSupportedAsset(s1Vault), 'the WETH/cbLTC share is priced');
+		assertFalse(IValueInterpreter(ClmFundsDeploy.VALUE_INTERPRETER).isSupportedAsset(s1Vault), 'the WETH/cbLTC share is not');
 	}
 }
