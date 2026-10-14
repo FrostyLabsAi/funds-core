@@ -7,6 +7,7 @@ import {FundFactory} from '../../src/core/FundFactory.sol';
 import {ComptrollerBlueprintDeployer} from '../../src/core/FundComponentDeployers.sol';
 import {ComptrollerV6} from '../../src/core/ComptrollerV6.sol';
 import {RedemptionQueueV2} from '../../src/redemption/RedemptionQueueV2.sol';
+import {ComptrollerV6Lib} from '../../src/core/ComptrollerV6Lib.sol';
 import {ERC4626ExitAdapter} from '../../src/adapters/ERC4626ExitAdapter.sol';
 import {FundsMainnet} from '../../script/mainnet/FundsMainnet.sol';
 import {ClmFundsDeploy} from '../../script/mainnet/ClmFundsDeploy.sol';
@@ -123,7 +124,7 @@ contract ERC4626ExitForkTest is Test {
 		uint256 wethShares = IERC20(STATIC_WETH).balanceOf(address(fund.vault()));
 		_overdueRedemption(fund);
 		vm.prank(keeper);
-		vm.expectRevert(); // ComptrollerV6Lib.NotASale, from the library's delegatecall
+		vm.expectRevert(ComptrollerV6Lib.NotASale.selector);
 		queue.liquidate(address(fund), erc4626Adapter, abi.encode(uint8(1), STATIC_WETH, wethShares, uint256(0)));
 	}
 
