@@ -13,7 +13,7 @@ import {FundsMainnet} from '../../script/mainnet/FundsMainnet.sol';
 import {ValueInterpreter} from '../../src/core/ValueInterpreter.sol';
 import {VerantaPerpPositionV2Factory} from '../../src/positions/VerantaPerpPositionV2.sol';
 import {VerantaListing, IVerantaPairCatalog} from '../../script/mainnet/VerantaListing.sol';
-import {IValueInterpreterAdmin} from '../../script/mainnet/ListingModuleBook.sol';
+import {IRegistrarV2Passthrough, IValueInterpreterAdmin, ViAdmin} from '../../script/mainnet/ListingModuleBook.sol';
 import {Ownable} from '@openzeppelin/contracts/access/Ownable.sol';
 
 interface IVerantaOperator {
@@ -215,8 +215,8 @@ contract VerantaUnpushedPairForkTest is Test {
 		assertGt(storePriced, 150, 'the long tail is store-priced');
 
 		// as the registrar's owner (the deployer until the governance handoff)
-		IValueInterpreterAdmin admin = IValueInterpreterAdmin(vi.owner());
-		vm.startPrank(Ownable(address(admin)).owner());
+		ViAdmin memory admin = ViAdmin(IValueInterpreterAdmin(vi.owner()), IRegistrarV2Passthrough(address(0)));
+		vm.startPrank(Ownable(address(admin.owner)).owner());
 		uint256 updated = VerantaListing.setPriceLifetime(STORE, admin, pairConfig, vi, 10 minutes);
 		assertEq(VerantaListing.setPriceLifetime(STORE, admin, pairConfig, vi, 10 minutes), 0, 'a second run is a no-op');
 		vm.stopPrank();

@@ -12,6 +12,8 @@
 # addPrimitive goes through the VI's owner's `execute`: the registrar named in
 # deployments/base-mainnet-pool-pricing.json (POOL_PRICING_FILE) or, before the switch-over, the
 # module named in deployments/base-mainnet-twap-v2.json (TWAP_V2_FILE). Anything else is refused.
+# Since registrar V2 (deployments/base-mainnet-v4.json `registrar`, or V4_FILE) took over that registrar
+# (2026-10-09), the call goes through registrar V2's callOldRegistrar; its owner, the deployer, sends it.
 # cast, NOT forge: B20 tokens are a Base node precompile that Foundry's EVM does not implement
 # (a local call to decimals() fails with OpcodeNotFound), so a forge script dies simulating
 # addPrimitive. cast sends to the real chain, where B20 works.
@@ -28,6 +30,7 @@ RPC=${BASE_RPC_URL:?set BASE_RPC_URL}
 DEPLOYMENTS=${DEPLOYMENTS_FILE:-deployments/base-mainnet.json}
 TWAP_V2=${TWAP_V2_FILE:-deployments/base-mainnet-twap-v2.json}
 POOL_PRICING=${POOL_PRICING_FILE:-deployments/base-mainnet-pool-pricing.json}
+V4_BOOK=${V4_FILE:-deployments/base-mainnet-v4.json}
 STALENESS=432000 # 5 days — outlives weekend + holiday closures (longest seen ≈ 92.5h); VI max is 7 days
 
 # The stock list is no longer hard-coded (2026-10-05). Base's DeFi guide
@@ -84,6 +87,13 @@ if [ -f "$DEPLOYMENTS" ]; then
 	done
 	[ -n "$ADMIN" ] || fail "the VI's owner $OWNER is neither the pool-pricing registrar nor the TWAP v2 module"
 	echo "$ADMIN owns the VI"
+	VIA_V2=""
+	if [ -f "$V4_BOOK" ]; then
+		REGISTRAR_V2=$(python3 -c "import json; print(json.load(open('$V4_BOOK')).get('registrar', ''))" | tr '[:upper:]' '[:lower:]')
+		ADMIN_OWNER=$(call "$ADMIN" 'owner()(address)' | tr '[:upper:]' '[:lower:]')
+		[ -n "$REGISTRAR_V2" ] && [ "$ADMIN_OWNER" = "$REGISTRAR_V2" ] && VIA_V2=$REGISTRAR_V2
+	fi
+	[ -z "$VIA_V2" ] || echo "registrar V2 $VIA_V2 owns it: listings go through callOldRegistrar"
 else
 	echo "no $DEPLOYMENTS yet — checking tokens and feeds only"
 fi
@@ -117,8 +127,13 @@ echo "── listing"
 for row in "${ROWS[@]}"; do
 	read -r SYM TOKEN FEED <<<"$row"
 	if [ "$(call "$VI" 'isSupportedAsset(address)(bool)' "$TOKEN")" != "true" ]; then
-		cast send "$ADMIN" 'execute(bytes)' "$(cast calldata 'addPrimitive(address,address,uint32)' "$TOKEN" "$FEED" "$STALENESS")" \
-			--rpc-url "$RPC" --private-key "$KEY" >/dev/null || fail "addPrimitive $SYM"
+		ADD=$(cast calldata 'addPrimitive(address,address,uint32)' "$TOKEN" "$FEED" "$STALENESS")
+		if [ -n "$VIA_V2" ]; then
+			cast send "$VIA_V2" 'callOldRegistrar(bytes)' "$(cast calldata 'execute(bytes)' "$ADD")" \
+				--rpc-url "$RPC" --private-key "$KEY" >/dev/null || fail "addPrimitive $SYM"
+		else
+			cast send "$ADMIN" 'execute(bytes)' "$ADD" --rpc-url "$RPC" --private-key "$KEY" >/dev/null || fail "addPrimitive $SYM"
+		fi
 	fi
 	RATE=$(call "$VI" 'calcUsdRate(address)(uint256)' "$TOKEN" | awk '{print $1}')
 	printf '✓ %-7s listed · VI rate %s\n' "$SYM" "$RATE"

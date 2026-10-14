@@ -3,7 +3,7 @@ pragma solidity 0.8.24;
 
 import {IERC4626} from '@openzeppelin/contracts/interfaces/IERC4626.sol';
 import {ValueInterpreter} from '../../src/core/ValueInterpreter.sol';
-import {IValueInterpreterAdmin} from './ListingModuleBook.sol';
+import {ViAdmin} from './ListingModuleBook.sol';
 
 /// @title YieldListing
 /// @notice The yield vaults funds can deposit into through the generic ERC4626Adapter,
@@ -54,7 +54,7 @@ library YieldListing {
 		v[3] = IPOR_NVDA_CARRY;
 	}
 
-	function listAll(IValueInterpreterAdmin admin, ValueInterpreter vi, address feed, address[] memory vaults)
+	function listAll(ViAdmin memory admin, ValueInterpreter vi, address feed, address[] memory vaults)
 		internal
 		returns (uint256 listed)
 	{

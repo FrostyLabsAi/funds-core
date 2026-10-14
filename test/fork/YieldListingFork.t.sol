@@ -9,7 +9,7 @@ import {ERC4626PriceFeed} from '../../src/pricing/ERC4626PriceFeed.sol';
 import {MockERC20} from '../utils/Mocks.sol';
 import {VerantaFundingFixture as Fx} from '../utils/VerantaFundingFixture.sol';
 import {FundsMainnet} from '../../script/mainnet/FundsMainnet.sol';
-import {IValueInterpreterAdmin} from '../../script/mainnet/ListingModuleBook.sol';
+import {IRegistrarV2Passthrough, IValueInterpreterAdmin, ViAdmin} from '../../script/mainnet/ListingModuleBook.sol';
 import {YieldListing} from '../../script/mainnet/YieldListing.sol';
 import {PoolPriceRegistrar} from '../../src/pricing/PoolPriceRegistrar.sol';
 import {FreshPoolPricing} from '../utils/FreshPoolPricing.sol';
@@ -51,7 +51,7 @@ contract YieldListingForkTest is Test {
 
 	function _list() internal returns (uint256 listed) {
 		vm.startPrank(deployer);
-		listed = YieldListing.listAll(IValueInterpreterAdmin(address(registrar)), d.valueInterpreter, feed, YieldListing.nonStockVaults());
+		listed = YieldListing.listAll(ViAdmin(IValueInterpreterAdmin(address(registrar)), IRegistrarV2Passthrough(address(0))), d.valueInterpreter, feed, YieldListing.nonStockVaults());
 		vm.stopPrank();
 	}
 
@@ -97,7 +97,7 @@ contract YieldListingForkTest is Test {
 
 	function listExternal(address[] memory vaults) external {
 		vm.startPrank(deployer);
-		YieldListing.listAll(IValueInterpreterAdmin(address(registrar)), d.valueInterpreter, feed, vaults);
+		YieldListing.listAll(ViAdmin(IValueInterpreterAdmin(address(registrar)), IRegistrarV2Passthrough(address(0))), d.valueInterpreter, feed, vaults);
 		vm.stopPrank();
 	}
 
