@@ -9,7 +9,7 @@ import {MockERC20} from '../utils/Mocks.sol';
 import {VerantaFundingFixture as Fx} from '../utils/VerantaFundingFixture.sol';
 import {FundsMainnet} from '../../script/mainnet/FundsMainnet.sol';
 import {VerantaListing, IVerantaPairCatalog} from '../../script/mainnet/VerantaListing.sol';
-import {IValueInterpreterAdmin} from '../../script/mainnet/ListingModuleBook.sol';
+import {IRegistrarV2Passthrough, IValueInterpreterAdmin, ViAdmin} from '../../script/mainnet/ListingModuleBook.sol';
 import {PoolPriceRegistrar} from '../../src/pricing/PoolPriceRegistrar.sol';
 import {FreshPoolPricing} from '../utils/FreshPoolPricing.sol';
 
@@ -51,7 +51,7 @@ contract VerantaListingForkTest is Test {
 	function test_fork_listsEveryUnmappedLazerPair_withTheTenMinuteLifetime() public {
 		vm.skip(!forked);
 		vm.startPrank(deployer);
-		uint256 listed = VerantaListing.listAll(store, IValueInterpreterAdmin(address(registrar)), d.verantaFactory);
+		uint256 listed = VerantaListing.listAll(store, ViAdmin(IValueInterpreterAdmin(address(registrar)), IRegistrarV2Passthrough(address(0))), d.verantaFactory);
 		vm.stopPrank();
 
 		uint256 expected;
@@ -85,7 +85,7 @@ contract VerantaListingForkTest is Test {
 	function test_fork_afterARelay_theViPricesListedMarkersAtVerantasPrice() public {
 		vm.skip(!forked);
 		vm.startPrank(deployer);
-		VerantaListing.listAll(store, IValueInterpreterAdmin(address(registrar)), d.verantaFactory);
+		VerantaListing.listAll(store, ViAdmin(IValueInterpreterAdmin(address(registrar)), IRegistrarV2Passthrough(address(0))), d.verantaFactory);
 		vm.stopPrank();
 		store.relayFunding{value: 1 ether}(Fx.calldata_());
 
@@ -104,8 +104,8 @@ contract VerantaListingForkTest is Test {
 	function test_fork_listingTwiceIsANoOp() public {
 		vm.skip(!forked);
 		vm.startPrank(deployer);
-		VerantaListing.listAll(store, IValueInterpreterAdmin(address(registrar)), d.verantaFactory);
-		assertEq(VerantaListing.listAll(store, IValueInterpreterAdmin(address(registrar)), d.verantaFactory), 0, 'already-mapped pairs are skipped');
+		VerantaListing.listAll(store, ViAdmin(IValueInterpreterAdmin(address(registrar)), IRegistrarV2Passthrough(address(0))), d.verantaFactory);
+		assertEq(VerantaListing.listAll(store, ViAdmin(IValueInterpreterAdmin(address(registrar)), IRegistrarV2Passthrough(address(0))), d.verantaFactory), 0, 'already-mapped pairs are skipped');
 		vm.stopPrank();
 	}
 }

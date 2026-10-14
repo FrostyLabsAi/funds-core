@@ -5,7 +5,7 @@ import {Script, console2} from 'forge-std/Script.sol';
 import {ValueInterpreter} from '../../src/core/ValueInterpreter.sol';
 import {ERC4626PriceFeed} from '../../src/pricing/ERC4626PriceFeed.sol';
 import {YieldListing} from './YieldListing.sol';
-import {ListingModuleBook, IValueInterpreterAdmin} from './ListingModuleBook.sol';
+import {ListingModuleBook, ViAdmin} from './ListingModuleBook.sol';
 
 /// @notice Runbook step 3, AFTER list-coinbase-stocks.sh (the IPOR stock vaults need their stock
 ///         priced): deploy one ERC4626PriceFeed (or reuse YIELD_FEED) and register every vault in
@@ -20,7 +20,7 @@ contract ListYieldVaults is Script {
 	function run() external {
 		require(block.chainid == 8453, 'Base (8453) only');
 		string memory json = vm.readFile(vm.envOr('DEPLOYMENTS_FILE', string('deployments/base-mainnet.json')));
-		IValueInterpreterAdmin admin = ListingModuleBook.admin(vm, json);
+		ViAdmin memory admin = ListingModuleBook.admin(vm, json);
 		ValueInterpreter vi = ValueInterpreter(vm.parseJsonAddress(json, '.valueInterpreter'));
 
 		vm.startBroadcast();

@@ -6,7 +6,7 @@ import {ValueInterpreter} from '../../src/core/ValueInterpreter.sol';
 import {VerantaPerpPositionV2Factory} from '../../src/positions/VerantaPerpPositionV2.sol';
 import {VerantaPriceStore} from '../../src/pricing/VerantaPriceStore.sol';
 import {VerantaListing} from './VerantaListing.sol';
-import {ListingModuleBook, IValueInterpreterAdmin} from './ListingModuleBook.sol';
+import {ListingModuleBook, ViAdmin} from './ListingModuleBook.sol';
 
 /// @notice Stock perps priced at Veranta's own price (founder 2026-10-06): the 13 stock perps mapped to
 ///         their Coinbase tokens (deployments/base-mainnet-stock-hedges.json) move to Veranta-priced
@@ -31,7 +31,7 @@ contract RepointStockPerps is Script {
 		string memory json = vm.readFile(vm.envOr('DEPLOYMENTS_FILE', string('deployments/base-mainnet.json')));
 		VerantaPerpPositionV2Factory factory = VerantaPerpPositionV2Factory(vm.parseJsonAddress(json, '.verantaFactory'));
 		ValueInterpreter vi = ValueInterpreter(vm.parseJsonAddress(json, '.valueInterpreter'));
-		IValueInterpreterAdmin admin = ListingModuleBook.admin(vm, json);
+		ViAdmin memory admin = ListingModuleBook.admin(vm, json);
 		VerantaPriceStore store = VerantaPriceStore(
 			vm.envOr('STORE', vm.parseJsonAddress(vm.readFile('deployments/base-mainnet-veranta.json'), '.store'))
 		);

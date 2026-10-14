@@ -6,7 +6,7 @@ import {VerantaPerpPositionV2Factory} from '../../src/positions/VerantaPerpPosit
 import {VerantaPriceStore, IPythLazerVerifier, IVerantaLazerPairs} from '../../src/pricing/VerantaPriceStore.sol';
 import {FundsMainnet} from './FundsMainnet.sol';
 import {VerantaListing} from './VerantaListing.sol';
-import {ListingModuleBook, IValueInterpreterAdmin} from './ListingModuleBook.sol';
+import {ListingModuleBook, ViAdmin} from './ListingModuleBook.sol';
 
 /// @notice Runbook step 3 (while the deployer still owns the VI and the perp factory): deploy the
 ///         Veranta price store (or reuse STORE) and list every Veranta pair genesis left unmapped —
@@ -22,7 +22,7 @@ contract ListVerantaPairs is Script {
 		require(block.chainid == 8453, 'Base (8453) only');
 		string memory json = vm.readFile(vm.envOr('DEPLOYMENTS_FILE', string('deployments/base-mainnet.json')));
 		VerantaPerpPositionV2Factory factory = VerantaPerpPositionV2Factory(vm.parseJsonAddress(json, '.verantaFactory'));
-		IValueInterpreterAdmin admin = ListingModuleBook.admin(vm, json);
+		ViAdmin memory admin = ListingModuleBook.admin(vm, json);
 
 		vm.startBroadcast();
 		VerantaPriceStore store = VerantaPriceStore(vm.envOr('STORE', address(0)));

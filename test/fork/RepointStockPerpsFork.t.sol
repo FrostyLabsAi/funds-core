@@ -10,7 +10,7 @@ import {VerantaPriceStore} from '../../src/pricing/VerantaPriceStore.sol';
 import {VerantaPriceAdapter} from '../../src/pricing/VerantaPriceAdapter.sol';
 import {FundsMainnet} from '../../script/mainnet/FundsMainnet.sol';
 import {VerantaListing, IVerantaPairCatalog} from '../../script/mainnet/VerantaListing.sol';
-import {IValueInterpreterAdmin} from '../../script/mainnet/ListingModuleBook.sol';
+import {IRegistrarV2Passthrough, IValueInterpreterAdmin, ViAdmin} from '../../script/mainnet/ListingModuleBook.sol';
 import {RepointStockPerps} from '../../script/mainnet/RepointStockPerps.s.sol';
 
 /// @notice Rehearsal of script/mainnet/RepointStockPerps.s.sol on the LIVE Base deployment (founder
@@ -37,7 +37,7 @@ contract RepointStockPerpsForkTest is Test {
 	bool internal forked;
 	VerantaPerpPositionV2Factory internal factory;
 	ValueInterpreter internal vi;
-	IValueInterpreterAdmin internal admin;
+	ViAdmin internal admin;
 	address internal owner;
 	RepointStockPerps internal script;
 	string internal hedges;
@@ -53,8 +53,8 @@ contract RepointStockPerpsForkTest is Test {
 		string memory genesis = vm.readFile('deployments/base-mainnet.json');
 		factory = VerantaPerpPositionV2Factory(vm.parseJsonAddress(genesis, '.verantaFactory'));
 		vi = ValueInterpreter(vm.parseJsonAddress(genesis, '.valueInterpreter'));
-		admin = IValueInterpreterAdmin(vi.owner()); // the pool-pricing registrar
-		owner = Ownable(address(admin)).owner(); // the deployer until the governance handoff
+		admin = ViAdmin(IValueInterpreterAdmin(vi.owner()), IRegistrarV2Passthrough(address(0))); // the pool-pricing registrar, its owner calling
+		owner = Ownable(address(admin.owner)).owner(); // the deployer until the governance handoff
 		assertEq(Ownable(address(factory)).owner(), owner, 'the deployer owns both');
 		script = new RepointStockPerps();
 		hedges = vm.readFile('deployments/base-mainnet-stock-hedges.json');

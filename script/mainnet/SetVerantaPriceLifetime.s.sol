@@ -6,7 +6,7 @@ import {ValueInterpreter} from '../../src/core/ValueInterpreter.sol';
 import {VerantaPerpPositionV2Factory} from '../../src/positions/VerantaPerpPositionV2.sol';
 import {VerantaPriceStore} from '../../src/pricing/VerantaPriceStore.sol';
 import {VerantaListing} from './VerantaListing.sol';
-import {ListingModuleBook, IValueInterpreterAdmin} from './ListingModuleBook.sol';
+import {ListingModuleBook, ViAdmin} from './ListingModuleBook.sol';
 
 /// @notice Perp prices on demand (founder 2026-10-05, PLAN_PERP_PULL_PRICING step 6): every Veranta
 ///         pair priced from the store gets a 10-minute heartbeat in the VI — see
@@ -25,7 +25,7 @@ contract SetVerantaPriceLifetime is Script {
 		string memory json = vm.readFile(vm.envOr('DEPLOYMENTS_FILE', string('deployments/base-mainnet.json')));
 		VerantaPerpPositionV2Factory factory = VerantaPerpPositionV2Factory(vm.parseJsonAddress(json, '.verantaFactory'));
 		ValueInterpreter vi = ValueInterpreter(vm.parseJsonAddress(json, '.valueInterpreter'));
-		IValueInterpreterAdmin admin = ListingModuleBook.admin(vm, json);
+		ViAdmin memory admin = ListingModuleBook.admin(vm, json);
 		VerantaPriceStore store = VerantaPriceStore(
 			vm.envOr('STORE', vm.parseJsonAddress(vm.readFile('deployments/base-mainnet-veranta.json'), '.store'))
 		);

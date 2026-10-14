@@ -7,7 +7,7 @@ import {VerantaPerpPositionV2Factory} from '../../src/positions/VerantaPerpPosit
 import {PriceMarker} from '../../src/pricing/PriceMarker.sol';
 import {VerantaPriceStore} from '../../src/pricing/VerantaPriceStore.sol';
 import {VerantaPriceAdapter} from '../../src/pricing/VerantaPriceAdapter.sol';
-import {IValueInterpreterAdmin} from './ListingModuleBook.sol';
+import {ViAdmin} from './ListingModuleBook.sol';
 import {FundsMainnet} from './FundsMainnet.sol';
 
 /// @notice Veranta's PairStorage views the listing walks (verified ABI, impl 0x2511bF7e…).
@@ -32,7 +32,7 @@ interface IVerantaPairCatalog {
 ///         an old price is never used. It was 1 hour for crypto and 5 days for closed-market groups
 ///         while a keeper pushed on a schedule. Lazer publishes closed-market prices too, so a
 ///         weekend never blocks a fund. The primitive is added through the VI's owner
-///         (`admin.execute`: the pool-pricing registrar; its owner only).
+///         (`admin.execute`: the pool-pricing registrar, through registrar V2 since 2026-10-09; see ListingModuleBook).
 library VerantaListing {
 	/// @notice Pyth Lazer's verifier on Base — the one Veranta's PriceAggregator uses.
 	address internal constant PYTH_LAZER_VERIFIER = 0xACeA761c27A909d4D3895128EBe6370FDE2dF481;
@@ -40,7 +40,7 @@ library VerantaListing {
 	/// @notice How old a stored Veranta price may be when the VI reads it (the primitive's heartbeat).
 	uint32 internal constant PRICE_LIFETIME = 10 minutes;
 
-	function listAll(VerantaPriceStore store, IValueInterpreterAdmin admin, VerantaPerpPositionV2Factory factory)
+	function listAll(VerantaPriceStore store, ViAdmin memory admin, VerantaPerpPositionV2Factory factory)
 		internal
 		returns (uint256 listed)
 	{
@@ -67,7 +67,7 @@ library VerantaListing {
 	///         first (funds-keeper src/tools/pair-holders.ts).
 	function repointToStore(
 		VerantaPriceStore store,
-		IValueInterpreterAdmin admin,
+		ViAdmin memory admin,
 		VerantaPerpPositionV2Factory factory,
 		ValueInterpreter vi,
 		uint256[] memory pairs,
@@ -89,7 +89,7 @@ library VerantaListing {
 	}
 
 	/// @dev Marker + store adapter (10-minute lifetime) + VI primitive, then the pair is mapped to the marker.
-	function _listPair(VerantaPriceStore store, IValueInterpreterAdmin admin, VerantaPerpPositionV2Factory factory, uint256 i)
+	function _listPair(VerantaPriceStore store, ViAdmin memory admin, VerantaPerpPositionV2Factory factory, uint256 i)
 		private
 		returns (address)
 	{
@@ -111,7 +111,7 @@ library VerantaListing {
 	///         second run is a no-op. Reversible: run again with the old heartbeat.
 	function setPriceLifetime(
 		VerantaPriceStore store,
-		IValueInterpreterAdmin admin,
+		ViAdmin memory admin,
 		VerantaPerpPositionV2Factory factory,
 		ValueInterpreter vi,
 		uint32 lifetime
