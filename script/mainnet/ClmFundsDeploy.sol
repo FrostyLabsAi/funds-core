@@ -27,6 +27,19 @@ library ClmFundsDeploy {
 		FundFactory(FUND_FACTORY).registerAdapter(address(adapter));
 	}
 
+	/// @notice Lists the vaults the VI doesn't price yet (vaults deployed after DeployClmFunds, 2026-10-14), so a rerun
+	///         lists nothing. The VI refuses a vault the feed doesn't support (FeedDoesNotSupportAsset).
+	function listUnpriced(ClmVaultPriceFeed feed, address[] memory vaults) internal returns (uint256 listed) {
+		address[] memory unpriced = new address[](vaults.length);
+		for (uint256 i; i < vaults.length; ++i) {
+			if (!ValueInterpreter(VALUE_INTERPRETER).isSupportedAsset(vaults[i])) unpriced[listed++] = vaults[i];
+		}
+		assembly ('memory-safe') {
+			mstore(unpriced, listed)
+		}
+		list(feed, unpriced);
+	}
+
 	/// @notice Lists each vault in the VI through registrar V2 → today's registrar.
 	function list(ClmVaultPriceFeed feed, address[] memory vaults) internal {
 		for (uint256 i; i < vaults.length; ++i) {
