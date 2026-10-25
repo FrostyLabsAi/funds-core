@@ -11,12 +11,14 @@ import {ClmFundsDeploy} from './ClmFundsDeploy.sol';
 ///         feed and an adapter; already-priced vaults are skipped. Rehearsed in test/fork/ListClmVaultsFork.t.sol.
 ///         Run: forge script script/mainnet/ListClmVaults.s.sol --rpc-url base --account frosty-main --sender <deployer>
 ///              --broadcast --slow
+///         CLM v2 on Aero (2026-10-25): CLM_BOOK=deployments/base-mainnet-clm-v2.json lists its vaults the same way (the
+///         feed prices them as v1's: same strategy factory).
 contract ListClmVaults is Script {
 	string public constant CLM_PATH = 'deployments/base-mainnet-clm.json';
 	string public constant CLM_FUNDS_PATH = 'deployments/base-mainnet-clm-funds.json';
 
 	function run() external {
-		string memory clm = vm.readFile(CLM_PATH);
+		string memory clm = vm.readFile(vm.envOr('CLM_BOOK', CLM_PATH));
 		string[] memory symbols = vm.parseJsonKeys(clm, '.vaults');
 		address[] memory vaults = new address[](symbols.length);
 		for (uint256 i; i < symbols.length; ++i) {

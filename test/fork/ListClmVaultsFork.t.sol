@@ -44,7 +44,9 @@ contract ListClmVaultsFork is Test {
 		string memory clm = vm.readFile('deployments/base-mainnet-clm.json');
 		string[] memory symbols = vm.parseJsonKeys(clm, '.vaults');
 		for (uint256 i; i < symbols.length; ++i) {
-			listed.push(vm.parseJsonAddress(clm, string.concat('.vaults.', symbols[i], '.vault')));
+			address vault = vm.parseJsonAddress(clm, string.concat('.vaults.', symbols[i], '.vault'));
+			// the book grew after this block (15 more pools, deployed after DeployClmFunds): only the vaults that exist here
+			if (vault.code.length > 0) listed.push(vault);
 		}
 	}
 
@@ -66,6 +68,7 @@ contract ListClmVaultsFork is Test {
 
 	function test_fork_listsOnlyTheUnpricedVaults() public {
 		vm.skip(!forked);
+		assertEq(listed.length, 10, 'the first 10 exist at this block');
 		for (uint256 i; i < listed.length; ++i) assertTrue(vi.isSupportedAsset(listed[i]), 'the first 10 are priced');
 		address fresh = _deployWethZro();
 		assertFalse(vi.isSupportedAsset(fresh), 'a new vault starts unpriced');
