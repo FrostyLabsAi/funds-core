@@ -59,9 +59,12 @@ interface ICLPoolGauge {
 ///         (1 min deposit window + accruals) and `_accrue` asserts the WETH feed is still fresh. The
 ///         ETH/USD rounds before the pinned one are 750–1,230 s apart, so an unpinned block's round is
 ///         young enough for 1,860 s too (≤ ~1,230 + 1,860 < 3,600).
-///         Run: BASE_MAINNET_RPC=<url> [BASE_FORK_BLOCK=52014634] forge test --match-path test/fork/SlipstreamLPPositionV2Fork.t.sol -j 1 -vv
+///         Run: BASE_MAINNET_RPC=<url> forge test --match-path test/fork/SlipstreamLPPositionV2Fork.t.sol -j 1 -vv
 contract SlipstreamLPPositionV2ForkTest is Test {
 	string internal constant GENESIS_FILE = 'deployments/base-mainnet.json';
+	/// @dev The default fork block since 2026-10-25: at the live head the Aero merger (2026-10-22) has killed these
+	///      gauges, and the factory makes newer funds than the genesis Comptroller these tests deposit into.
+	uint256 internal constant PINNED_BLOCK = 52_014_634;
 
 	address internal constant WETH = FundsMainnet.WETH; // token0 of both pools (0x42… < 0x83…)
 	address internal constant USDC = FundsMainnet.USDC;
@@ -137,9 +140,7 @@ contract SlipstreamLPPositionV2ForkTest is Test {
 	function setUp() public {
 		string memory rpc = vm.envOr('BASE_MAINNET_RPC', string(''));
 		if (bytes(rpc).length == 0) return;
-		uint256 blockNumber = vm.envOr('BASE_FORK_BLOCK', uint256(0));
-		if (blockNumber > 0) vm.createSelectFork(rpc, blockNumber);
-		else vm.createSelectFork(rpc);
+		vm.createSelectFork(rpc, vm.envOr('BASE_FORK_BLOCK', PINNED_BLOCK));
 		forked = true;
 
 		string memory genesis = vm.readFile(GENESIS_FILE);

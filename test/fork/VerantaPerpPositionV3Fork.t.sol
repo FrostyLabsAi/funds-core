@@ -93,7 +93,7 @@ interface IVerantaOperatorRouter {
 ///         $2,685.28631153, published 1790818690, Lazer signature verified on-chain by the aggregator.
 ///         MARKET_OPEN accepts a packet newer than block.timestamp − 60 s and has no upper bound, so the
 ///         fill warps to 2 s after publication. Spread params and the 1 wei Lazer fee are those of that tx.
-///         Run: BASE_MAINNET_RPC=<url> BASE_FORK_BLOCK=52014634 forge test --match-path test/fork/VerantaPerpPositionV3Fork.t.sol -j 1 -vv
+///         Run: BASE_MAINNET_RPC=<url> forge test --match-path test/fork/VerantaPerpPositionV3Fork.t.sol -j 1 -vv
 contract VerantaPerpPositionV3ForkTest is Test {
 	string internal constant GENESIS_FILE = 'deployments/base-mainnet.json';
 	uint256 internal constant PINNED_BLOCK = 52014634;
@@ -169,9 +169,9 @@ contract VerantaPerpPositionV3ForkTest is Test {
 	function setUp() public {
 		string memory rpc = vm.envOr('BASE_MAINNET_RPC', string(''));
 		if (bytes(rpc).length == 0) return;
-		uint256 blockNumber = vm.envOr('BASE_FORK_BLOCK', uint256(0));
-		if (blockNumber > 0) vm.createSelectFork(rpc, blockNumber);
-		else vm.createSelectFork(rpc);
+		// pinned by default since 2026-10-25: at the live head the founder ops this setUp rehearses are done (the DAO
+		// Safe registered 'frostydao'; the shared config points at it), so registerCode reverts CodeAlreadyExists
+		vm.createSelectFork(rpc, vm.envOr('BASE_FORK_BLOCK', PINNED_BLOCK));
 		forked = true;
 
 		string memory genesis = vm.readFile(GENESIS_FILE);
