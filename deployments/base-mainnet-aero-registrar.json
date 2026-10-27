@@ -1,0 +1,7 @@
+{
+  "fundV6Deployer": "0x4456b58d40A206A8cd17eAE1C796150C6154a0ba",
+  "policy": "0xA6Ac6C8c3FFcdB6a1b85747289bd7049e2A7fcF3",
+  "registrar": "0xF867a01419d805A76A4637304f13d486EcB5749c",
+  "startBlock": 53173142,
+  "v4Adapter": "0x8a078601Cfd8AB2dD7bB9D506D3021eb66Fd39E7"
+}
