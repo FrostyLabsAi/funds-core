@@ -18,10 +18,11 @@ interface IRegistrarV2Passthrough {
 
 /// @notice Where a listing script's VI admin calls go: the VI's owner, called directly by its owner,
 ///         or — since registrar V2 took ownership of that registrar (2026-10-09) — through registrar
-///         V2's `callOldRegistrar`, which only registrar V2's owner (the deployer) may call.
+///         V2's `callOldRegistrar`, which only registrar V2's owner (the deployer) may call; once registrar V3
+///         owns V2 (the Aero venue, 2026-10-25), through V3's `callOldRegistrar`, the same call one hop further.
 struct ViAdmin {
 	IValueInterpreterAdmin owner; // the VI's owner (today's registrar)
-	IRegistrarV2Passthrough registrarV2; // that registrar's owner when it is registrar V2, else zero
+	IRegistrarV2Passthrough registrarV2; // that registrar's owner when it is registrar V2 (or V3 when V3 owns V2), else zero
 }
 
 using ListingModuleBook for ViAdmin global;
@@ -54,12 +55,18 @@ library ListingModuleBook {
 		return abi.decode(result, (bytes));
 	}
 
-	/// @dev `registrarOwner` when it is the registrar V2 named in the v4 book, else zero.
+	/// @dev `registrarOwner` when it is the registrar V2 named in the v4 book — or, when V2 is owned by the registrar
+	///      V3 named in the Aero registrar book (or AERO_REGISTRAR_FILE), V3 — else zero.
 	function _registrarV2(Vm vm, address registrarOwner) private view returns (IRegistrarV2Passthrough) {
 		string memory v4File = vm.envOr('V4_FILE', string('deployments/base-mainnet-v4.json'));
-		if (vm.exists(v4File) && vm.parseJsonAddress(vm.readFile(v4File), '.registrar') == registrarOwner) {
-			return IRegistrarV2Passthrough(registrarOwner);
+		if (!vm.exists(v4File) || vm.parseJsonAddress(vm.readFile(v4File), '.registrar') != registrarOwner) {
+			return IRegistrarV2Passthrough(address(0));
 		}
-		return IRegistrarV2Passthrough(address(0));
+		string memory aeroFile = vm.envOr('AERO_REGISTRAR_FILE', string('deployments/base-mainnet-aero-registrar.json'));
+		address v2Owner = Ownable(registrarOwner).owner();
+		if (vm.exists(aeroFile) && vm.parseJsonAddress(vm.readFile(aeroFile), '.registrar') == v2Owner) {
+			return IRegistrarV2Passthrough(v2Owner);
+		}
+		return IRegistrarV2Passthrough(registrarOwner);
 	}
 }

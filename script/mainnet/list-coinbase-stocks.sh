@@ -45,7 +45,20 @@ CL_DIRECTORY=${CL_DIRECTORY:-https://reference-data-directory.vercel.app/feeds-e
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-curl -sf -m 60 "$CB_API" -o "$WORK/coinbase.json" || { echo "✗ FAIL: can't read $CB_API"; exit 1; }
+# the API pages 100 tokens at a time (2026-10-25: 211 stocks over three pages; reading one page missed 111)
+python3 - "$CB_API" "$WORK/coinbase.json" <<'EOF' || { echo "✗ FAIL: can't read $CB_API"; exit 1; }
+import json, sys, urllib.parse, urllib.request
+api, out = sys.argv[1], sys.argv[2]
+tokens, page = [], None
+while True:
+	url = api + (f'?page_token={urllib.parse.quote(page)}' if page else '')
+	body = json.load(urllib.request.urlopen(urllib.request.Request(url, headers={'user-agent': 'curl/8.5.0'}), timeout=60))
+	tokens += body['tokens']
+	page = body.get('next_page_token')
+	if not page:
+		break
+json.dump({'tokens': tokens}, open(out, 'w'))
+EOF
 curl -sf -m 60 "$CL_DIRECTORY" -o "$WORK/chainlink.json" || { echo "✗ FAIL: can't read $CL_DIRECTORY"; exit 1; }
 # rows: SYM TOKEN FEED NAV — one per Coinbase stock with a Chainlink feed
 python3 - "$WORK" <<'EOF'
@@ -93,7 +106,13 @@ if [ -f "$DEPLOYMENTS" ]; then
 		ADMIN_OWNER=$(call "$ADMIN" 'owner()(address)' | tr '[:upper:]' '[:lower:]')
 		[ -n "$REGISTRAR_V2" ] && [ "$ADMIN_OWNER" = "$REGISTRAR_V2" ] && VIA_V2=$REGISTRAR_V2
 	fi
-	[ -z "$VIA_V2" ] || echo "registrar V2 $VIA_V2 owns it: listings go through callOldRegistrar"
+	# once registrar V3 owns V2 (the Aero venue, 2026-10-25) the deployer sends the same callOldRegistrar to V3
+	AERO_BOOK=${AERO_REGISTRAR_FILE:-deployments/base-mainnet-aero-registrar.json}
+	if [ -n "$VIA_V2" ] && [ -f "$AERO_BOOK" ]; then
+		V3=$(python3 -c "import json; print(json.load(open('$AERO_BOOK')).get('registrar', ''))" | tr '[:upper:]' '[:lower:]')
+		[ -n "$V3" ] && [ "$(call "$VIA_V2" 'owner()(address)' | tr '[:upper:]' '[:lower:]')" = "$V3" ] && VIA_V2=$V3
+	fi
+	[ -z "$VIA_V2" ] || echo "listings go through $VIA_V2's callOldRegistrar"
 else
 	echo "no $DEPLOYMENTS yet — checking tokens and feeds only"
 fi

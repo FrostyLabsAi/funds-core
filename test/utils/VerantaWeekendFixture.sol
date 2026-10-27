@@ -1,0 +1,96 @@
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity 0.8.24;
+
+/// @notice Real Pyth Lazer packets from Veranta's feed app (GET feed-v3.veranta.xyz/v2/pairs/{i}/price-update-data),
+///         saved on Sunday 2026-10-25 between 23:55:17 and 23:55:45 UTC, two rounds ~24 s apart, for the seven stocks
+///         Veranta prices and funds can buy on Aero. The US market was closed: every packet is signed on Sunday (header)
+///         and carries the stock's last trade on Friday 2026-10-23 just before 24:00 UTC (FEED_US). Fork at BLOCK
+///         (23:55:49 UTC), the first block after the newest header.
+library VerantaWeekendFixture {
+	uint256 internal constant BLOCK = 53_091_601;
+
+	// MU (Veranta pair 100, Lazer feed 1298): 87992000 × 10^-5, last trade Fri 23:59:59.95 UTC
+	uint256 internal constant MU_PAIR = 100;
+	int64 internal constant MU_PRICE = 87992000;
+	int16 internal constant MU_EXPONENT = -5;
+	uint64 internal constant MU_FEED_US = 1792799999950000;
+	uint64 internal constant MU_HEADER_1 = 1792972517400000;
+	bytes internal constant MU_PACKET_1 =
+		hex'2a22999ae51b54642f13f669298abd24eb5b187a5d5c55192ec685c679843c782fc9c15e6d1f4f437324cc580020668f7828d0e0501d34872149e22653752f9a54dcc8fe01003293c7d37500065eb2f1fdddc0020100000512040000000000053ea6c004fffb050000000000001b580c0100065e8ac7267cb0';
+	uint64 internal constant MU_HEADER_2 = 1792972541750000;
+	bytes internal constant MU_PACKET_2 =
+		hex'2a22999a46a35d48f57a563cbfc27c76d28cda61b909e02a7baea52dcf926ebc4f5247ea4ae6f36bf0feda783c957cf6432691a45810a569ef53db2b0a83f7ffef5152d000003293c7d37500065eb2f3716af0020100000512040000000000053ea6c004fffb050000000000001b580c0100065e8ac7267cb0';
+
+	// PLTR (Veranta pair 110, Lazer feed 1346): 19742000 × 10^-5, last trade Fri 23:59:59.95 UTC
+	uint256 internal constant PLTR_PAIR = 110;
+	int64 internal constant PLTR_PRICE = 19742000;
+	int16 internal constant PLTR_EXPONENT = -5;
+	uint64 internal constant PLTR_FEED_US = 1792799999950000;
+	uint64 internal constant PLTR_HEADER_1 = 1792972518000000;
+	bytes internal constant PLTR_PACKET_1 =
+		hex'2a22999a6a147a7cbefda09959f7a2f5e5f7299ab8867252ab95cb6f562be4e1dc7ff02118047b897bb023e936f510d3d383a8c4fbaddf3fac4fd14bf0d3c7531387b7b400003293c7d37500065eb2f2070580020100000542040000000000012d3d3004fffb0500000000000017150c0100065e8ac7267cb0';
+	uint64 internal constant PLTR_HEADER_2 = 1792972542600000;
+	bytes internal constant PLTR_PACKET_2 =
+		hex'2a22999acc806495644681796de96453b5ca3765348d8543a7d98886c77567632c9306d45d0e68983d3556004a80a7b2015c01462eb7c072369f8a210bbcc858cbee32b700003293c7d37500065eb2f37e6340020100000542040000000000012d3d3004fffb0500000000000017150c0100065e8ac7267cb0';
+
+	// NFLX (Veranta pair 112, Lazer feed 1304): 6575013 × 10^-5, last trade Fri 23:59:59.80 UTC
+	uint256 internal constant NFLX_PAIR = 112;
+	int64 internal constant NFLX_PRICE = 6575013;
+	int16 internal constant NFLX_EXPONENT = -5;
+	uint64 internal constant NFLX_FEED_US = 1792799999800000;
+	uint64 internal constant NFLX_HEADER_1 = 1792972518600000;
+	bytes internal constant NFLX_PACKET_1 =
+		hex'2a22999a1b6e81253ef97fdbf3424d4e523a4b904d1d74ec7b637e2cc38db68c550453ed4cf1146c979dace419926914dc3b439e65e21603c43d997cfaa8be4af3a5733b01003293c7d37500065eb2f2102d40030100000518040000000000006453a504fffb0500000000000018ac0c0100065e8ac72432c0';
+	uint64 internal constant NFLX_HEADER_2 = 1792972543000000;
+	bytes internal constant NFLX_PACKET_2 =
+		hex'2a22999aa13d4451b65120f87ad614a0bc07fb325920044915c71aa2dbb7d6fb4a55d0e445ea495c6e68321d15276fe01bf957f110498fcc66840be8bb9210a6f31fcef401003293c7d37500065eb2f3847dc0030100000518040000000000006453a504fffb0500000000000018ac0c0100065e8ac72432c0';
+
+	// AMD (Veranta pair 98, Lazer feed 949): 51667609 × 10^-5, last trade Fri 23:59:59.95 UTC
+	uint256 internal constant AMD_PAIR = 98;
+	int64 internal constant AMD_PRICE = 51667609;
+	int16 internal constant AMD_EXPONENT = -5;
+	uint64 internal constant AMD_FEED_US = 1792799999950000;
+	uint64 internal constant AMD_HEADER_1 = 1792972519200000;
+	bytes internal constant AMD_PACKET_1 =
+		hex'2a22999af198dc1f49164ee08123ff21b1d8e2d181407152ebbf2b15a0c64a66c92ccf61515035fee4dda834ccb1528904dc09b050c462d58c4954e4281a19280adcac2101003293c7d37500065eb2f21955000201000003b50400000000000314629904fffb050000000000007f610c0100065e8ac7267cb0';
+	uint64 internal constant AMD_HEADER_2 = 1792972543950000;
+	bytes internal constant AMD_PACKET_2 =
+		hex'2a22999ae53af1f0666edc62dfcdd165ab9340a664fd57184db9f2a454297041f5803f3051775af447f1d086a1dfd30a6ec964321dab3ca06b1c67a05fe75b84e7ae369000003293c7d37500065eb2f392fcb00201000003b50400000000000314629904fffb050000000000007f610c0100065e8ac7267cb0';
+
+	// AVGO (Veranta pair 111, Lazer feed 972): 32229999 × 10^-5, last trade Fri 23:59:59.80 UTC
+	uint256 internal constant AVGO_PAIR = 111;
+	int64 internal constant AVGO_PRICE = 32229999;
+	int16 internal constant AVGO_EXPONENT = -5;
+	uint64 internal constant AVGO_FEED_US = 1792799999800000;
+	uint64 internal constant AVGO_HEADER_1 = 1792972519800000;
+	bytes internal constant AVGO_PACKET_1 =
+		hex'2a22999a146d463c99916ea248bcb9d5ffb121d3262914ba7c26c63d42abcf54ca85f64f4eedb59d2b45e4aeb6d4c6072d50d4ffed65e6cdcbdcaaf25c5a76a7b727ffe901003293c7d37500065eb2f2227cc00301000003cc04000000000001ebca6f04fffb05000000000000270f0c0100065e8ac72432c0';
+	uint64 internal constant AVGO_HEADER_2 = 1792972544400000;
+	bytes internal constant AVGO_PACKET_2 =
+		hex'2a22999a2f1cd67bc0159542054071531560ea16392f6242cb85964984e5fed21352d2d5799c4dbc838de3b802f558a08b4c896b6899b8df88586a7dfb5a8014ce56222601003293c7d37500065eb2f399da800301000003cc04000000000001ebca6f04fffb05000000000000270f0c0100065e8ac72432c0';
+
+	// MRVL (Veranta pair 107, Lazer feed 1289): 22784500 × 10^-5, last trade Fri 23:59:59.80 UTC
+	uint256 internal constant MRVL_PAIR = 107;
+	int64 internal constant MRVL_PRICE = 22784500;
+	int16 internal constant MRVL_EXPONENT = -5;
+	uint64 internal constant MRVL_FEED_US = 1792799999800000;
+	uint64 internal constant MRVL_HEADER_1 = 1792972520400000;
+	bytes internal constant MRVL_PACKET_1 =
+		hex'2a22999a1c3a0ca619e84dffec868f0330d45414f0fff52a52cc4e12f1915b0b654fc19941f6a28f983b49f644b720dd1ba18bd4c23e51bfc885908bcba2ff3f54e00d0201003293c7d37500065eb2f22ba480030100000509040000000000015ba9f404fffb050000000000003c8c0c0100065e8ac72432c0';
+	uint64 internal constant MRVL_HEADER_2 = 1792972545000000;
+	bytes internal constant MRVL_PACKET_2 =
+		hex'2a22999a3e8ec8f944b7d4449da9b690c7a566717e8beb3328c022db350509d361f56e675f5145c85980b1d77e4694eefcb040e62be0055b1ceabd3b015f58b2ea18a8fc00003293c7d37500065eb2f3a30240030100000509040000000000015ba9f404fffb050000000000003c8c0c0100065e8ac72432c0';
+
+	// LLY (Veranta pair 120, Lazer feed 1246): 127849538 × 10^-5, last trade Fri 23:59:59.80 UTC
+	uint256 internal constant LLY_PAIR = 120;
+	int64 internal constant LLY_PRICE = 127849538;
+	int16 internal constant LLY_EXPONENT = -5;
+	uint64 internal constant LLY_FEED_US = 1792799999800000;
+	uint64 internal constant LLY_HEADER_1 = 1792972520800000;
+	bytes internal constant LLY_PACKET_1 =
+		hex'2a22999aa8d0fd357b2c4341c24d33610b902b73a7a1dd38f38ac9a924ce3f53ce68044f3592daaf1f258bbb80088a3de372a7633495706cc1b556bad753f7daeafc7efb01003293c7d37500065eb2f231bf000301000004de040000000000079ed44204fffb0500000000000434720c0100065e8ac72432c0';
+	uint64 internal constant LLY_HEADER_2 = 1792972545400000;
+	bytes internal constant LLY_PACKET_2 =
+		hex'2a22999a8626f8c543ac6733991c1804cfb30817de6f2b4def52c125675a2cd2adee4e37209fe20fe5b2ef9028ae9ca85a98defbd57898de98c86458245a176133e6285500003293c7d37500065eb2f3a91cc00301000004de040000000000079ed44204fffb0500000000000434720c0100065e8ac72432c0';
+
+}
