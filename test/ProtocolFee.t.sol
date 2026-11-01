@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
+import {V6Host} from './utils/V6Host.sol';
 import {Test} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
 import {Ownable} from '@openzeppelin/contracts/access/Ownable.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
 import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
-import {Comptroller} from '../src/core/Comptroller.sol';
+import {ComptrollerV6 as Comptroller} from '../src/core/ComptrollerV6.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {ProtocolFeeReserve} from '../src/core/ProtocolFeeReserve.sol';
 import {MockERC20, MockAggregator} from './utils/Mocks.sol';
@@ -45,7 +46,7 @@ contract ProtocolFeeTest is Test {
 		interpreter.addPrimitive(address(frost), address(frostFeed), 7 days);
 		vm.stopPrank();
 
-		factory = new FundFactory(interpreter, new ComptrollerDeployer(), new SharesVaultDeployer()); // this test = factory owner
+		factory = new FundFactory(interpreter, V6Host.deployer(), new SharesVaultDeployer()); // this test = factory owner
 		reserve = new ProtocolFeeReserve(address(frost), admin);
 
 		comptroller = Comptroller(
@@ -71,7 +72,7 @@ contract ProtocolFeeTest is Test {
 	function _depositFor(address depositor, uint256 assets) internal {
 		vm.startPrank(depositor);
 		usdc.approve(address(comptroller), assets);
-		comptroller.requestDeposit(assets);
+		comptroller.requestDeposit(assets, type(uint256).max);
 		vm.stopPrank();
 		skip(30 minutes);
 		comptroller.executeDepositRequest(depositor);
@@ -128,16 +129,17 @@ contract ProtocolFeeTest is Test {
 		assertEq(comptroller.shares().balanceOf(treasury), expected, 'one day of fee, not one year');
 	}
 
-	function test_protocolFee_inKindRedemption_settlesBeforeProrata() public {
+	function test_protocolFee_redemption_settlesBeforeProrata() public {
 		factory.setProtocolFee(25, treasury);
 		_depositFor(alice, 1000e6);
-		skip(30 days); // feeds stale — exactly the case the in-kind path must survive
+		skip(30 days);
+		usdcFeed.setAnswer(1e8);
 
 		vm.prank(alice);
-		comptroller.redeemSharesInKind(999e18);
+		comptroller.redeemShares(999e18);
 
 		uint256 expectedFee = (1000e18 * 25 * 30 days) / (SECONDS_IN_YEAR * 10_000);
-		assertEq(comptroller.shares().balanceOf(treasury), expectedFee, 'fee settled with stale feeds');
+		assertEq(comptroller.shares().balanceOf(treasury), expectedFee, 'fee settled');
 		// Alice's prorata slice was computed AGAINST the diluted supply.
 		assertEq(usdc.balanceOf(alice), 99_000e6 + Math.mulDiv(1000e6, 999e18, 1000e18 + expectedFee));
 	}

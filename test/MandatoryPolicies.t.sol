@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
+import {V6Host} from './utils/V6Host.sol';
 import {Test} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {Ownable} from '@openzeppelin/contracts/access/Ownable.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
 import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
-import {Comptroller} from '../src/core/Comptroller.sol';
+import {ComptrollerV6 as Comptroller} from '../src/core/ComptrollerV6.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {IPolicy} from '../src/interfaces/IPolicy.sol';
 import {MaxConcentrationPolicy} from '../src/policies/MaxConcentrationPolicy.sol';
@@ -30,7 +31,7 @@ contract MandatoryPoliciesTest is Test {
 		usdc = new MockERC20('USD Coin', 'USDC', 6);
 		usdcFeed = new MockAggregator(8, 1e8);
 		vi.addPrimitive(address(usdc), address(usdcFeed), 7 days);
-		factory = new FundFactory(vi, new ComptrollerDeployer(), new SharesVaultDeployer());
+		factory = new FundFactory(vi, V6Host.deployer(), new SharesVaultDeployer());
 		integrationPolicy = new MaxConcentrationPolicy(5_000);
 		depositPolicy = new MinMaxDepositPolicy(1e6, 1_000_000e6);
 	}

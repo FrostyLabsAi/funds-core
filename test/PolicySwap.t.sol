@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
+import {V6Host} from './utils/V6Host.sol';
 import {Test} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {Ownable} from '@openzeppelin/contracts/access/Ownable.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
 import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
-import {Comptroller} from '../src/core/Comptroller.sol';
+import {ComptrollerV6 as Comptroller} from '../src/core/ComptrollerV6.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {IPolicy} from '../src/interfaces/IPolicy.sol';
 import {MaxConcentrationPolicy} from '../src/policies/MaxConcentrationPolicy.sol';
@@ -60,7 +61,7 @@ contract PolicySwapTest is Test {
 		usdc = new MockERC20('USD Coin', 'USDC', 6);
 		usdcFeed = new MockAggregator(8, 1e8);
 		interpreter.addPrimitive(address(usdc), address(usdcFeed), 7 days);
-		factory = new FundFactory(interpreter, new ComptrollerDeployer(), new SharesVaultDeployer());
+		factory = new FundFactory(interpreter, V6Host.deployer(), new SharesVaultDeployer());
 		factory.setGuardian(guardian);
 
 		buggy = new RedemptionGatePolicy(true);
@@ -101,7 +102,7 @@ contract PolicySwapTest is Test {
 		usdc.mint(who, amount);
 		vm.startPrank(who);
 		usdc.approve(address(c), amount);
-		c.requestDeposit(amount);
+		c.requestDeposit(amount, type(uint256).max);
 		vm.stopPrank();
 		skip(30 minutes);
 		c.executeDepositRequest(who);
@@ -139,7 +140,7 @@ contract PolicySwapTest is Test {
 	function test_theBugBlocksCashRedemptions_theSwapFixesIt_everythingElseCarries() public {
 		vm.prank(alice);
 		vm.expectRevert(bytes('redemption gate bug'));
-		fund.redeemSharesForDenominationAsset(1000e18);
+		fund.redeemShares(1000e18);
 
 		factory.setPolicyReplacement(address(buggy), address(fixedGate));
 		vm.expectEmit(true, true, true, false, address(factory));
@@ -159,7 +160,7 @@ contract PolicySwapTest is Test {
 		assertEq(factory.getRequestedPolicySwaps(address(fund)).length, 0);
 
 		vm.prank(alice);
-		fresh.redeemSharesForDenominationAsset(1000e18);
+		fresh.redeemShares(1000e18);
 		assertEq(usdc.balanceOf(alice), 1000e6);
 	}
 

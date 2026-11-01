@@ -9,14 +9,19 @@ import {
 	ComptrollerDeployer, ComptrollerBlueprintDeployer, SharesVaultDeployer
 } from '../src/core/FundComponentDeployers.sol';
 import {Comptroller} from '../src/core/Comptroller.sol';
-import {ComptrollerV2} from '../src/core/ComptrollerV2.sol';
+import {Shares} from '../src/fund/Shares.sol';
+import {ComptrollerV6} from '../src/core/ComptrollerV6.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {IPolicy} from '../src/interfaces/IPolicy.sol';
 import {IUniswapV3SwapRouter} from '../src/interfaces/external/IUniswapV3SwapRouter.sol';
 import {UniswapV3SwapAdapter} from '../src/adapters/UniswapV3SwapAdapter.sol';
 import {PoolPriceRegistrar} from '../src/pricing/PoolPriceRegistrar.sol';
+import {PoolPriceRegistrarWindowed} from '../src/pricing/PoolPriceRegistrarWindowed.sol';
 import {MinPoolLiquidityPolicy} from '../src/policies/MinPoolLiquidityPolicy.sol';
 import {MockERC20, MockAggregator, MockSwapRouter} from './utils/Mocks.sol';
+import {MockRedemptionQueue} from './utils/MockRedemptionQueue.sol';
+import {MockUnwindPosition, MockUnwindPositionFactory} from './utils/MockUnwindPosition.sol';
+import {AllowedSharesTransferRecipientsPolicy} from '../src/policies/AllowedSharesTransferRecipientsPolicy.sol';
 import {
 	ScriptedCLPool,
 	MockUniswapV3Factory,
@@ -24,14 +29,17 @@ import {
 	MockAerodromeBasicFactory
 } from './utils/PoolPriceMocks.sol';
 
-/// @notice Fund version 2 (PLAN_FUND_V2_2026-10-04) on a real factory, deployed through the
-///         blueprint deployer: TKN ($1, 6 decimals) is pool-priced from its scripted Uniswap pool,
-///         WETH ($2,000) is Chainlink-priced, USDC is the denomination. Trades go through the real
-///         Uniswap adapter against a router that fills at whatever price the test sets.
-contract ComptrollerV2Test is Test {
+/// @notice What fund v6 shares with the versions before it, on a real factory through the blueprint deployer: TKN ($1,
+///         6 decimals) is pool-priced from its scripted Uniswap pool, WETH ($2,000) is Chainlink-priced, USDC is the
+///         denomination. Trades go through the real Uniswap adapter against a router that fills at whatever price the test
+///         sets. ComptrollerV6Test runs these and adds v6's own. (Was the V3 suite; moved to v6 2026-11-01.)
+abstract contract ComptrollerV6Base is Test {
 	/// @dev USDC per share unit at the bootstrap price: 1 USDC per 1e18 shares.
 	uint256 internal constant ONE_USDC_PRICE = 1e6;
 	uint128 internal constant PLENTY = 1_000_000e6;
+	uint256 internal constant UNWIND_TYPE = 99;
+	/// @dev 2%/yr management fee as a 1e27-scaled per-second rate
+	uint128 internal constant TWO_PCT_MGMT = 1_000_000_000_627_507_379_616_874_496;
 
 	ValueInterpreter internal vi;
 	PoolPriceRegistrar internal registrar;
@@ -44,6 +52,7 @@ contract ComptrollerV2Test is Test {
 	MockAggregator internal wethFeed;
 	MockAggregator internal usdcFeed;
 	ScriptedCLPool internal pool;
+	MockRedemptionQueue internal queue;
 
 	address internal manager = makeAddr('manager');
 	address internal alice = makeAddr('alice');
@@ -51,7 +60,7 @@ contract ComptrollerV2Test is Test {
 	address internal attacker = makeAddr('attacker');
 	uint256 internal nonce;
 
-	function setUp() public {
+	function setUp() public virtual {
 		vm.warp(30 days);
 		usdc = new MockERC20('USD Coin', 'USDC', 6);
 		weth = new MockERC20('Wrapped Ether', 'WETH', 18);
@@ -65,8 +74,8 @@ contract ComptrollerV2Test is Test {
 		MockUniswapV3Factory uniswap = new MockUniswapV3Factory();
 		address[] memory quotes = new address[](1);
 		quotes[0] = address(usdc);
-		registrar = new PoolPriceRegistrar(
-			PoolPriceRegistrar.Wiring({
+		registrar = PoolPriceRegistrar(address(new PoolPriceRegistrarWindowed(
+			PoolPriceRegistrarWindowed.Wiring({
 				valueInterpreter: vi,
 				uniswapV3Factory: address(uniswap),
 				slipstreamFactories: [
@@ -78,7 +87,7 @@ contract ComptrollerV2Test is Test {
 				quotes: quotes
 			}),
 			address(this)
-		);
+		)));
 		vi.transferOwnership(address(registrar));
 		registrar.execute(abi.encodeCall(Ownable2Step.acceptOwnership, ()));
 
@@ -89,9 +98,10 @@ contract ComptrollerV2Test is Test {
 		uniswap.setPool(address(tkn), address(usdc), 3000, address(pool));
 		registrar.register(address(tkn), address(pool));
 
+		queue = new MockRedemptionQueue();
 		factory = new FundFactory(
 			vi,
-			new ComptrollerBlueprintDeployer(type(ComptrollerV2).creationCode, abi.encode(registrar)),
+			new ComptrollerBlueprintDeployer(type(ComptrollerV6).creationCode, abi.encode(registrar, queue)),
 			new SharesVaultDeployer()
 		);
 		router = new MockSwapRouter();
@@ -102,13 +112,14 @@ contract ComptrollerV2Test is Test {
 			hook: IPolicy.PolicyHook.PostCallOnIntegration, policy: address(new MinPoolLiquidityPolicy(registrar))
 		});
 		factory.setMandatoryPolicies(mandatory);
+		factory.registerPositionType(UNWIND_TYPE, address(new MockUnwindPositionFactory(IERC20(address(usdc)))));
 	}
 
 	// ─── helpers ─────────────────────────────────────────────────────────────────
 
 	/// @dev A fund with `perfBps` performance fee; alice deposits 10,000 USDC at the bootstrap price.
-	function _fund(uint16 perfBps) internal returns (ComptrollerV2 fund) {
-		fund = ComptrollerV2(
+	function _fund(uint16 perfBps) internal returns (ComptrollerV6 fund) {
+		fund = ComptrollerV6(
 			factory.createFund(
 				FundFactory.FundConfig({
 					name: string.concat('V2 Fund #', vm.toString(++nonce)),
@@ -127,7 +138,7 @@ contract ComptrollerV2Test is Test {
 		_deposit(fund, alice, 10_000e6, type(uint256).max);
 	}
 
-	function _request(ComptrollerV2 fund, address who, uint256 amount, uint256 maxSharePrice) internal {
+	function _request(ComptrollerV6 fund, address who, uint256 amount, uint256 maxSharePrice) internal {
 		deal(address(usdc), who, amount);
 		vm.startPrank(who);
 		usdc.approve(address(fund), amount);
@@ -136,12 +147,12 @@ contract ComptrollerV2Test is Test {
 		skip(1 minutes);
 	}
 
-	function _deposit(ComptrollerV2 fund, address who, uint256 amount, uint256 maxSharePrice) internal {
+	function _deposit(ComptrollerV6 fund, address who, uint256 amount, uint256 maxSharePrice) internal {
 		_request(fund, who, amount, maxSharePrice);
 		fund.executeDepositRequest(who);
 	}
 
-	function _swap(ComptrollerV2 fund, MockERC20 tokenIn, MockERC20 tokenOut, uint256 amountIn, uint256 amountOut) internal {
+	function _swap(ComptrollerV6 fund, MockERC20 tokenIn, MockERC20 tokenOut, uint256 amountIn, uint256 amountOut) internal {
 		router.setNextAmountOut(amountOut);
 		vm.prank(manager);
 		fund.callOnIntegration(
@@ -155,60 +166,18 @@ contract ComptrollerV2Test is Test {
 		pool.setOracle(tick, PLENTY);
 	}
 
-	function _held(ComptrollerV2 fund, MockERC20 token) internal view returns (uint256) {
+	function _held(ComptrollerV6 fund, MockERC20 token) internal view returns (uint256) {
 		return token.balanceOf(address(fund.vault()));
 	}
 
-	function _sharesOf(ComptrollerV2 fund, address who) internal view returns (uint256) {
+	function _sharesOf(ComptrollerV6 fund, address who) internal view returns (uint256) {
 		return fund.shares().balanceOf(who);
 	}
 
 	// ─── rule 1: redemptions ─────────────────────────────────────────────────────
 
-	function test_redeemPaysCashForPricedHoldingsAndTheLongTailSliceInKind() public {
-		ComptrollerV2 fund = _fund(0);
-		_swap(fund, usdc, tkn, 2_000e6, 2_000e6); // 8,000 USDC + 2,000 TKN ($1)
-
-		uint256 half = _sharesOf(fund, alice) / 2;
-		vm.prank(alice);
-		fund.redeemShares(half);
-
-		// alice holds all but the bootstrap shares, so half her shares is a hair under half the fund
-		assertApproxEqRel(usdc.balanceOf(alice), 4_000e6, 1e15);
-		assertApproxEqRel(tkn.balanceOf(alice), 1_000e6, 1e15);
-	}
-
-	function test_aPumpedLongTailPriceAddsNoCashToARedemption() public {
-		ComptrollerV2 fund = _fund(0);
-		_swap(fund, usdc, tkn, 2_000e6, 2_000e6);
-		uint256 half = _sharesOf(fund, alice) / 2;
-		vm.prank(alice);
-		fund.redeemShares(half / 2);
-		uint256 cashAtFairPrice = usdc.balanceOf(alice);
-
-		_setTknPriceTick(23028); // TKN's pool pumped to $10 for the whole window
-		vm.prank(alice);
-		fund.redeemShares(half / 2);
-
-		// the same slice of the fund paid the same cash: the pump added nothing
-		assertApproxEqAbs(usdc.balanceOf(alice) - cashAtFairPrice, cashAtFairPrice, 1);
-	}
-
-	function test_aTokenWhosePriceCannotBeReadIsPaidInKind() public {
-		ComptrollerV2 fund = _fund(0);
-		_swap(fund, usdc, weth, 2_000e6, 1e18); // 8,000 USDC + 1 WETH
-		skip(2 hours); // WETH's 1-hour feed is now stale; USDC's 25-hour one is not
-
-		uint256 half = _sharesOf(fund, alice) / 2;
-		vm.prank(alice);
-		fund.redeemShares(half);
-
-		assertApproxEqRel(usdc.balanceOf(alice), 4_000e6, 1e15);
-		assertApproxEqRel(weth.balanceOf(alice), 0.5e18, 1e15);
-	}
-
 	function test_aReadablePricedHoldingIsPaidInCash() public {
-		ComptrollerV2 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		_swap(fund, usdc, weth, 2_000e6, 1e18); // 8,000 USDC + 1 WETH ($2,000)
 
 		uint256 half = _sharesOf(fund, alice) / 2;
@@ -222,7 +191,7 @@ contract ComptrollerV2Test is Test {
 	// ─── rule 2: deposits ────────────────────────────────────────────────────────
 
 	function test_aDepositExecutesAtItsMaxSharePrice() public {
-		ComptrollerV2 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 
 		_deposit(fund, bob, 1_000e6, ONE_USDC_PRICE);
 
@@ -230,12 +199,12 @@ contract ComptrollerV2Test is Test {
 	}
 
 	function test_aDepositPricedOverItsMaximumDoesNotExecute() public {
-		ComptrollerV2 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		_swap(fund, usdc, tkn, 2_000e6, 2_000e6);
 		_request(fund, bob, 1_000e6, ONE_USDC_PRICE);
 		_setTknPriceTick(23028); // pumped: 8,000 USDC + 2,000 TKN at $10 → ≈ $2.80 a share
 
-		vm.expectPartialRevert(ComptrollerV2.SharePriceAboveMax.selector);
+		vm.expectPartialRevert(ComptrollerV6.SharePriceAboveMax.selector);
 		vm.prank(attacker);
 		fund.executeDepositRequest(bob);
 
@@ -247,7 +216,7 @@ contract ComptrollerV2Test is Test {
 	// ─── rule 3: performance fee ─────────────────────────────────────────────────
 
 	function test_aPumpedLongTailPriceMintsNoPerformanceFee() public {
-		ComptrollerV2 fund = _fund(2_000);
+		ComptrollerV6 fund = _fund(2_000);
 		_swap(fund, usdc, tkn, 2_000e6, 2_000e6);
 		_setTknPriceTick(23028);
 
@@ -257,7 +226,7 @@ contract ComptrollerV2Test is Test {
 	}
 
 	function test_aLongTailGainIsChargedOnceSold() public {
-		ComptrollerV2 fund = _fund(2_000);
+		ComptrollerV6 fund = _fund(2_000);
 		_swap(fund, usdc, tkn, 2_000e6, 2_000e6);
 		_setTknPriceTick(6932); // TKN doubles (1.0001^6932 ≈ 2)
 		_swap(fund, tkn, usdc, 2_000e6, 4_000e6); // sold at $2: +2,000 USDC realized
@@ -270,7 +239,7 @@ contract ComptrollerV2Test is Test {
 	}
 
 	function test_aLongTailLossCountsAtOnceAndRecoveringToCostChargesNothing() public {
-		ComptrollerV2 fund = _fund(2_000);
+		ComptrollerV6 fund = _fund(2_000);
 		_swap(fund, usdc, tkn, 2_000e6, 2_000e6);
 		_setTknPriceTick(-6932); // TKN halves
 		fund.settleFees();
@@ -283,7 +252,7 @@ contract ComptrollerV2Test is Test {
 	}
 
 	function test_aDepositIntoAFundWithUnrealizedGainsTriggersNoFee() public {
-		ComptrollerV2 fund = _fund(2_000);
+		ComptrollerV6 fund = _fund(2_000);
 		_swap(fund, usdc, tkn, 2_000e6, 2_000e6);
 		_setTknPriceTick(6932); // unrealized: TKN worth $4,000 against a $2,000 cost
 
@@ -294,7 +263,7 @@ contract ComptrollerV2Test is Test {
 	}
 
 	function test_donatedLongTailTokensMintNoFee() public {
-		ComptrollerV2 fund = _fund(2_000);
+		ComptrollerV6 fund = _fund(2_000);
 		_swap(fund, usdc, tkn, 2_000e6, 2_000e6);
 		tkn.mint(address(fund.vault()), 5_000e6); // a donation: units with no cost
 
@@ -303,90 +272,117 @@ contract ComptrollerV2Test is Test {
 		assertEq(_sharesOf(fund, manager), 0);
 	}
 
-	function test_costBasisFollowsBuysSalesAndInKindPayouts() public {
-		ComptrollerV2 fund = _fund(0);
-		_swap(fund, usdc, tkn, 2_000e6, 2_000e6);
-		assertEq(fund.costBasis(address(tkn)), 2_000e6); // TKN's pool value at the buy
-
-		_swap(fund, tkn, usdc, 500e6, 500e6); // a quarter sold
-		assertEq(fund.costBasis(address(tkn)), 1_500e6);
-
-		uint256 shares = _sharesOf(fund, alice);
-		uint256 supply = fund.shares().totalSupply();
-		vm.prank(alice);
-		fund.redeemShares(shares / 2); // ≈ half of the 1,500 TKN paid in kind
-
-		assertApproxEqRel(fund.costBasis(address(tkn)), 1_500e6 - 1_500e6 * (shares / 2) / supply, 1e12);
+	/// EIP-170: the V3 comptroller's runtime must fit (V2 had 603 bytes to spare).
+	function test_runtimeSizeFitsEip170() public {
+		ComptrollerV6 fund = _fund(0);
+		assertLt(address(fund).code.length, 24_577);
 	}
 
-	function test_inKindRedemptionTakesItsShareOfTheCostBasis() public {
-		ComptrollerV2 fund = _fund(0);
-		_swap(fund, usdc, tkn, 2_000e6, 2_000e6);
-		uint256 shares = _sharesOf(fund, alice);
-		uint256 supply = fund.shares().totalSupply();
+	// ─── redemption-queue hooks (founder 2026-10-06) ─────────────────────────────
 
-		vm.prank(alice);
-		fund.redeemSharesInKind(shares / 2);
-
-		assertApproxEqRel(fund.costBasis(address(tkn)), 2_000e6 - 2_000e6 * (shares / 2) / supply, 1e12);
-	}
-
-	function test_aPriceThatCannotBeReadSkipsThePerformanceFeeNotTheExit() public {
-		ComptrollerV2 fund = _fund(2_000);
-		_swap(fund, usdc, weth, 2_000e6, 1e18);
-		wethFeed.setAnswer(3000e8); // +$1,000
-		skip(2 hours); // WETH's feed is now stale
-
-		uint256 small = _sharesOf(fund, alice) / 100;
-		vm.prank(alice);
-		fund.redeemShares(small);
-		assertEq(_sharesOf(fund, manager), 0, 'fee waits for a readable price');
-
-		wethFeed.setAnswer(3000e8);
-		fund.settleFees();
-		assertGt(_sharesOf(fund, manager), 0, 'and settles once it reads');
-	}
-
-	/// The upgrade path for funds created before v2: the factory points at the v2 build and the
-	/// fund owner reconfigures; holders, vault and high-water mark carry over.
-	function test_aV1FundMovesToV2ThroughReconfiguration() public {
-		FundFactory v1Factory = new FundFactory(vi, new ComptrollerDeployer(), new SharesVaultDeployer());
-		FundFactory.FundConfig memory config = FundFactory.FundConfig({
-			name: 'Before V2',
-			symbol: 'V1',
+	function _config(uint128 mgmtRate, uint16 perfBps) internal returns (FundFactory.FundConfig memory) {
+		return FundFactory.FundConfig({
+			name: string.concat('V3 Fund #', vm.toString(++nonce)),
+			symbol: 'V3',
 			denominationAsset: IERC20(address(usdc)),
 			fundOwner: manager,
-			mgmtScaledPerSecondRate: 0,
-			perfFeeBps: 0,
+			mgmtScaledPerSecondRate: mgmtRate,
+			perfFeeBps: perfBps,
 			sharesActionTimelock: 0,
 			minRequestDuration: 1 minutes,
 			executionWindow: 1 days,
 			allowRiskyAssets: false
 		});
-		Comptroller v1 = Comptroller(v1Factory.createFund(config));
-		deal(address(usdc), alice, 10_000e6);
-		vm.startPrank(alice);
-		usdc.approve(address(v1), 10_000e6);
-		v1.requestDeposit(10_000e6);
+	}
+
+	/// @dev alice's 10,000 USDC fund with 4,000 USDC locked in an unwindable position.
+	function _fundWithUnwindPosition() internal returns (ComptrollerV6 fund, MockUnwindPosition position) {
+		fund = _fund(0);
+		vm.startPrank(manager);
+		position = MockUnwindPosition(fund.createExternalPosition(UNWIND_TYPE, ''));
+		address[] memory assets = new address[](1);
+		assets[0] = address(usdc);
+		uint256[] memory amounts = new uint256[](1);
+		amounts[0] = 4_000e6;
+		fund.callOnExternalPosition(address(position), assets, amounts, new address[](0), abi.encode(uint8(0), abi.encode(uint256(4_000e6))));
 		vm.stopPrank();
-		skip(1 minutes);
-		v1.executeDepositRequest(alice);
-		uint256 aliceShares = v1.shares().balanceOf(alice);
-		uint256 hwm = v1.highWaterMark();
+	}
 
-		v1Factory.setComptrollerDeployer(new ComptrollerBlueprintDeployer(type(ComptrollerV2).creationCode, abi.encode(registrar)));
-		vm.prank(manager);
-		ComptrollerV2 v2 = ComptrollerV2(v1Factory.createReconfigurationRequest(address(v1), config));
-		skip(2 days);
+	function _refreshFeeds() internal {
 		usdcFeed.setAnswer(1e8);
-		vm.prank(manager);
-		v1Factory.executeReconfiguration(address(v1));
+		wethFeed.setAnswer(wethFeed.answer());
+	}
 
-		assertEq(address(v2.registrar()), address(registrar));
-		assertEq(v2.shares().balanceOf(alice), aliceShares);
-		assertEq(v2.highWaterMark(), hwm);
+	function _usdc(uint256 amount) internal view returns (address[] memory assets, uint256[] memory amounts) {
+		assets = new address[](1);
+		assets[0] = address(usdc);
+		amounts = new uint256[](1);
+		amounts[0] = amount;
+	}
+
+	function test_settleFeesForRedemption_onlyTheQueue() public {
+		ComptrollerV6 fund = _fund(0);
+		vm.expectRevert(ComptrollerV6.OnlyRedemptionQueue.selector);
+		fund.settleFeesForRedemption();
+	}
+
+	function test_instantCashRedemption_refusedWhileTheFundHoldsAPosition() public {
+		(ComptrollerV6 fund,) = _fundWithUnwindPosition();
 		vm.prank(alice);
-		v2.redeemShares(aliceShares);
-		assertApproxEqRel(usdc.balanceOf(alice), 10_000e6, 1e15);
+		vm.expectRevert(ComptrollerV6.UseRedemptionQueue.selector);
+		fund.redeemShares(1e18);
+	}
+
+	function test_sharesMovingToAndFromTheQueue_skipTransferPolicies() public {
+		FundFactory.PolicyReg[] memory regs = new FundFactory.PolicyReg[](1);
+		AllowedSharesTransferRecipientsPolicy allowList = new AllowedSharesTransferRecipientsPolicy(manager, new address[](0));
+		regs[0] = FundFactory.PolicyReg({hook: IPolicy.PolicyHook.PreTransferShares, policy: address(allowList)});
+		ComptrollerV6 fund = ComptrollerV6(factory.createFund(_config(0, 0), regs));
+		_deposit(fund, alice, 10_000e6, type(uint256).max);
+
+		Shares fundShares = fund.shares();
+		vm.prank(alice);
+		fundShares.transfer(address(queue), 1e18); // a request
+		vm.prank(address(queue));
+		fundShares.transfer(alice, 1e18); // a cancel
+		vm.prank(alice);
+		vm.expectRevert(abi.encodeWithSelector(AllowedSharesTransferRecipientsPolicy.TransferRecipientNotAllowed.selector, bob));
+		fundShares.transfer(bob, 1e18); // anyone else: the allow list still applies
+	}
+
+	function test_feeStop_managementFeeTimeIsForfeitedWhileOverdue() public {
+		ComptrollerV6 fund = ComptrollerV6(factory.createFund(_config(TWO_PCT_MGMT, 0)));
+		_deposit(fund, alice, 10_000e6, type(uint256).max);
+		skip(30 days);
+		_refreshFeeds();
+		queue.setOverdue(address(fund), true);
+		uint256 supply = fund.shares().totalSupply();
+		fund.settleFees();
+		assertEq(fund.shares().totalSupply(), supply, 'no management fee while overdue');
+
+		queue.setOverdue(address(fund), false);
+		skip(1 days);
+		_refreshFeeds();
+		fund.settleFees();
+		uint256 minted = fund.shares().totalSupply() - supply;
+		assertApproxEqRel(minted, supply * 2 / 100 / 365, 0.02e18, 'only the day after the clear is charged');
+	}
+
+	function test_feeStop_gainsMadeWhileOverdueAreNeverCharged() public {
+		ComptrollerV6 fund = _fund(2_000);
+		_swap(fund, usdc, weth, 5_000e6, 2.5e18);
+		queue.setOverdue(address(fund), true);
+		wethFeed.setAnswer(3_000e8); // +2,500 while overdue
+		uint256 supply = fund.shares().totalSupply();
+		fund.settleFees();
+		assertEq(fund.shares().totalSupply(), supply, 'no performance fee while overdue');
+
+		queue.setOverdue(address(fund), false);
+		fund.settleFees();
+		assertEq(fund.shares().totalSupply(), supply, 'the overdue gains stay uncharged after the clear');
+
+		wethFeed.setAnswer(4_000e8); // +2,500 after the clear
+		fund.settleFees();
+		assertGt(fund.shares().totalSupply(), supply, 'later gains are charged again');
 	}
 }

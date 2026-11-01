@@ -9,6 +9,7 @@ import {FundFactory} from '../../src/core/FundFactory.sol';
 import {ComptrollerBlueprintDeployer} from '../../src/core/FundComponentDeployers.sol';
 import {ComptrollerV6} from '../../src/core/ComptrollerV6.sol';
 import {ComptrollerV6Lib} from '../../src/core/ComptrollerV6Lib.sol';
+import {IValueInterpreter} from '../../src/interfaces/IValueInterpreter.sol';
 import {IVerantaMulticall, IVerantaTradingStorage} from '../../src/interfaces/external/IVeranta.sol';
 import {VerantaPerpPositionV2Factory} from '../../src/positions/VerantaPerpPositionV2.sol';
 import {VerantaPerpPositionV4, VerantaPerpPositionV4Factory} from '../../src/positions/VerantaPerpPositionV4.sol';
@@ -115,6 +116,44 @@ contract FundV6PerpForkTest is Test {
 		assertApproxEqRel(IERC20(USDC).balanceOf(investor), Math.mulDiv(gav, shares, supply), 0.005e18, 'its share, within the close costs');
 	}
 
+	/// A filled long reports its pair's marker, which the fund never tracked (the open ran trackHeld before Veranta's
+	/// operator filled it). At a full tracked set (20) the keeper's close went into TrackedAssetsLimitReached, and the
+	/// investor got only the vault's USDC (red-team POSITIONS-01, 2026-10-27). The marker is now tracked past the cap.
+	function test_fork_aLongOnAFullTrackedSet_isClosedByTheKeeper_andTheLeaverPaid() public {
+		vm.skip(!forked);
+		(ComptrollerV6 fund, address account) = _fundWithFilledTrade(1_000e6, 800e6); // vault 200, trade 800
+		_fillTrackedSet(fund, account);
+		assertEq(fund.getTrackedAssets().length, 20, 'tracked set full');
+		uint256 shares = fund.shares().balanceOf(investor);
+		vm.startPrank(investor);
+		IERC20(address(fund.shares())).approve(address(queue), shares);
+		uint256 id = queue.requestRedeem(address(fund), shares);
+		vm.stopPrank();
+		vm.warp(block.timestamp + 2); // overdue under the test queue's 1-second deadline
+		_push();
+		uint256 gav = fund.calcGav();
+
+		uint256 collateral = _collateral(account);
+		vm.prank(keeper);
+		queue.liquidatePosition(address(fund), account, new address[](0), _one(_closeTrade(collateral)));
+		assertEq(fund.getTrackedAssets().length, 21, "the long's marker is tracked past the cap");
+		_fillPending(account);
+		assertEq(_collateral(account), 0, 'closed on Veranta');
+
+		uint256 idle = IERC20(USDC).balanceOf(account);
+		address[] memory back = new address[](1);
+		back[0] = USDC;
+		vm.prank(keeper);
+		queue.liquidatePosition(
+			address(fund), account, back, _one(abi.encode(uint8(VerantaPerpPositionV4.Action.ReturnToVault), abi.encode(idle)))
+		);
+		_push();
+		vm.prank(keeper);
+		queue.settle(address(fund), 1);
+		assertFalse(queue.requestAt(address(fund), id).open, 'paid in full');
+		assertApproxEqRel(IERC20(USDC).balanceOf(investor), gav, 0.005e18, 'the whole fund, within the close costs');
+	}
+
 	// ─── helpers ─────────────────────────────────────────────────────────────────
 
 	function _one(bytes memory action) internal pure returns (bytes[] memory actions) {
@@ -192,6 +231,20 @@ contract FundV6PerpForkTest is Test {
 			})
 		);
 		assertEq(IVerantaMulticall(MULTICALL).getPendingOrder(account).length, 0, 'filled');
+	}
+
+	/// @dev Tracks supported pair markers (never the long's own) until the set holds 20 (red-team RT_POSITIONS_01b).
+	function _fillTrackedSet(ComptrollerV6 fund, address account) internal {
+		VerantaPerpPositionV2Factory cfg = VerantaPerpPositionV2Factory(perpConfig);
+		IValueInterpreter vi = fund.valueInterpreter();
+		address own = cfg.pairAsset(PAIR);
+		uint256 pairs = VerantaPerpPositionV4(payable(account)).pairStorage().pairsCount();
+		for (uint256 p; p < pairs && fund.getTrackedAssets().length < 20; ++p) {
+			address a = cfg.pairAsset(p);
+			if (a == address(0) || a == own || !vi.isSupportedAsset(a) || vi.isZeroPricedAsset(a)) continue;
+			vm.prank(manager);
+			try fund.addTrackedAsset(a) {} catch {}
+		}
 	}
 
 	function _collateral(address account) internal view returns (uint256) {

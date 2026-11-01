@@ -13,6 +13,11 @@ contract MockRedemptionQueue is IRedemptionQueue {
 		overdue[comptroller] = value;
 	}
 
+	/// @dev No open requests: what a reconfiguration asks (head == length).
+	function queueBounds(address) external pure returns (uint256 head, uint256 length) {
+		return (0, 0);
+	}
+
 	function isOverdue(address comptroller) external view returns (bool) {
 		return overdue[comptroller];
 	}

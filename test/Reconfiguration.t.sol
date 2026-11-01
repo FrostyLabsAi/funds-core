@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
+import {V6Host} from './utils/V6Host.sol';
 import {Test} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
 import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
-import {Comptroller} from '../src/core/Comptroller.sol';
+import {ComptrollerV6 as Comptroller} from '../src/core/ComptrollerV6.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {Shares} from '../src/fund/Shares.sol';
 import {Vault} from '../src/fund/Vault.sol';
@@ -31,14 +32,14 @@ contract ReconfigurationTest is Test {
 		vm.prank(admin);
 		interpreter.addPrimitive(address(usdc), address(usdcFeed), 7 days);
 
-		factory = new FundFactory(interpreter, new ComptrollerDeployer(), new SharesVaultDeployer());
+		factory = new FundFactory(interpreter, V6Host.deployer(), new SharesVaultDeployer());
 		oldComptroller = Comptroller(factory.createFund(_config(0)));
 
 		// Seed with a depositor and some PnL so the HWM is meaningful
 		usdc.mint(alice, 10_000e6);
 		vm.startPrank(alice);
 		usdc.approve(address(oldComptroller), 10_000e6);
-		oldComptroller.requestDeposit(10_000e6);
+		oldComptroller.requestDeposit(10_000e6, type(uint256).max);
 		vm.stopPrank();
 		skip(30 minutes);
 		oldComptroller.executeDepositRequest(alice);
@@ -172,7 +173,7 @@ contract ReconfigurationTest is Test {
 		usdc.mint(bob, 500e6);
 		vm.startPrank(bob);
 		usdc.approve(address(oldComptroller), 500e6);
-		oldComptroller.requestDeposit(500e6);
+		oldComptroller.requestDeposit(500e6, type(uint256).max);
 		vm.stopPrank();
 
 		_requestAndExecute(1500);
@@ -196,7 +197,7 @@ contract ReconfigurationTest is Test {
 		usdc.mint(bob, 1000e6);
 		vm.startPrank(bob);
 		usdc.approve(address(newComptroller), 1000e6);
-		newComptroller.requestDeposit(1000e6);
+		newComptroller.requestDeposit(1000e6, type(uint256).max);
 		vm.stopPrank();
 		skip(30 minutes);
 		newComptroller.executeDepositRequest(bob);
@@ -204,7 +205,7 @@ contract ReconfigurationTest is Test {
 
 		// Existing holder redeems through the new comptroller
 		vm.prank(alice);
-		newComptroller.redeemSharesForDenominationAsset(1000e18);
+		newComptroller.redeemShares(1000e18);
 		assertEq(usdc.balanceOf(alice), 1000e6);
 
 		// SET-ONCE survives reconfiguration: the ruleset carried over verbatim and the

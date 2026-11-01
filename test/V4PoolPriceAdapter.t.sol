@@ -6,6 +6,7 @@ import {Clones} from '@openzeppelin/contracts/proxy/Clones.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {IValueInterpreter} from '../src/interfaces/IValueInterpreter.sol';
 import {IPoolPriceAdapter} from '../src/interfaces/IPoolPriceAdapter.sol';
+import {IPoolWatch} from '../src/interfaces/IPoolWatch.sol';
 import {ConcentratedPoolPriceAdapter} from '../src/pricing/ConcentratedPoolPriceAdapter.sol';
 import {V4PoolPriceAdapter} from '../src/pricing/V4PoolPriceAdapter.sol';
 import {V4PriceSampler} from '../src/pricing/V4PriceSampler.sol';
@@ -249,5 +250,17 @@ contract V4PoolPriceAdapterTest is Test {
 		assertEq(address(e.sampler), address(sampler));
 		assertEq(e.poolId, POOL);
 		assertEq(feed.config().asset, address(asset));
+	}
+
+	/// The pool now under half the sampled median is unsettled at once (review 2026-11-01).
+	function test_liquidityUnderHalfNowIsUnsettled() public {
+		_setPool(0, 1e18);
+		_sampleEvery10Min(6);
+		IPoolWatch feed = IPoolWatch(address(_adapter(usdc, true)));
+		assertFalse(feed.poolUnsettled(), 'steady');
+		_setPool(0, 1e18 / 2);
+		assertFalse(feed.poolUnsettled(), 'half is the line');
+		_setPool(0, 1e18 / 2 - 1e6);
+		assertTrue(feed.poolUnsettled());
 	}
 }

@@ -3,19 +3,19 @@ pragma solidity 0.8.24;
 
 import {Test} from 'forge-std/Test.sol';
 import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
-import {ComptrollerV3} from '../../src/core/ComptrollerV3.sol';
-import {RedemptionQueue} from '../../src/redemption/RedemptionQueue.sol';
+import {ComptrollerV6} from '../../src/core/ComptrollerV6.sol';
+import {RedemptionQueueV2} from '../../src/redemption/RedemptionQueueV2.sol';
 import {Shares} from '../../src/fund/Shares.sol';
 import {MockERC20, MockAggregator} from '../utils/Mocks.sol';
 import {MockUnwindPosition} from '../utils/MockUnwindPosition.sol';
-import {RedemptionFixture} from '../utils/RedemptionFixture.sol';
+import {RedemptionFixtureV6} from '../utils/RedemptionFixtureV6.sol';
 
-/// @dev Drives one queue-mode fund: investors request (cash or in kind), cancel, the manager
+/// @dev Drives one fund v6: investors request, cancel, the manager
 ///      raises cash, anyone settles, time passes. Records what every settlement paid against the
 ///      share of NAV it was owed.
 contract RedemptionQueueHandler is Test {
-	ComptrollerV3 internal fund;
-	RedemptionQueue internal queue;
+	ComptrollerV6 internal fund;
+	RedemptionQueueV2 internal queue;
 	MockUnwindPosition internal position;
 	MockERC20 internal usdc;
 	MockAggregator internal usdcFeed;
@@ -28,8 +28,8 @@ contract RedemptionQueueHandler is Test {
 	uint256 public settlements;
 
 	constructor(
-		ComptrollerV3 fund_,
-		RedemptionQueue queue_,
+		ComptrollerV6 fund_,
+		RedemptionQueueV2 queue_,
 		MockUnwindPosition position_,
 		MockERC20 usdc_,
 		MockAggregator usdcFeed_,
@@ -45,7 +45,7 @@ contract RedemptionQueueHandler is Test {
 		investors = investors_;
 	}
 
-	function request(uint256 who, uint256 fractionBps, bool inKind) external {
+	function request(uint256 who, uint256 fractionBps) external {
 		address investor = investors[who % investors.length];
 		(bool exists,,) = queue.requestOf(address(fund), investor);
 		uint256 free = fund.shares().balanceOf(investor);
@@ -58,7 +58,7 @@ contract RedemptionQueueHandler is Test {
 		Shares fundShares = fund.shares();
 		vm.startPrank(investor);
 		fundShares.approve(address(queue), shares);
-		queue.requestRedeem(address(fund), shares, inKind ? RedemptionQueue.Mode.InKind : RedemptionQueue.Mode.Cash);
+		queue.requestRedeem(address(fund), shares);
 		vm.stopPrank();
 	}
 
@@ -95,10 +95,11 @@ contract RedemptionQueueHandler is Test {
 		uint256[] memory before = new uint256[](length);
 		bool[] memory wasOpen = new bool[](length);
 		for (uint256 id = head; id < length; ++id) {
-			RedemptionQueue.Request memory r = queue.requestAt(address(fund), id);
+			RedemptionQueueV2.Request memory r = queue.requestAt(address(fund), id);
 			wasOpen[id] = r.open;
 			before[id] = usdc.balanceOf(r.investor);
 		}
+		vm.prank(manager); // the manager or a keeper settles
 		try queue.settle(address(fund), 10) returns (uint256 n) {
 			settlements += n;
 		} catch {
@@ -106,7 +107,7 @@ contract RedemptionQueueHandler is Test {
 		}
 		bool olderStillOpen;
 		for (uint256 id = head; id < length; ++id) {
-			RedemptionQueue.Request memory r = queue.requestAt(address(fund), id);
+			RedemptionQueueV2.Request memory r = queue.requestAt(address(fund), id);
 			if (!wasOpen[id]) continue;
 			if (r.open) {
 				olderStillOpen = true;
@@ -124,9 +125,9 @@ contract RedemptionQueueHandler is Test {
 /// @notice Settlement invariants (spec 2026-10-06 §10).
 /// forge-config: default.invariant.runs = 64
 /// forge-config: default.invariant.depth = 40
-contract RedemptionQueueInvariantTest is RedemptionFixture {
+contract RedemptionQueueInvariantTest is RedemptionFixtureV6 {
 	RedemptionQueueHandler internal handler;
-	ComptrollerV3 internal fund;
+	ComptrollerV6 internal fund;
 
 	function setUp() public override {
 		super.setUp();
@@ -156,7 +157,7 @@ contract RedemptionQueueInvariantTest is RedemptionFixture {
 		(uint256 head, uint256 length) = queue.queueBounds(address(fund));
 		uint256 open;
 		for (uint256 id = head; id < length; ++id) {
-			RedemptionQueue.Request memory r = queue.requestAt(address(fund), id);
+			RedemptionQueueV2.Request memory r = queue.requestAt(address(fund), id);
 			if (r.open) open += r.shares;
 		}
 		assertEq(fund.shares().balanceOf(address(queue)), open);

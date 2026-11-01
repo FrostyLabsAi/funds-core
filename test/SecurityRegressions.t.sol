@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
+import {V6Host} from './utils/V6Host.sol';
 import {Test} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
 import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
-import {Comptroller} from '../src/core/Comptroller.sol';
+import {ComptrollerV6 as Comptroller} from '../src/core/ComptrollerV6.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {LimitOrderPosition, LimitOrderPositionFactory} from '../src/positions/LimitOrderPosition.sol';
 import {UniswapV3LPPositionFactory} from '../src/positions/UniswapV3LPPosition.sol';
@@ -50,7 +51,7 @@ contract SecurityRegressionsTest is Test {
 		interpreter.addPrimitive(address(gpux), address(gpuxFeed), 7 days);
 		vm.stopPrank();
 
-		factory = new FundFactory(interpreter, new ComptrollerDeployer(), new SharesVaultDeployer());
+		factory = new FundFactory(interpreter, V6Host.deployer(), new SharesVaultDeployer());
 		factory.registerPositionType(LIMIT_ORDER_TYPE_ID, address(new LimitOrderPositionFactory()));
 		factory.registerPositionType(
 			LP_TYPE_ID,
@@ -85,7 +86,7 @@ contract SecurityRegressionsTest is Test {
 	function _deposit(Comptroller comptroller, address depositor, uint256 assets) internal {
 		vm.startPrank(depositor);
 		usdc.approve(address(comptroller), assets);
-		comptroller.requestDeposit(assets);
+		comptroller.requestDeposit(assets, type(uint256).max);
 		vm.stopPrank();
 		skip(30 minutes);
 		comptroller.executeDepositRequest(depositor);
@@ -93,7 +94,7 @@ contract SecurityRegressionsTest is Test {
 
 	// ─── C-1 · donation / share-price inflation via supply dusting ──────────────
 
-	/// The full verified exploit: eve bootstraps, dusts supply via in-kind redemption,
+	/// The full verified exploit: eve bootstraps, dusts supply via redemption,
 	/// then donates against bob's queued 10k deposit and executes it herself.
 	/// Bob must keep ≥ 99.5% of his deposit's value; pre-fix he keeps ~75%.
 	function test_c1_donationInflation_cannotStealFromNextDepositor() public {
@@ -103,12 +104,12 @@ contract SecurityRegressionsTest is Test {
 		// dust the supply: redeem everything eve holds but 1 wei
 		uint256 eveShares = comptroller.shares().balanceOf(eve);
 		vm.prank(eve);
-		comptroller.redeemSharesInKind(eveShares - 1);
+		comptroller.redeemShares(eveShares - 1);
 
 		// victim queues a 10,000 USDC deposit
 		vm.startPrank(bob);
 		usdc.approve(address(comptroller), 10_000e6);
-		comptroller.requestDeposit(10_000e6);
+		comptroller.requestDeposit(10_000e6, type(uint256).max);
 		vm.stopPrank();
 		skip(30 minutes);
 
@@ -147,7 +148,7 @@ contract SecurityRegressionsTest is Test {
 		Comptroller comptroller = _createFund();
 		vm.startPrank(alice);
 		usdc.approve(address(comptroller), 1e6);
-		comptroller.requestDeposit(1e6); // exactly 1 USDC → sharesToMint == seed
+		comptroller.requestDeposit(1e6, type(uint256).max); // exactly 1 USDC → sharesToMint == seed
 		vm.stopPrank();
 		skip(30 minutes);
 		vm.expectRevert();
@@ -167,7 +168,7 @@ contract SecurityRegressionsTest is Test {
 
 		vm.startPrank(bob);
 		usdc.approve(address(comptroller), 1e6);
-		comptroller.requestDeposit(1e6);
+		comptroller.requestDeposit(1e6, type(uint256).max);
 		vm.stopPrank();
 		skip(30 minutes);
 
@@ -178,15 +179,15 @@ contract SecurityRegressionsTest is Test {
 		assertEq(comptroller.shares().balanceOf(bob), 0, 'no shares minted at zero gav');
 	}
 
-	function test_c2_zeroGavWithSupply_inKindExitStillWorks() public {
+	function test_c2_zeroGavWithSupply_theExitStillWorks() public {
 		Comptroller comptroller = _createFund();
 		_deposit(comptroller, alice, 100e6);
 		deal(address(usdc), address(comptroller.vault()), 0);
 
 		uint256 aliceShares = comptroller.shares().balanceOf(alice);
 		vm.prank(alice);
-		comptroller.redeemSharesInKind(aliceShares); // guaranteed exit never gated on pricing
-		assertEq(comptroller.shares().balanceOf(alice), 0, 'in-kind exit burned the shares');
+		comptroller.redeemShares(aliceShares);
+		assertEq(comptroller.shares().balanceOf(alice), 0, 'the exit burned the shares');
 	}
 
 	// ─── C-3 · limit-order self-fill drain ──────────────────────────────────────
@@ -317,9 +318,10 @@ contract SecurityRegressionsTest is Test {
 
 		_epTransferIn(comptroller, position, 50e6); // 0.5% — allowed, accrues
 
-		// 50bps accrued + 80bps now = 130bps vs the 100bps budget
+		// 50bps accrued + 80.4bps now (80 of the 9,950 left) = 130.4bps, shown rounded up, vs the 100bps budget
+		// (whole-bps accrual read 130; red-team ADAPTERS-01, 2026-10-27)
 		vm.expectRevert(
-			abi.encodeWithSelector(CumulativeSlippageTolerancePolicy.CumulativeSlippageExceeded.selector, 130, 100)
+			abi.encodeWithSelector(CumulativeSlippageTolerancePolicy.CumulativeSlippageExceeded.selector, 131, 100)
 		);
 		this.epTransferInExternal(comptroller, position, 80e6); // cumulative ≈ 1.3% > 1%
 	}

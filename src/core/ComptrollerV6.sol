@@ -185,6 +185,8 @@ contract ComptrollerV6 is ReentrancyGuard {
 	error ZeroAddressConfig();
 	error RiskyAssetsNotAllowed(address asset);
 	error BootstrapDepositTooSmall();
+	error MarketClosed();
+	error PoolPriceUnsettled();
 	error ZeroGavWithSupply();
 	error HookNotImplemented(IPolicy.PolicyHook hook, address policy);
 	error SharePriceAboveMax(uint256 sharePrice, uint256 maxSharePrice);
@@ -316,7 +318,7 @@ contract ComptrollerV6 is ReentrancyGuard {
 
 		delete depositRequests[depositor];
 
-		(uint256 sharePrice, uint256 feeGav) = _settleFeesAndGetSharePrice();
+		(uint256 sharePrice, uint256 feeGav) = _settleFeesAndGetSharePrice(true);
 		if (sharePrice > request.maxSharePrice) revert SharePriceAboveMax(sharePrice, request.maxSharePrice);
 		uint256 sharesToMint = Math.mulDiv(request.assets, SHARES_UNIT, sharePrice);
 		if (sharesToMint == 0) revert ZeroAmount();
@@ -374,7 +376,9 @@ contract ComptrollerV6 is ReentrancyGuard {
 	///         be read) and the queue pays from the GAV of the same pass, only when `complete`.
 	function settleFeesForRedemption() external onlyRedemptionQueue nonReentrant returns (uint256 gav, bool complete) {
 		FundValuationV6.Valuation memory v = _settleFeesTolerant();
-		return (v.gav, v.complete);
+		// with a pool unsettled the manager could be settling short on their own LP's pulls, or exiting a rug of their own at the
+		// old price, so the queue waits for its deadline, and a real rug's exits go on from there (review 2026-11-01)
+		return (v.gav, v.complete && (!v.unsettled || _overdue()));
 	}
 
 	/// @notice Liquidation, through the queue's keeper once a redemption is overdue: sell tracked tokens into the
@@ -478,7 +482,8 @@ contract ComptrollerV6 is ReentrancyGuard {
 		uint256[] memory incomingAmounts = ComptrollerV3Lib.receivedAmounts(
 			trackedAssets, _tracking(), address(vault), incomingAssets, balancesBefore, minIncomingAmounts
 		);
-		FundValuationV6.followTrade(costBasis, _context(), spendAssets, spendBefore, incomingAssets, incomingAmounts);
+		// from here spendAmounts is what left the vault: a deposit's refund is no loss to the policies (review 2026-11-01, Medium 4)
+		spendAmounts = FundValuationV6.followTrade(costBasis, _context(), spendAssets, spendBefore, incomingAssets, incomingAmounts);
 		_keepUsdc(usdcFloor);
 
 		_runPolicies(
@@ -516,7 +521,7 @@ contract ComptrollerV6 is ReentrancyGuard {
 
 	/// @notice Settle accrued fees without a deposit/redeem. Callable by anyone; needs valid prices.
 	function settleFees() external nonReentrant returns (uint256 grossSharePrice) {
-		(grossSharePrice,) = _settleFeesAndGetSharePrice();
+		(grossSharePrice,) = _settleFeesAndGetSharePrice(false);
 		emit FeesSettled(msg.sender, grossSharePrice);
 	}
 
@@ -525,14 +530,14 @@ contract ComptrollerV6 is ReentrancyGuard {
 	function _settleFeesTolerant() private returns (FundValuationV6.Valuation memory v) {
 		_settleManagementFee();
 		v = _value(true);
-		if (v.complete) _settlePerformanceFee(v.feeGav, shares.totalSupply());
+		if (v.complete) _settlePerformanceFee(v.feeGav, v.gav, shares.totalSupply());
 		_settleProtocolFee();
 	}
 
 	/// @dev Settles management, performance, then protocol fee; returns the gross share price.
 	///      Zero GAV with supply outstanding reverts (pricing at the default would expropriate
 	///      holders).
-	function _settleFeesAndGetSharePrice() private returns (uint256 sharePrice, uint256 feeGav) {
+	function _settleFeesAndGetSharePrice(bool deposit) private returns (uint256 sharePrice, uint256 feeGav) {
 		_settleManagementFee();
 
 		uint256 totalSupply = shares.totalSupply();
@@ -543,8 +548,15 @@ contract ComptrollerV6 is ReentrancyGuard {
 
 		FundValuationV6.Valuation memory v = _value(false);
 		if (v.gav == 0) revert ZeroGavWithSupply();
+		if (deposit) {
+			// a closed market's price: a depositor could pick it, knowing where the market reopens (red-team PF-02, 2026-10-27)
+			if (!v.complete) revert MarketClosed();
+			// an LP's own pulls would sell the depositor the token's share for nothing (review 2026-11-01)
+			if (v.unsettled) revert PoolPriceUnsettled();
+		}
 
-		_settlePerformanceFee(v.feeGav, totalSupply);
+		// the performance fee waits for a real price; settling the rest must not, or a cancel loses its fee stop (Low 6)
+		if (v.complete) _settlePerformanceFee(v.feeGav, v.gav, totalSupply);
 		// After the manager's fees, before pricing the action.
 		_settleProtocolFee();
 		return (Math.mulDiv(v.gav, SHARES_UNIT, shares.totalSupply()), v.feeGav);
@@ -557,7 +569,7 @@ contract ComptrollerV6 is ReentrancyGuard {
 		lastMgmtFeeSettled = block.timestamp;
 		if (rate <= RATE_SCALE || elapsed == 0) return;
 		// fee stop: while a redemption is overdue the time is forfeited (founder 2026-10-06)
-		if (redemptionQueue.isOverdue(address(this))) return;
+		if (_overdue()) return;
 
 		uint256 totalSupply = shares.totalSupply();
 		if (totalSupply == 0) return;
@@ -570,17 +582,18 @@ contract ComptrollerV6 is ReentrancyGuard {
 	}
 
 	/// @dev Continuous accrual, no crystallization, on the FEE GAV (long-tail tokens at the lower
-	///      of value and cost): g = GAV/TS; W = max(g - hwm, 0)*TS; F = W*rate;
-	///      feeShares = F*TS/(GAV - F); hwm' = GAV/TS' when paid.
-	function _settlePerformanceFee(uint256 gav, uint256 totalSupply) private {
+	///      of value and cost): g = feeGAV/TS; W = max(g - hwm, 0)*TS; F = W*rate; hwm' = feeGAV/TS' when paid.
+	///      feeShares = F*TS/(fullGAV - F): a share claims the full GAV, so shares sized on the fee GAV paid the manager
+	///      F*gav/feeGav, past the rate and the bytecode cap (red-team V6FEES-02, 2026-10-27).
+	function _settlePerformanceFee(uint256 feeGav, uint256 gav, uint256 totalSupply) private {
 		uint256 rate = feeConfig.perfFeeBps;
 		if (rate == 0) return;
 
-		uint256 grossSharePrice = Math.mulDiv(gav, SHARES_UNIT, totalSupply);
+		uint256 grossSharePrice = Math.mulDiv(feeGav, SHARES_UNIT, totalSupply);
 		uint256 hwm = highWaterMark;
 		if (grossSharePrice <= hwm) return;
 		// fee stop: gains made while a redemption is overdue are never charged (founder 2026-10-06)
-		if (redemptionQueue.isOverdue(address(this))) {
+		if (_overdue()) {
 			highWaterMark = grossSharePrice;
 			return;
 		}
@@ -593,7 +606,7 @@ contract ComptrollerV6 is ReentrancyGuard {
 		if (feeShares == 0) return;
 
 		shares.mint(fundOwner, feeShares);
-		uint256 newHwm = Math.mulDiv(gav, SHARES_UNIT, shares.totalSupply());
+		uint256 newHwm = Math.mulDiv(feeGav, SHARES_UNIT, shares.totalSupply());
 		highWaterMark = newHwm;
 
 		emit PerformanceFeeSettled(feeShares, newHwm);
@@ -648,6 +661,13 @@ contract ComptrollerV6 is ReentrancyGuard {
 
 	function _tracking() private view returns (ComptrollerV3Lib.Tracking memory) {
 		return ComptrollerV3Lib.Tracking(valueInterpreter, allowRiskyAssets, MAX_TRACKED_ASSETS);
+	}
+
+	/// @notice Write off a token whose pool reads 1 wei: it leaves the vault for good, so deposits and the queue stop waiting on it
+	///         (review 2026-11-01). Selling it is refused at that price (MinPoolLiquidityPolicy), so this is the manager's way
+	///         out of a dead token. It is burned rather than sent anywhere: faking the floor to write off a live one pays nobody.
+	function writeOffAsset(address asset) external onlyFundOwner nonReentrant {
+		ComptrollerV6Lib.writeOff(trackedAssets, costBasis, _context(), asset);
 	}
 
 	/// @dev An asset with a non-zero vault balance is fund value and cannot be untracked.
@@ -803,8 +823,12 @@ contract ComptrollerV6 is ReentrancyGuard {
 	}
 
 	/// @dev The vault's USDC a manager's trade must leave: all of it while a redemption is overdue, else none.
+	function _overdue() private view returns (bool) {
+		return redemptionQueue.isOverdue(address(this));
+	}
+
 	function _usdcFloor() private view returns (uint256) {
-		if (!redemptionQueue.isOverdue(address(this))) return 0;
+		if (!_overdue()) return 0;
 		return denominationAsset.balanceOf(address(vault));
 	}
 

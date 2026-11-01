@@ -3,8 +3,9 @@ pragma solidity 0.8.24;
 
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {FundFactory} from '../../src/core/FundFactory.sol';
-import {ComptrollerDeployer, SharesVaultDeployer} from '../../src/core/FundComponentDeployers.sol';
-import {Comptroller} from '../../src/core/Comptroller.sol';
+import {SharesVaultDeployer} from '../../src/core/FundComponentDeployers.sol';
+import {ComptrollerV6 as Comptroller} from '../../src/core/ComptrollerV6.sol';
+import {V6Host} from '../utils/V6Host.sol';
 import {ValueInterpreter} from '../../src/core/ValueInterpreter.sol';
 import {MockERC20, MockAggregator} from '../utils/Mocks.sol';
 
@@ -29,7 +30,7 @@ contract EchidnaFund {
 		usdcFeed = new MockAggregator(8, 1e8);
 		interpreter.addPrimitive(address(usdc), address(usdcFeed), 7 days);
 
-		factory = new FundFactory(interpreter, new ComptrollerDeployer(), new SharesVaultDeployer());
+		factory = new FundFactory(interpreter, V6Host.deployer(), new SharesVaultDeployer());
 		comptroller = Comptroller(
 			factory.createFund(
 				FundFactory.FundConfig({
@@ -56,18 +57,18 @@ contract EchidnaFund {
 
 	function requestDeposit(uint256 assets) external {
 		assets = 1 + (assets % 1_000_000e6);
-		comptroller.requestDeposit(assets);
+		comptroller.requestDeposit(assets, type(uint256).max);
 		escrowMirror += assets;
 	}
 
 	function cancelDeposit() external {
-		(uint256 assets,) = comptroller.depositRequests(address(this));
+		(uint256 assets,,) = comptroller.depositRequests(address(this));
 		comptroller.cancelDepositRequest();
 		escrowMirror -= assets;
 	}
 
 	function executeDeposit() external {
-		(uint256 assets,) = comptroller.depositRequests(address(this));
+		(uint256 assets,,) = comptroller.depositRequests(address(this));
 		comptroller.executeDepositRequest(address(this));
 		escrowMirror -= assets;
 	}
@@ -75,13 +76,7 @@ contract EchidnaFund {
 	function redeemForDenom(uint256 sharesAmount) external {
 		uint256 balance = comptroller.shares().balanceOf(address(this));
 		if (balance == 0) return;
-		comptroller.redeemSharesForDenominationAsset(1 + (sharesAmount % balance));
-	}
-
-	function redeemInKind(uint256 sharesAmount) external {
-		uint256 balance = comptroller.shares().balanceOf(address(this));
-		if (balance == 0) return;
-		comptroller.redeemSharesInKind(1 + (sharesAmount % balance));
+		comptroller.redeemShares(1 + (sharesAmount % balance));
 	}
 
 	function pokeFees() external {

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
+import {V6Host} from './utils/V6Host.sol';
 import {Test} from 'forge-std/Test.sol';
 import {Ownable} from '@openzeppelin/contracts/access/Ownable.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
 import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
-import {Comptroller} from '../src/core/Comptroller.sol';
+import {ComptrollerV6 as Comptroller} from '../src/core/ComptrollerV6.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {MockERC20, MockAggregator} from './utils/Mocks.sol';
 
@@ -129,7 +130,7 @@ contract SequencerUptimeTest is Test {
 	// ─── Fund level ──────────────────────────────────────────────────────────────
 
 	function _fundHoldingGpux() internal returns (Comptroller comptroller) {
-		FundFactory factory = new FundFactory(interpreter, new ComptrollerDeployer(), new SharesVaultDeployer());
+		FundFactory factory = new FundFactory(interpreter, V6Host.deployer(), new SharesVaultDeployer());
 		comptroller = Comptroller(
 			factory.createFund(
 				FundFactory.FundConfig({
@@ -149,7 +150,7 @@ contract SequencerUptimeTest is Test {
 		usdc.mint(alice, 1_000e6);
 		vm.startPrank(alice);
 		usdc.approve(address(comptroller), 1_000e6);
-		comptroller.requestDeposit(1_000e6);
+		comptroller.requestDeposit(1_000e6, type(uint256).max);
 		vm.stopPrank();
 		skip(30 minutes);
 		comptroller.executeDepositRequest(alice);
@@ -161,12 +162,12 @@ contract SequencerUptimeTest is Test {
 		gpuxFeed.setAnswer(100e8);
 	}
 
-	function test_fund_downBlocksDepositExecution_inKindExitStaysOpen() public {
+	function test_fund_downBlocksDepositExecution_andSendsTheInstantExitToTheQueue() public {
 		Comptroller comptroller = _fundHoldingGpux();
 		usdc.mint(bob, 100e6);
 		vm.startPrank(bob);
 		usdc.approve(address(comptroller), 100e6);
-		comptroller.requestDeposit(100e6);
+		comptroller.requestDeposit(100e6, type(uint256).max);
 		vm.stopPrank();
 		skip(30 minutes);
 		usdcFeed.setAnswer(1e8);
@@ -178,9 +179,8 @@ contract SequencerUptimeTest is Test {
 
 		uint256 aliceShares = comptroller.shares().balanceOf(alice);
 		vm.prank(alice);
-		comptroller.redeemSharesInKind(aliceShares); // the guaranteed exit never prices
-		assertEq(comptroller.shares().balanceOf(alice), 0);
-		assertGt(gpux.balanceOf(alice), 0);
+		vm.expectRevert(Comptroller.UseRedemptionQueue.selector);
+		comptroller.redeemShares(aliceShares); // no price, no instant exit: the queue takes it
 	}
 
 	function test_fund_afterGrace_depositExecutes() public {
@@ -192,7 +192,7 @@ contract SequencerUptimeTest is Test {
 		usdc.mint(bob, 150e6);
 		vm.startPrank(bob);
 		usdc.approve(address(comptroller), 150e6);
-		comptroller.requestDeposit(150e6);
+		comptroller.requestDeposit(150e6, type(uint256).max);
 		vm.stopPrank();
 		skip(30 minutes); // matured, but still inside the 1h grace
 		usdcFeed.setAnswer(1e8);

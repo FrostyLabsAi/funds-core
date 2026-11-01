@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
+import {V6Host} from './utils/V6Host.sol';
 import {Test} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {Ownable2Step} from '@openzeppelin/contracts/access/Ownable2Step.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
 import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
-import {Comptroller} from '../src/core/Comptroller.sol';
+import {ComptrollerV6 as Comptroller} from '../src/core/ComptrollerV6.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {IPolicy} from '../src/interfaces/IPolicy.sol';
 import {IUniswapV3SwapRouter} from '../src/interfaces/external/IUniswapV3SwapRouter.sol';
 import {UniswapV3SwapAdapter} from '../src/adapters/UniswapV3SwapAdapter.sol';
 import {PoolPriceRegistrar} from '../src/pricing/PoolPriceRegistrar.sol';
+import {PoolPriceRegistrarWindowed} from '../src/pricing/PoolPriceRegistrarWindowed.sol';
 import {MinPoolLiquidityPolicy} from '../src/policies/MinPoolLiquidityPolicy.sol';
 import {MockERC20, MockAggregator, MockSwapRouter, MockUniV3PositionManager} from './utils/Mocks.sol';
 import {LimitOrderPosition, LimitOrderPositionFactory} from '../src/positions/LimitOrderPosition.sol';
@@ -58,8 +60,8 @@ contract MinPoolLiquidityPolicyTest is Test {
 		MockUniswapV3Factory uniswap = new MockUniswapV3Factory();
 		address[] memory quotes = new address[](1);
 		quotes[0] = address(usdc);
-		registrar = new PoolPriceRegistrar(
-			PoolPriceRegistrar.Wiring({
+		registrar = PoolPriceRegistrar(address(new PoolPriceRegistrarWindowed(
+			PoolPriceRegistrarWindowed.Wiring({
 				valueInterpreter: vi,
 				uniswapV3Factory: address(uniswap),
 				slipstreamFactories: [
@@ -71,7 +73,7 @@ contract MinPoolLiquidityPolicyTest is Test {
 				quotes: quotes
 			}),
 			address(this)
-		);
+		)));
 		vi.transferOwnership(address(registrar));
 		registrar.execute(abi.encodeCall(Ownable2Step.acceptOwnership, ()));
 
@@ -83,7 +85,7 @@ contract MinPoolLiquidityPolicyTest is Test {
 		registrar.register(address(tkn), address(pool));
 
 		policy = new MinPoolLiquidityPolicy(registrar);
-		factory = new FundFactory(vi, new ComptrollerDeployer(), new SharesVaultDeployer());
+		factory = new FundFactory(vi, V6Host.deployer(), new SharesVaultDeployer());
 		router = new MockSwapRouter();
 		uniAdapter = new UniswapV3SwapAdapter(IUniswapV3SwapRouter(address(router)));
 		factory.registerAdapter(address(uniAdapter));
@@ -124,7 +126,7 @@ contract MinPoolLiquidityPolicyTest is Test {
 		usdc.mint(alice, 100_000e6);
 		vm.startPrank(alice);
 		usdc.approve(address(c), 100_000e6);
-		c.requestDeposit(100_000e6);
+		c.requestDeposit(100_000e6, type(uint256).max);
 		vm.stopPrank();
 		skip(1 minutes);
 		c.executeDepositRequest(alice);

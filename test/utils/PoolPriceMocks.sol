@@ -23,6 +23,7 @@ contract ScriptedCLPool {
 
 	int24 public meanTick;
 	uint128 public meanLiquidity;
+	uint128 public spotLiquidity;
 	int24 public spotTick;
 	uint16 public observationIndex;
 	uint16 public observationCardinality = 1;
@@ -31,6 +32,10 @@ contract ScriptedCLPool {
 	/// @dev Before the last `recentSpan` seconds the pool sat at `olderTick` (0 = never).
 	int24 public olderTick;
 	uint32 public recentSpan;
+	/// @dev In-range liquidity was `dipLiquidity` from `dipFromAgo` to `dipToAgo` seconds ago (0 = no dip).
+	uint128 public dipLiquidity;
+	uint32 public dipFromAgo;
+	uint32 public dipToAgo;
 
 	constructor(address a, address b, address factory_, uint24 fee_, int24 tickSpacing_) {
 		(token0, token1) = a < b ? (a, b) : (b, a);
@@ -55,6 +60,23 @@ contract ScriptedCLPool {
 		recentSpan = recentSpan_;
 	}
 
+	/// @dev In-range liquidity right now, apart from the oracle's (0 = none set).
+	function setSpotLiquidity(uint128 liquidity_) external {
+		spotLiquidity = liquidity_;
+	}
+
+	function liquidity() external view returns (uint128) {
+		if (spotLiquidity != 0) return spotLiquidity;
+		return dipLiquidity != 0 && dipFromAgo == 0 ? dipLiquidity : meanLiquidity;
+	}
+
+	/// @dev Liquidity pulled to `liquidity` between `fromAgo` and `toAgo` seconds ago (fromAgo < toAgo).
+	function setDip(uint128 liquidity, uint32 fromAgo, uint32 toAgo) external {
+		dipLiquidity = liquidity;
+		dipFromAgo = fromAgo;
+		dipToAgo = toAgo;
+	}
+
 	/// @dev A full ring: index 0 is the newest, index 1 (the next to overwrite) the oldest.
 	function setHistory(uint32 oldestAge) external {
 		observationIndex = 0;
@@ -75,6 +97,8 @@ contract ScriptedCLPool {
 		observations[6] = Observation(1, 0, 0, false);
 	}
 
+	/// @dev Cumulatives at any number of points, from the scripted tick and liquidity history (each read as seconds
+	///      ago): a two-point read answers exactly as a constant-liquidity window does.
 	function observe(uint32[] calldata secondsAgos)
 		external
 		view
@@ -82,17 +106,29 @@ contract ScriptedCLPool {
 	{
 		uint32 oldestAge = uint32(block.timestamp) - _oldestTimestamp();
 		require(secondsAgos[0] <= oldestAge, 'OLD');
-		uint32 span = secondsAgos[0] - secondsAgos[1];
-		int56 tickTime = int56(meanTick) * int56(uint56(span));
-		if (recentSpan != 0 && span > recentSpan) {
-			tickTime = int56(meanTick) * int56(uint56(recentSpan)) + int56(olderTick) * int56(uint56(span - recentSpan));
+		tickCumulatives = new int56[](secondsAgos.length);
+		secondsPerLiquidityCumulativeX128s = new uint160[](secondsAgos.length);
+		for (uint256 i; i < secondsAgos.length; ++i) {
+			tickCumulatives[i] = 1_000_000_000_000 - _tickArea(secondsAgos[i]);
+			secondsPerLiquidityCumulativeX128s[i] = uint160(1 << 159) - _splArea(secondsAgos[i]);
 		}
-		tickCumulatives = new int56[](2);
-		secondsPerLiquidityCumulativeX128s = new uint160[](2);
-		tickCumulatives[0] = 1_000_000;
-		tickCumulatives[1] = 1_000_000 + tickTime;
-		secondsPerLiquidityCumulativeX128s[0] = 7;
-		secondsPerLiquidityCumulativeX128s[1] = 7 + uint160((uint256(span) << 128) / meanLiquidity);
+	}
+
+	/// @dev Σ tick over the last `ago` seconds.
+	function _tickArea(uint32 ago) internal view returns (int56) {
+		if (recentSpan != 0 && ago > recentSpan) {
+			return int56(meanTick) * int56(uint56(recentSpan)) + int56(olderTick) * int56(uint56(ago - recentSpan));
+		}
+		return int56(meanTick) * int56(uint56(ago));
+	}
+
+	/// @dev Σ seconds / liquidity (X128) over the last `ago` seconds; one division per constant stretch.
+	function _splArea(uint32 ago) internal view returns (uint160) {
+		if (dipLiquidity == 0 || ago <= dipFromAgo) return uint160((uint256(ago) << 128) / meanLiquidity);
+		uint32 dipEnd = ago < dipToAgo ? ago : dipToAgo;
+		uint256 area = (uint256(dipFromAgo) << 128) / meanLiquidity + (uint256(dipEnd - dipFromAgo) << 128) / dipLiquidity;
+		if (ago > dipToAgo) area += (uint256(ago - dipToAgo) << 128) / meanLiquidity;
+		return uint160(area);
 	}
 
 	function slot0()

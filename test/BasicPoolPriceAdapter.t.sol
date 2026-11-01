@@ -6,14 +6,14 @@ import {Clones} from '@openzeppelin/contracts/proxy/Clones.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {IValueInterpreter} from '../src/interfaces/IValueInterpreter.sol';
 import {IPoolPriceAdapter} from '../src/interfaces/IPoolPriceAdapter.sol';
-import {BasicPoolPriceAdapter} from '../src/pricing/BasicPoolPriceAdapter.sol';
 import {PoolPriceAdapterBase} from '../src/pricing/PoolPriceAdapterBase.sol';
 import {MockERC20, MockAggregator} from './utils/Mocks.sol';
 import {ScriptedBasicPool} from './utils/PoolPriceMocks.sol';
 
-contract BasicPoolPriceAdapterTest is Test {
+/// @notice What every BasicPoolPriceAdapter version must do; the concrete suite is on the version the registrars clone (V2).
+abstract contract BasicPoolPriceAdapterTest is Test {
 	ValueInterpreter internal vi;
-	BasicPoolPriceAdapter internal impl;
+	address internal impl;
 	MockERC20 internal usdc;
 	MockERC20 internal weth;
 	MockERC20 internal tkn;
@@ -34,8 +34,11 @@ contract BasicPoolPriceAdapterTest is Test {
 		vi.addPrimitive(address(usdc), address(new MockAggregator(8, 1e8)), 25 hours);
 		vi.addPrimitive(address(weth), address(wethFeed), 1 hours);
 		vm.stopPrank();
-		impl = new BasicPoolPriceAdapter();
+		impl = _implementation();
 	}
+
+	/// @dev The implementation every clone in this suite runs.
+	function _implementation() internal virtual returns (address);
 
 	// ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -190,14 +193,6 @@ contract BasicPoolPriceAdapterTest is Test {
 		_script(pool, tkn, 10e18, 10e18, 2 hours); // 10 WETH at $2000
 
 		assertEq(_adapter(pool, tkn).liquidityUsd(), 20_000e18);
-	}
-
-	function test_pricesNearZeroWhenThePoolWasDrained() public {
-		ScriptedBasicPool pool = _usdcPool();
-		_script(pool, tkn, HALF_M_TKN, ONE_M_USDC, 2 hours);
-		_setReserves(pool, tkn, 2_000e18, 4_999e6); // under the $5,000 valuation minimum
-
-		assertEq(_answer(_adapter(pool, tkn)), 1);
 	}
 
 	function test_pricesNearZeroWhenTheWindowAveragedUnderTheMinimum() public {

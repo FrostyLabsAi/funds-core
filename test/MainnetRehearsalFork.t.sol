@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
+import {V6Host} from './utils/V6Host.sol';
 import {Test, console2} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {IERC4626} from '@openzeppelin/contracts/interfaces/IERC4626.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
 import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
-import {Comptroller} from '../src/core/Comptroller.sol';
+import {ComptrollerV6 as Comptroller} from '../src/core/ComptrollerV6.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {IPolicy} from '../src/interfaces/IPolicy.sol';
 import {IExternalPosition} from '../src/interfaces/IExternalPosition.sol';
@@ -34,7 +35,7 @@ import {IVerantaTradingRouter, IVerantaMulticall, IVerantaPairStorage} from '../
 ///         NOT covered (by construction, see the report): B20 stock tokens are Base-node
 ///         precompiles (OpcodeNotFound on anvil); Veranta fills need their operator + signed
 ///         Pyth updates; Chainlink never updates on a frozen fork (warps stay < heartbeat).
-///         Run: REHEARSAL_RPC=<base rpc> REHEARSAL_BLOCK=<pinned block> \
+///         Run: BASE_MAINNET_RPC=<base rpc> REHEARSAL_BLOCK=<pinned block> \
 ///              forge test --match-path test/MainnetRehearsalFork.t.sol -vv
 contract MainnetRehearsalForkTest is Test {
 	// ── Base mainnet (each verified on-chain 2026-09-23) ─────────────────────────
@@ -72,16 +73,14 @@ contract MainnetRehearsalForkTest is Test {
 	address internal keeper = makeAddr('keeper');
 	address internal feeRecipient = makeAddr('protocolFeeRecipient');
 
+	uint256 internal constant FORK_BLOCK = 53_380_000;
 	bool internal forked;
 
 	function setUp() public {
-		string memory rpc = vm.envOr('REHEARSAL_RPC', string(''));
+		string memory rpc = vm.envOr('BASE_MAINNET_RPC', string(''));
 		if (bytes(rpc).length == 0) return;
-		// Pin a block (REHEARSAL_BLOCK) so forge's fork cache survives across runs — the
-		// run touches thousands of pool / vault / venue slots
-		uint256 blockNumber = vm.envOr('REHEARSAL_BLOCK', uint256(0));
-		if (blockNumber > 0) vm.createSelectFork(rpc, blockNumber);
-		else vm.createSelectFork(rpc);
+		// pinned so forge's fork cache survives across runs: the run touches thousands of pool, vault and venue slots
+		vm.createSelectFork(rpc, FORK_BLOCK);
 		forked = true;
 
 		interpreter = new ValueInterpreter(admin);
@@ -93,7 +92,7 @@ contract MainnetRehearsalForkTest is Test {
 		interpreter.addDerivative(STEAKHOUSE_USDC, erc4626Feed);
 		vm.stopPrank();
 
-		FundFactory factory = new FundFactory(interpreter, new ComptrollerDeployer(), new SharesVaultDeployer());
+		FundFactory factory = new FundFactory(interpreter, V6Host.deployer(), new SharesVaultDeployer());
 		factory.setProtocolFee(25, feeRecipient);
 		uniAdapter = address(new UniswapV3SwapAdapter(IUniswapV3SwapRouter(SWAP_ROUTER02)));
 		erc4626Adapter = address(new ERC4626Adapter());
@@ -151,7 +150,7 @@ contract MainnetRehearsalForkTest is Test {
 		deal(USDC, alice, 100_000e6);
 		vm.startPrank(alice);
 		IERC20(USDC).approve(address(comptroller), 100_000e6);
-		comptroller.requestDeposit(100_000e6);
+		comptroller.requestDeposit(100_000e6, type(uint256).max);
 		vm.stopPrank();
 		skip(1 minutes);
 		comptroller.executeDepositRequest(alice);
@@ -229,7 +228,7 @@ contract MainnetRehearsalForkTest is Test {
 		uint256 price = comptroller.calcGrossShareValue();
 		uint256 before = IERC20(USDC).balanceOf(alice);
 		vm.prank(alice);
-		comptroller.redeemSharesForDenominationAsset(redeemShares);
+		comptroller.redeemShares(redeemShares);
 		uint256 paid = IERC20(USDC).balanceOf(alice) - before;
 		console2.log('RESULT redeemed 10% of shares, paid (1e6)', paid);
 		assertApproxEqRel(paid, redeemShares * price / 1e18, 0.0001e18, 'paid = shares x share price');

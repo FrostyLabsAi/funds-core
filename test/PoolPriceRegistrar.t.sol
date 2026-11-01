@@ -6,7 +6,7 @@ import {Ownable} from '@openzeppelin/contracts/access/Ownable.sol';
 import {Ownable2Step} from '@openzeppelin/contracts/access/Ownable2Step.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {IPoolPriceAdapter} from '../src/interfaces/IPoolPriceAdapter.sol';
-import {PoolPriceRegistrar} from '../src/pricing/PoolPriceRegistrar.sol';
+import {PoolPriceRegistrarWindowed as PoolPriceRegistrar} from '../src/pricing/PoolPriceRegistrarWindowed.sol';
 import {MockERC20, MockAggregator} from './utils/Mocks.sol';
 import {
 	ScriptedCLPool,

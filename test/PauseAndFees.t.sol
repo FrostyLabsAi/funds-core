@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
+import {V6Host} from './utils/V6Host.sol';
 import {Test} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
 import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
-import {Comptroller} from '../src/core/Comptroller.sol';
+import {ComptrollerV6 as Comptroller} from '../src/core/ComptrollerV6.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {MockERC20, MockAggregator} from './utils/Mocks.sol';
 
@@ -31,7 +32,7 @@ contract PauseAndFeesTest is Test {
 		vm.prank(admin);
 		interpreter.addPrimitive(address(usdc), address(usdcFeed), 7 days);
 
-		factory = new FundFactory(interpreter, new ComptrollerDeployer(), new SharesVaultDeployer()); // this test contract = factory owner
+		factory = new FundFactory(interpreter, V6Host.deployer(), new SharesVaultDeployer()); // this test contract = factory owner
 		factory.setGuardian(guardian);
 
 		comptroller = Comptroller(
@@ -58,7 +59,7 @@ contract PauseAndFeesTest is Test {
 	function _depositFor(address depositor, uint256 assets) internal {
 		vm.startPrank(depositor);
 		usdc.approve(address(comptroller), assets);
-		comptroller.requestDeposit(assets);
+		comptroller.requestDeposit(assets, type(uint256).max);
 		vm.stopPrank();
 		skip(30 minutes);
 		comptroller.executeDepositRequest(depositor);
@@ -114,14 +115,14 @@ contract PauseAndFeesTest is Test {
 		vm.startPrank(alice);
 		usdc.approve(address(comptroller), 1000e6);
 		vm.expectRevert(Comptroller.DepositsSuspended.selector);
-		comptroller.requestDeposit(1000e6);
+		comptroller.requestDeposit(1000e6, type(uint256).max);
 		vm.stopPrank();
 
 		// Reopen, request, then pause again mid-flight: execute is blocked, cancel is not
 		vm.prank(manager);
 		comptroller.setOwnerDepositsPaused(false);
 		vm.prank(alice);
-		comptroller.requestDeposit(1000e6);
+		comptroller.requestDeposit(1000e6, type(uint256).max);
 		skip(30 minutes);
 
 		vm.prank(manager);
@@ -144,7 +145,7 @@ contract PauseAndFeesTest is Test {
 		vm.startPrank(alice);
 		usdc.approve(address(comptroller), 1000e6);
 		vm.expectRevert(Comptroller.DepositsSuspended.selector);
-		comptroller.requestDeposit(1000e6);
+		comptroller.requestDeposit(1000e6, type(uint256).max);
 		vm.stopPrank();
 
 		// Neither the guardian nor the fund owner can unpause…
@@ -166,7 +167,7 @@ contract PauseAndFeesTest is Test {
 		assertFalse(comptroller.guardianDepositsPaused());
 
 		vm.prank(alice);
-		comptroller.requestDeposit(1000e6);
+		comptroller.requestDeposit(1000e6, type(uint256).max);
 	}
 
 	function test_guardianRole_gates() public {
@@ -204,18 +205,16 @@ contract PauseAndFeesTest is Test {
 		vm.startPrank(bob);
 		usdc.approve(address(comptroller), 1000e6);
 		vm.expectRevert(Comptroller.DepositsSuspended.selector);
-		comptroller.requestDeposit(1000e6);
+		comptroller.requestDeposit(1000e6, type(uint256).max);
 		vm.stopPrank();
 
 		vm.prank(manager);
 		vm.expectRevert(Comptroller.AlreadyShutDown.selector);
 		comptroller.createExternalPosition(1, '');
 
-		// Both exit paths still work
-		vm.startPrank(alice);
-		comptroller.redeemSharesForDenominationAsset(400e18);
-		comptroller.redeemSharesInKind(100e18);
-		vm.stopPrank();
+		// The exit still works
+		vm.prank(alice);
+		comptroller.redeemShares(500e18);
 		assertEq(comptroller.shares().balanceOf(alice), 499e18); // 999e18 after the bootstrap seed − 500e18
 	}
 }
