@@ -12,6 +12,7 @@ import {IPolicy} from '../../src/interfaces/IPolicy.sol';
 import {IUniswapV3SwapRouter} from '../../src/interfaces/external/IUniswapV3SwapRouter.sol';
 import {UniswapV3SwapAdapter} from '../../src/adapters/UniswapV3SwapAdapter.sol';
 import {PoolPriceRegistrar} from '../../src/pricing/PoolPriceRegistrar.sol';
+import {PoolPriceRegistrarWindowed} from '../../src/pricing/PoolPriceRegistrarWindowed.sol';
 import {MinPoolLiquidityPolicy} from '../../src/policies/MinPoolLiquidityPolicy.sol';
 import {RedemptionQueueV2} from '../../src/redemption/RedemptionQueueV2.sol';
 import {Shares} from '../../src/fund/Shares.sol';
@@ -21,7 +22,7 @@ import {MockUnwindPosition, MockUnwindPositionFactory} from './MockUnwindPositio
 import {ScriptedCLPool, MockUniswapV3Factory, MockSlipstreamFactory, MockAerodromeBasicFactory} from './PoolPriceMocks.sol';
 
 /// @notice Fund version 6 (USDC-only exit, founder 2026-10-11) on a real factory wired to a real RedemptionQueueV2:
-///         RedemptionFixture's world (USDC denomination $1, WETH $2,000 Chainlink-style, TKN $1 pool-priced,
+///         The world (USDC denomination $1, WETH $2,000 Chainlink-style, TKN $1 pool-priced,
 ///         MockUnwindPosition as a perp stand-in) with fund v6 funds and the queue's keeper.
 abstract contract RedemptionFixtureV6 is Test {
 	uint128 internal constant PLENTY = 1_000_000e6;
@@ -64,8 +65,8 @@ abstract contract RedemptionFixtureV6 is Test {
 		MockUniswapV3Factory uniswap = new MockUniswapV3Factory();
 		address[] memory quotes = new address[](1);
 		quotes[0] = address(usdc);
-		registrar = new PoolPriceRegistrar(
-			PoolPriceRegistrar.Wiring({
+		registrar = PoolPriceRegistrar(address(new PoolPriceRegistrarWindowed(
+			PoolPriceRegistrarWindowed.Wiring({
 				valueInterpreter: vi,
 				uniswapV3Factory: address(uniswap),
 				slipstreamFactories: [
@@ -77,7 +78,7 @@ abstract contract RedemptionFixtureV6 is Test {
 				quotes: quotes
 			}),
 			address(this)
-		);
+		)));
 		vi.transferOwnership(address(registrar));
 		registrar.execute(abi.encodeCall(Ownable2Step.acceptOwnership, ()));
 		pool = new ScriptedCLPool(address(tkn), address(usdc), address(uniswap), 3000, 60);

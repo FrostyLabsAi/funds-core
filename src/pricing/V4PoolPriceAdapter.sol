@@ -4,6 +4,7 @@ pragma solidity 0.8.24;
 import {Clones} from '@openzeppelin/contracts/proxy/Clones.sol';
 import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
 import {IPoolPriceAdapter} from '../interfaces/IPoolPriceAdapter.sol';
+import {IPoolWatch} from '../interfaces/IPoolWatch.sol';
 import {V4PriceSampler} from './V4PriceSampler.sol';
 import {IV4StateView} from '../interfaces/external/IUniswapV4.sol';
 import {TickMath} from '../libraries/TickMath.sol';
@@ -29,7 +30,7 @@ import {PoolPriceMath} from '../libraries/PoolPriceMath.sol';
 ///        stays as deployed for today's adapters).
 ///      - Two readings pumped out of six don't move the median; moving it takes holding the price through at
 ///        least half the readings, ≈ 30 minutes at the keeper's 10-minute cadence.
-contract V4PoolPriceAdapter is IPoolPriceAdapter {
+contract V4PoolPriceAdapter is IPoolPriceAdapter, IPoolWatch {
 	uint32 public constant SAMPLE_WINDOW = 1 hours;
 	uint256 public constant MIN_SAMPLES = 4;
 	/// @notice Whole USD of sampled pool liquidity under which the asset is valued at ≈ $0 (PoolPriceAdapterBase's).
@@ -82,6 +83,14 @@ contract V4PoolPriceAdapter is IPoolPriceAdapter {
 		Config memory c = config();
 		(uint256 sampledUsd18, uint256 nowUsd18,) = _read(c, c.valueInterpreter.calcUsdRate(c.quoteAsset));
 		return nowUsd18 < sampledUsd18 ? nowUsd18 : sampledUsd18;
+	}
+
+	/// @inheritdoc IPoolWatch
+	/// @dev The pool now against the sampled median, read at a fixed quote price since only the ratio counts (review 2026-11-01).
+	///      v4's flash accounting lets a manager's own contract re-add for one call: this stops a plain rug, not that.
+	function poolUnsettled() external view returns (bool) {
+		(uint256 sampled, uint256 current,) = _read(config(), 1e18);
+		return current * 2 < sampled;
 	}
 
 	/// @dev The sampled and current liquidity (USD, 18 decimals; current is 0 for a pool gone uninitialized) and the

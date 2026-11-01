@@ -90,66 +90,6 @@ contract GovernanceHandoffForkTest is Test {
 		});
 	}
 
-	function test_fork_liveHandoffLeavesTheDeployerNothing() public {
-		vm.skip(!forked);
-		// the live premises the plan was written against
-		assertEq(d.valueInterpreter.owner(), address(p.registrar), 'the registrar owns the VI');
-		assertTrue(c.factory.creators(LISTER), 'the retired lister still holds the creator role');
-		assertEq(TIMELOCK.getMinDelay(), 2 days);
-		assertTrue(TIMELOCK.hasRole(TIMELOCK.PROPOSER_ROLE(), SAFE), 'the Admin Safe proposes');
-		assertTrue(TIMELOCK.hasRole(TIMELOCK.EXECUTOR_ROLE(), address(0)), 'anyone executes');
-
-		// nine owners, every one the deployer's today, never the VI
-		address[] memory owned = FundsGovernance.owned(d, p, c, r);
-		assertEq(owned.length, 9, 'registrar, factory, V2 perp config, 3 compounder factories, 3 retired');
-		for (uint256 i; i < owned.length; ++i) {
-			assertEq(Ownable(owned[i]).owner(), deployer);
-			assertTrue(owned[i] != address(d.valueInterpreter));
-		}
-
-		vm.startPrank(deployer);
-		FundsGovernance.start(d, p, c, r, address(TIMELOCK));
-		vm.stopPrank();
-		assertFalse(c.factory.creators(LISTER), 'start revoked the retired lister');
-		for (uint256 i; i < owned.length; ++i) {
-			assertEq(Ownable2Step(owned[i]).pendingOwner(), address(TIMELOCK));
-		}
-
-		(address[] memory targets, uint256[] memory values, bytes[] memory payloads) = FundsGovernance.acceptBatch(d, p, c, r);
-		vm.prank(SAFE);
-		TIMELOCK.scheduleBatch(targets, values, payloads, bytes32(0), SALT, 2 days);
-		// not before the delay
-		vm.expectRevert();
-		TIMELOCK.executeBatch(targets, values, payloads, bytes32(0), SALT);
-		skip(2 days);
-		// a fork gets no new oracle reports: the quotes the checks below price through report again now
-		_restamp(FundsMainnet.USDC);
-		_restamp(FundsMainnet.WETH);
-
-		// the real launch-day scripts: Finish executes the batch (anyone may) and verifies; Verify agrees
-		new FinishFundsGovernance().run();
-		new VerifyFundsGovernance().run();
-
-		_assertDeployerPowerless(owned);
-
-		// the timelock reaches VI admin, and only through the registrar
-		vm.prank(address(TIMELOCK));
-		p.registrar.execute(abi.encodeCall(ValueInterpreter.setAnswerBounds, (FundsMainnet.USDC, 1, 10e8)));
-		(int256 min, int256 max) = d.valueInterpreter.answerBounds(FundsMainnet.USDC);
-		assertEq(min, 1);
-		assertEq(max, 10e8);
-
-		// pool pricing stays permissionless: a stranger prices rETH from its pool
-		address stranger = makeAddr('stranger');
-		assertFalse(d.valueInterpreter.isSupportedAsset(RETH));
-		vm.prank(stranger);
-		address adapter = p.registrar.register(RETH, RETH_WETH_500);
-		assertEq(p.registrar.poolPricedAdapter(RETH), adapter);
-		assertGt(d.valueInterpreter.calcUsdRate(RETH), 0);
-
-		_assertNewFundIsV2AndTakesADeposit();
-	}
-
 	/// @notice Before the handoff, verify names the first owner still with the deployer: it never
 	///         passes early.
 	function test_fork_verifyRefusesBeforeTheHandoff() public {
@@ -181,6 +121,9 @@ contract GovernanceHandoffForkTest is Test {
 	/// the timelock with the rest; verify accepts fund v3 as the new-fund version and checks the
 	/// queue's wiring. Afterwards the guardian may still switch the approved unwinder on, only the
 	/// timelock switches it off, and the deployer can do neither.
+	// The full live-handoff rehearsal was removed 2026-11-01: the launch-day scripts predate registrar V3, fund v6 and the CLM
+	// contracts, and it gets rewritten with them right before the handoff (founder 2026-10-27).
+
 	function test_fork_handoffIncludesTheRedemptionQueue() public {
 		vm.skip(!forked);
 		VerantaPriceStore store =
@@ -234,26 +177,6 @@ contract GovernanceHandoffForkTest is Test {
 			abi.encodeWithSelector(AggregatorV3Interface.latestRoundData.selector),
 			abi.encode(round, answer, block.timestamp, block.timestamp, answeredIn)
 		);
-	}
-
-	/// @dev Every moved owner refuses the deployer, plus the live powers that matter most by name.
-	function _assertDeployerPowerless(address[] memory owned) internal {
-		vm.startPrank(deployer);
-		for (uint256 i; i < owned.length; ++i) {
-			vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, deployer));
-			Ownable(owned[i]).transferOwnership(deployer);
-		}
-		vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, deployer));
-		p.registrar.execute(abi.encodeCall(ValueInterpreter.setAnswerBounds, (FundsMainnet.USDC, 1, 10e8)));
-		vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, deployer));
-		p.registrar.setPool(RETH, RETH_WETH_500);
-		vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, deployer));
-		d.factory.registerAdapter(address(1));
-		vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, deployer));
-		c.factory.setCreator(deployer, true);
-		vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, deployer));
-		d.verantaFactory.setPairAsset(9, address(1));
-		vm.stopPrank();
 	}
 
 	function _assertNewFundIsV2AndTakesADeposit() internal {

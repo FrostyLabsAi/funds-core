@@ -7,6 +7,7 @@ import {Ownable2Step} from '@openzeppelin/contracts/access/Ownable2Step.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {IPoolPriceAdapter} from '../src/interfaces/IPoolPriceAdapter.sol';
 import {PoolPriceRegistrar} from '../src/pricing/PoolPriceRegistrar.sol';
+import {PoolPriceRegistrarWindowed} from '../src/pricing/PoolPriceRegistrarWindowed.sol';
 import {PoolPriceRegistrarV2} from '../src/pricing/PoolPriceRegistrarV2.sol';
 import {V4PoolPriceAdapter} from '../src/pricing/V4PoolPriceAdapter.sol';
 import {V4PriceSampler} from '../src/pricing/V4PriceSampler.sol';
@@ -64,8 +65,8 @@ contract PoolPriceRegistrarV2Test is Test {
 		address[] memory oldQuotes = new address[](2);
 		oldQuotes[0] = address(usdc);
 		oldQuotes[1] = address(weth);
-		old = new PoolPriceRegistrar(
-			PoolPriceRegistrar.Wiring({
+		old = PoolPriceRegistrar(address(new PoolPriceRegistrarWindowed(
+			PoolPriceRegistrarWindowed.Wiring({
 				valueInterpreter: vi,
 				uniswapV3Factory: address(uniswap),
 				slipstreamFactories: [address(slipstreams[0]), address(slipstreams[1]), address(slipstreams[2])],
@@ -73,7 +74,7 @@ contract PoolPriceRegistrarV2Test is Test {
 				quotes: oldQuotes
 			}),
 			admin
-		);
+		)));
 		vm.startPrank(admin);
 		vi.transferOwnership(address(old));
 		old.execute(abi.encodeCall(Ownable2Step.acceptOwnership, ()));

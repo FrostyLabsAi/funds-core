@@ -49,7 +49,10 @@ library ClmFundsDeploy {
 	///         long-tail token without the long-tail rules (final review 2026-10-08, I1; review 2026-10-25).
 	function list(ClmVaultPriceFeed feed, address[] memory vaults) internal {
 		address v2Owner = PoolPriceRegistrarV2(REGISTRAR_V2).owner();
-		bool viaV3 = v2Owner.code.length > 0;
+		// an EOA with an EIP-7702 delegation has code too, `0xef0100 || delegate` (23 bytes): the deployer has had
+		// MetaMask's, so this read it as registrar V3 before V3 existed (2026-11-01, four fork tests)
+		bytes memory ownerCode = v2Owner.code;
+		bool viaV3 = ownerCode.length > 0 && !(ownerCode.length == 23 && bytes3(ownerCode) == 0xef0100);
 		PoolPriceRegistrarV2 via = PoolPriceRegistrarV2(viaV3 ? v2Owner : REGISTRAR_V2);
 		for (uint256 i; i < vaults.length; ++i) {
 			if (viaV3) _refuseLongTail(PoolPriceRegistrarV3(v2Owner), vaults[i]);

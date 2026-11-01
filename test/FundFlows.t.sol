@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
+import {V6Host} from './utils/V6Host.sol';
 import {Test} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
 import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
-import {Comptroller} from '../src/core/Comptroller.sol';
+import {ComptrollerV6 as Comptroller} from '../src/core/ComptrollerV6.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {Shares} from '../src/fund/Shares.sol';
 import {Vault} from '../src/fund/Vault.sol';
@@ -36,7 +37,7 @@ contract FundFlowsTest is Test {
 		vm.prank(admin);
 		interpreter.addPrimitive(address(usdc), address(usdcFeed), 7 days);
 
-		factory = new FundFactory(interpreter, new ComptrollerDeployer(), new SharesVaultDeployer());
+		factory = new FundFactory(interpreter, V6Host.deployer(), new SharesVaultDeployer());
 
 		usdc.mint(alice, 1_000_000e6);
 		usdc.mint(bob, 1_000_000e6);
@@ -63,7 +64,7 @@ contract FundFlowsTest is Test {
 	function _depositFor(Comptroller comptroller, address depositor, uint256 assets) internal {
 		vm.startPrank(depositor);
 		usdc.approve(address(comptroller), assets);
-		comptroller.requestDeposit(assets);
+		comptroller.requestDeposit(assets, type(uint256).max);
 		vm.stopPrank();
 		skip(30 minutes);
 		comptroller.executeDepositRequest(depositor);
@@ -147,7 +148,7 @@ contract FundFlowsTest is Test {
 		Comptroller comptroller = _createFund(0, 0);
 		vm.startPrank(alice);
 		usdc.approve(address(comptroller), 1000e6);
-		comptroller.requestDeposit(1000e6);
+		comptroller.requestDeposit(1000e6, type(uint256).max);
 		vm.stopPrank();
 
 		// Too young
@@ -177,7 +178,7 @@ contract FundFlowsTest is Test {
 		// Trigger settlement via a second deposit; compute expectation at execution time
 		vm.startPrank(bob);
 		usdc.approve(address(comptroller), 100e6);
-		comptroller.requestDeposit(100e6);
+		comptroller.requestDeposit(100e6, type(uint256).max);
 		vm.stopPrank();
 		skip(30 minutes);
 
@@ -241,53 +242,21 @@ contract FundFlowsTest is Test {
 		_depositFor(comptroller, alice, 1000e6);
 
 		skip(1 days); // timelock
+		usdcFeed.setAnswer(1e8); // a stale price would send the exit to the queue
 
 		vm.prank(alice);
-		comptroller.redeemSharesForDenominationAsset(400e18);
+		comptroller.redeemShares(400e18);
 
 		assertEq(comptroller.shares().balanceOf(alice), 599e18); // 999e18 after the bootstrap seed − 400e18
 		assertEq(usdc.balanceOf(alice), 1_000_000e6 - 1000e6 + 400e6);
 		assertEq(usdc.balanceOf(address(comptroller.vault())), 600e6);
 	}
 
-	function test_redeemInKind_worksWithStaleEquityFeeds() public {
+	function test_holdingsViews() public {
 		Comptroller comptroller = _createFund(0, 0);
 		_depositFor(comptroller, alice, 1000e6);
 
-		// Fund also holds a tokenized stock (4h heartbeat = market-hours gate)
-		MockERC20 nvdax = new MockERC20('NVDA Wrapper', 'NVDAx', 18);
-		MockAggregator nvdaxFeed = new MockAggregator(8, 180e8);
-		vm.prank(admin);
-		interpreter.addPrimitive(address(nvdax), address(nvdaxFeed), 4 hours);
-		vm.prank(manager);
-		comptroller.addTrackedAsset(address(nvdax));
-		nvdax.mint(address(comptroller.vault()), 10e18);
-
-		// Weekend: equity feed stops updating; timelock also passes
-		skip(1 days);
-		usdcFeed.setAnswer(1e8); // crypto feed stays fresh
-
-		// Value-based redemption is blocked by the stale equity feed…
-		uint256 staleUpdatedAt = nvdaxFeed.updatedAt();
-		vm.prank(alice);
-		vm.expectRevert(abi.encodeWithSelector(ValueInterpreter.StalePrice.selector, address(nvdax), staleUpdatedAt));
-		comptroller.redeemSharesForDenominationAsset(100e18);
-
-		// …but the guaranteed 24/7 exit works, paying out BOTH assets prorata.
-		vm.prank(alice);
-		comptroller.redeemSharesInKind(500e18);
-		assertEq(comptroller.shares().balanceOf(alice), 499e18); // 999e18 after the bootstrap seed − 500e18
-		assertEq(usdc.balanceOf(address(comptroller.vault())), 500e6);
-		assertEq(usdc.balanceOf(alice), 1_000_000e6 - 1000e6 + 500e6);
-		assertEq(nvdax.balanceOf(alice), 5e18);
-	}
-
-	function test_redeemInKindWithSkips_forfeitsBrokenAsset() public {
-		Comptroller comptroller = _createFund(0, 0);
-		_depositFor(comptroller, alice, 1000e6);
-
-		// Fund also holds a second asset (imagine its transfers are frozen)
-		MockERC20 frozen = new MockERC20('Frozen Wrapper', 'FRZx', 18);
+		MockERC20 frozen = new MockERC20('Second Asset', 'FRZx', 18);
 		MockAggregator frozenFeed = new MockAggregator(8, 10e8);
 		vm.prank(admin);
 		interpreter.addPrimitive(address(frozen), address(frozenFeed), 7 days);
@@ -295,22 +264,9 @@ contract FundFlowsTest is Test {
 		comptroller.addTrackedAsset(address(frozen));
 		frozen.mint(address(comptroller.vault()), 100e18);
 
-		skip(1 days);
-
-		// Redeem half, skipping the frozen asset: USDC pays out, frozen stays (forfeited)
-		address[] memory skips = new address[](1);
-		skips[0] = address(frozen);
-		vm.prank(alice);
-		comptroller.redeemSharesInKindWithSkips(500e18, skips);
-
-		assertEq(usdc.balanceOf(address(comptroller.vault())), 500e6);
-		assertEq(frozen.balanceOf(address(comptroller.vault())), 100e18); // untouched
-		assertEq(frozen.balanceOf(alice), 0);
-
-		// Holdings views
 		(address[] memory assets, uint256[] memory balances) = comptroller.getFundHoldings();
 		assertEq(assets.length, 2);
-		assertEq(balances[0], 500e6);
+		assertEq(balances[0], 1000e6);
 		assertEq(comptroller.calcAssetGav(address(frozen)), 1000e6); // 100 FRZx * $10
 	}
 
@@ -322,7 +278,7 @@ contract FundFlowsTest is Test {
 
 		vm.startPrank(alice);
 		vm.expectRevert(abi.encodeWithSelector(Comptroller.SharesActionTimelocked.selector, alice));
-		comptroller.redeemSharesForDenominationAsset(100e18);
+		comptroller.redeemShares(100e18);
 
 		vm.expectRevert(abi.encodeWithSelector(Comptroller.SharesActionTimelocked.selector, alice));
 		fundShares.transfer(bob, 100e18);

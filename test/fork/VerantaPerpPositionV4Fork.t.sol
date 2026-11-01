@@ -69,7 +69,7 @@ contract PairCostsReader {
 ///         live V2 config, as the founder's rollout step does. Veranta's operator doesn't run on a fork, so
 ///         market orders are filled here the way it fills them (an operator address, the real packet,
 ///         that tx's spread params and 1 wei Lazer fee).
-///         Run: BASE_MAINNET_RPC=<archive url> BASE_FORK_BLOCK=52014634 forge test --match-path test/fork/VerantaPerpPositionV4Fork.t.sol -vv
+///         Run: BASE_MAINNET_RPC=<archive url> forge test --match-path test/fork/VerantaPerpPositionV4Fork.t.sol -vv
 contract VerantaPerpPositionV4ForkTest is Test {
 	uint256 internal constant PINNED_BLOCK = 52014634;
 
@@ -103,9 +103,7 @@ contract VerantaPerpPositionV4ForkTest is Test {
 	function setUp() public {
 		string memory rpc = vm.envOr('BASE_MAINNET_RPC', string(''));
 		if (bytes(rpc).length == 0) return;
-		uint256 blockNumber = vm.envOr('BASE_FORK_BLOCK', uint256(0));
-		if (blockNumber > 0) vm.createSelectFork(rpc, blockNumber);
-		else vm.createSelectFork(rpc);
+		vm.createSelectFork(rpc, PINNED_BLOCK); // the block its real Lazer packet is from
 		forked = true;
 
 		string memory genesis = vm.readFile('deployments/base-mainnet.json');
@@ -119,7 +117,7 @@ contract VerantaPerpPositionV4ForkTest is Test {
 
 	/// spec §3.3: Veranta's cost rates are plain PairStorage getters and return the live ETH costs.
 	function test_fork_closeCostReadsWorkInAStaticCall() public {
-		vm.skip(!forked || block.number != PINNED_BLOCK);
+		vm.skip(!forked);
 		PairCostsReader reader = new PairCostsReader();
 		(uint256 makerP, uint256 takerP, uint256 spreadP) = reader.read(IVerantaPairCosts(PAIR_STORAGE), ETH_PAIR);
 		assertEq(makerP, 1e8, 'ETH close maker fee 0.01%');
@@ -133,7 +131,7 @@ contract VerantaPerpPositionV4ForkTest is Test {
 	/// payout: this close got the maker rate (0.01%), so by (taker − maker) × 997.86 ≈ 0.349 plus the
 	/// referral's 5% fee discount that valuation leaves out (≈ 0.005).
 	function test_fork_navAfterCloseCostsVsRealClosePayout() public {
-		vm.skip(!forked || block.number != PINNED_BLOCK);
+		vm.skip(!forked);
 		(Comptroller fund, address p) = _fundWithFilledLong(200e6);
 		uint256 collateral = _collateral(p);
 		int256 value = _valueAt(p, ETH_PACKET_PRICE);
@@ -152,7 +150,7 @@ contract VerantaPerpPositionV4ForkTest is Test {
 
 	/// spec §4: the manager's AddMargin with Veranta's real signed packet and its 1 wei fee.
 	function test_fork_addMarginWithTheRealPacket() public {
-		vm.skip(!forked || block.number != PINNED_BLOCK);
+		vm.skip(!forked);
 		(Comptroller fund, address p) = _fundWithFilledLong(200e6);
 		uint256 collateral0 = _collateral(p);
 		vm.deal(p, 1);
@@ -174,7 +172,7 @@ contract VerantaPerpPositionV4ForkTest is Test {
 	/// Each mode is measured warm (after one warm-up call, so neither number carries the other's first
 	/// touches) and cooled (vm.cool on the account and Veranta's proxies, closer to a real transaction).
 	function test_fork_listModeGasVsFullWalk() public {
-		vm.skip(!forked || block.number != PINNED_BLOCK);
+		vm.skip(!forked);
 		(Comptroller fund, address p) = _fundWithFilledLong(200e6);
 		_act(fund, p, abi.encode(uint8(VerantaPerpPositionV4.Action.SetAutopilot), abi.encode(block.timestamp + 30 days)));
 		uint256 fullCooled = _cooledValuationGas(p);
@@ -198,7 +196,7 @@ contract VerantaPerpPositionV4ForkTest is Test {
 	/// spec §3.1: a trade the keeper opens through Veranta's delegation (the account never sees it) is
 	/// valued by the full walk, and RemoveAutopilot's sync lists it so list mode keeps valuing it.
 	function test_fork_keeperOpenCountedThenSynced() public {
-		vm.skip(!forked || block.number != PINNED_BLOCK);
+		vm.skip(!forked);
 		Comptroller fund = _fund('V4 keeper');
 		address p = _create(fund);
 		address[] memory assets = new address[](1);
@@ -248,7 +246,7 @@ contract VerantaPerpPositionV4ForkTest is Test {
 	/// escrow must still count, and RemoveAutopilot's sync must list ITS pair, or the fill drops out of
 	/// list-mode NAV.
 	function test_fork_keeperCoinExposureOpen_escrowCountedAndPairSynced() public {
-		vm.skip(!forked || block.number != PINNED_BLOCK);
+		vm.skip(!forked);
 		Comptroller fund = _fund('V4 coin open');
 		address p = _create(fund);
 		address[] memory assets = new address[](1);

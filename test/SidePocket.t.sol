@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
+import {V6Host} from './utils/V6Host.sol';
 import {Test} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
 import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
-import {Comptroller} from '../src/core/Comptroller.sol';
+import {ComptrollerV6 as Comptroller} from '../src/core/ComptrollerV6.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {UniswapV3SwapAdapter} from '../src/adapters/UniswapV3SwapAdapter.sol';
 import {IUniswapV3SwapRouter} from '../src/interfaces/external/IUniswapV3SwapRouter.sol';
@@ -36,7 +37,7 @@ contract SidePocketTest is Test {
 		interpreter.addZeroPricedAsset(address(moon)); // the side-pocket class
 		vm.stopPrank();
 
-		factory = new FundFactory(interpreter, new ComptrollerDeployer(), new SharesVaultDeployer());
+		factory = new FundFactory(interpreter, V6Host.deployer(), new SharesVaultDeployer());
 		router = new MockSwapRouter();
 		adapter = new UniswapV3SwapAdapter(IUniswapV3SwapRouter(address(router)));
 		factory.registerAdapter(address(adapter));
@@ -71,7 +72,7 @@ contract SidePocketTest is Test {
 	function _seed(Comptroller comptroller, uint256 assets) internal {
 		vm.startPrank(alice);
 		usdc.approve(address(comptroller), assets);
-		comptroller.requestDeposit(assets);
+		comptroller.requestDeposit(assets, type(uint256).max);
 		vm.stopPrank();
 		skip(30 minutes);
 		comptroller.executeDepositRequest(alice);
@@ -137,16 +138,17 @@ contract SidePocketTest is Test {
 		assertGt(degenFund.shares().balanceOf(manager), 0);
 	}
 
-	function test_inKindRedemption_paysOutTheMoonbag() public {
+	/// Fund v6 pays exits in USDC only: a zero-priced bag counts for nothing, so an exit takes its USDC share and the
+	/// bag stays with who remains.
+	function test_anExitPaysItsUsdcShare_andTheMoonbagStays() public {
 		router.setNextAmountOut(1_000_000e18);
 		vm.prank(manager);
 		degenFund.callOnIntegration(address(adapter), _swapData(500e6, 0, true));
 
-		// Alice redeems 10% in kind: gets her USDC slice AND her share of the bag itself
 		vm.prank(alice);
-		degenFund.redeemSharesInKind(1000e18);
+		degenFund.redeemShares(1000e18);
 
 		assertEq(usdc.balanceOf(alice), 950e6);
-		assertEq(moon.balanceOf(alice), 100_000e18);
+		assertEq(moon.balanceOf(alice), 0);
 	}
 }

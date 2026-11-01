@@ -5,6 +5,7 @@ import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {EnumerableSet} from '@openzeppelin/contracts/utils/structs/EnumerableSet.sol';
 import {Vault} from '../fund/Vault.sol';
 import {IIntegrationAdapter} from '../interfaces/IIntegrationAdapter.sol';
+import {AggregatorV3Interface} from '../interfaces/AggregatorV3Interface.sol';
 import {IExternalPosition} from '../interfaces/IExternalPosition.sol';
 import {BalanceRead} from './BalanceRead.sol';
 import {ComptrollerV3Lib} from './ComptrollerV3Lib.sol';
@@ -15,6 +16,8 @@ import {FundValuationV6} from './FundValuationV6.sol';
 ///         fund into USDC without the manager. Moved out of ComptrollerV6 for EIP-170 room; external functions run by
 ///         DELEGATECALL in the comptroller's context, as ComptrollerV3Lib's do.
 library ComptrollerV6Lib {
+	address private constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
+
 	using EnumerableSet for EnumerableSet.AddressSet;
 
 	uint256 internal constant BPS = 10_000;
@@ -37,7 +40,10 @@ library ComptrollerV6Lib {
 	);
 	event PositionLiquidated(address indexed position, uint256 actions, uint256 lossValue);
 
+	event AssetWrittenOff(address indexed asset, uint256 amount);
+
 	error NotASale();
+	error NotAtFloor(address asset);
 	error LiquidationLoss(uint256 lossValue, uint256 maxLossValue);
 	error CloseOfNothing();
 	error NotAPullBack(uint8 action);
@@ -46,8 +52,9 @@ library ComptrollerV6Lib {
 	///         losing at most MAX_LIQUIDATION_LOSS_BPS of what it sold at the oracle's price. Every adapter is single-hop,
 	///         so a long-tail (pool-priced) token may instead sell into a feed-priced asset (its pool's WETH or cbBTC
 	///         quote), which the next sale takes to the denomination, each hop under the cap. Amounts are vault balance
-	///         deltas, never the adapter's claims; what arrives is tracked. The manager's trading policies don't run:
-	///         this cap is the rule.
+	///         deltas, never the adapter's claims; what arrives is tracked, past the tracked-asset cap: a full set (20)
+	///         made every sale into a WETH or cbBTC quote revert, which locked a ghosted fund's overdue exit (red-team
+	///         EXITADAPTERS-01, 2026-10-27). The manager's trading policies don't run: this cap is the rule.
 	function liquidateTrade(
 		EnumerableSet.AddressSet storage trackedAssets,
 		ComptrollerV3Lib.Tracking memory tracking,
@@ -58,7 +65,7 @@ library ComptrollerV6Lib {
 	) external {
 		(address[] memory spendAssets, uint256[] memory spendBefore, address[] memory incoming, uint256[] memory received, uint256 soldValue) =
 			_sell(ctx, adapter, integrationData);
-		ComptrollerV3Lib.trackAsset(trackedAssets, tracking, incoming[0]);
+		ComptrollerV3Lib.trackAsset(trackedAssets, _uncapped(tracking), incoming[0]);
 		uint256[] memory spent = new uint256[](spendAssets.length);
 		for (uint256 i; i < spendAssets.length; ++i) {
 			uint256 left = IERC20(spendAssets[i]).balanceOf(ctx.vault);
@@ -145,12 +152,36 @@ library ComptrollerV6Lib {
 		emit PositionLiquidated(address(position), actions.length, lossValue);
 	}
 
+	/// @notice A token whose pool reads 1 wei leaves the vault for good (ComptrollerV6.writeOffAsset). A token whose transfer
+	///         reverts stays: governance can still zero-price it.
+	function writeOff(
+		EnumerableSet.AddressSet storage trackedAssets,
+		mapping(address => uint256) storage costBasis,
+		FundValuationV6.Context memory ctx,
+		address asset
+	) external {
+		address adapter = ctx.registrar.poolPricedAdapter(asset);
+		if (adapter == address(0)) revert NotAtFloor(asset);
+		(, int256 answer,,,) = AggregatorV3Interface(adapter).latestRoundData();
+		if (answer != 1) revert NotAtFloor(asset);
+		uint256 amount = IERC20(asset).balanceOf(ctx.vault);
+		trackedAssets.remove(asset);
+		costBasis[asset] = 0;
+		if (amount > 0) Vault(ctx.vault).withdraw(asset, BURN_ADDRESS, amount);
+		emit AssetWrittenOff(asset, amount);
+	}
+
 	/// @notice Before any action on a position (the manager's or a liquidation), track every token it holds, so whatever
 	///         it sends to the vault counts in GAV whether or not the caller lists it in `assetsToReceive` (review
 	///         2026-10-11: a return of an untracked token, unlisted, dropped it out of GAV, and the manager could settle
 	///         the queue at that lower NAV, then track it again). A position whose holdings can't be read now (a perp
 	///         account on a stale price) is skipped, so a cut in risk never waits on a price: a perp account returns
 	///         USDC, which is always tracked. A read that failed for want of gas reverts instead (BalanceRead's rule).
+	///         What a position reports is tracked past the tracked-asset cap, bounded by what positions hold: at a full
+	///         set (20), one more reported asset (a 1-wei donation to a limit-order position, a filled perp long's
+	///         marker) made every position action revert, the keeper's liquidations included, and locked a ghosted
+	///         fund's overdue exit. Skipping the asset instead would reopen the hidden-value hole above (red-team
+	///         POSITIONS-01, 2026-10-27).
 	function trackHeld(
 		EnumerableSet.AddressSet storage trackedAssets,
 		ComptrollerV3Lib.Tracking memory tracking,
@@ -158,12 +189,19 @@ library ComptrollerV6Lib {
 	) public {
 		uint256 gasBefore = gasleft();
 		try position.getManagedAssets() returns (address[] memory assets, uint256[] memory) {
+			ComptrollerV3Lib.Tracking memory uncapped = _uncapped(tracking);
 			for (uint256 i; i < assets.length; ++i) {
-				ComptrollerV3Lib.trackAsset(trackedAssets, tracking, assets[i]);
+				ComptrollerV3Lib.trackAsset(trackedAssets, uncapped, assets[i]);
 			}
 		} catch {
 			if (gasleft() < gasBefore / 63) revert BalanceRead.CallStarved();
 		}
+	}
+
+	/// @dev The fund's tracking rules without the tracked-asset cap (a new struct: assigning the memory struct would
+	///      alias the caller's). The supported-asset and risky-asset rules still apply.
+	function _uncapped(ComptrollerV3Lib.Tracking memory tracking) private pure returns (ComptrollerV3Lib.Tracking memory) {
+		return ComptrollerV3Lib.Tracking(tracking.valueInterpreter, tracking.allowRiskyAssets, type(uint256).max);
 	}
 
 	/// @dev Whether the batch must be priced (an LP pull-back); a perp close of 0 reverts, and so does any action that

@@ -24,6 +24,13 @@ contract DeployClmFundsForkTest is ClmFixture {
 		deployer = vm.parseJsonAddress(vm.readFile('deployments/base-mainnet.json'), '.deployer');
 	}
 
+	/// @dev ClmFundsDeploy.list as the deployer, as one external call (so expectRevert sees the listing's revert).
+	function listAsDeployer(ClmVaultPriceFeed feed, address[] calldata vaults) external {
+		vm.startPrank(deployer);
+		ClmFundsDeploy.list(feed, vaults);
+		vm.stopPrank();
+	}
+
 	function test_deployAndList() public {
 		vm.skip(!ready);
 		(address strategyFactory, address poolDeployer) = _deployClm(makeAddr('keeper'), address(new MockClmVi()));
@@ -35,12 +42,13 @@ contract DeployClmFundsForkTest is ClmFixture {
 		address[] memory vaults = new address[](1);
 		vaults[0] = vault;
 		ClmFundsDeploy.list(feed, vaults);
-		// Final review I1: WETH/cbLTC holds a pool-priced token (cbLTC), so the VI refuses to list it.
+		vm.stopPrank();
+		// Final review I1: WETH/cbLTC holds a pool-priced token (cbLTC), so the VI refuses to list it. One external
+		// call: list() reads registrar V2's owner first, which a bare expectRevert would take as its call (2026-11-01).
 		address[] memory longTail = new address[](1);
 		longTail[0] = s1Vault;
 		vm.expectRevert(abi.encodeWithSelector(ValueInterpreter.FeedDoesNotSupportAsset.selector, s1Vault));
-		ClmFundsDeploy.list(feed, longTail);
-		vm.stopPrank();
+		this.listAsDeployer(feed, longTail);
 
 		assertEq(feed.strategyFactory(), strategyFactory);
 		assertEq(address(feed.valueInterpreter()), ClmFundsDeploy.VALUE_INTERPRETER);

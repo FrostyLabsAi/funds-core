@@ -6,6 +6,7 @@ import {Ownable} from '@openzeppelin/contracts/access/Ownable.sol';
 import {Ownable2Step} from '@openzeppelin/contracts/access/Ownable2Step.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {PoolPriceRegistrar} from '../src/pricing/PoolPriceRegistrar.sol';
+import {PoolPriceRegistrarWindowed} from '../src/pricing/PoolPriceRegistrarWindowed.sol';
 import {PoolPriceRegistrarV2} from '../src/pricing/PoolPriceRegistrarV2.sol';
 import {PoolPriceRegistrarV3} from '../src/pricing/PoolPriceRegistrarV3.sol';
 import {V4PriceSampler} from '../src/pricing/V4PriceSampler.sol';
@@ -50,8 +51,8 @@ contract PoolPriceRegistrarV3Test is Test {
 		address[] memory quotes = new address[](2);
 		quotes[0] = address(usdc);
 		quotes[1] = address(weth);
-		old = new PoolPriceRegistrar(
-			PoolPriceRegistrar.Wiring({
+		old = PoolPriceRegistrar(address(new PoolPriceRegistrarWindowed(
+			PoolPriceRegistrarWindowed.Wiring({
 				valueInterpreter: vi,
 				uniswapV3Factory: address(uniswap),
 				slipstreamFactories: [address(slipstreams[0]), address(slipstreams[1]), address(slipstreams[2])],
@@ -59,7 +60,7 @@ contract PoolPriceRegistrarV3Test is Test {
 				quotes: quotes
 			}),
 			admin
-		);
+		)));
 		vm.startPrank(admin);
 		vi.transferOwnership(address(old));
 		old.execute(abi.encodeCall(Ownable2Step.acceptOwnership, ()));
@@ -124,7 +125,8 @@ contract PoolPriceRegistrarV3Test is Test {
 
 	function test_refusesUnderMinLiquidity() public {
 		ScriptedCLPool pool = _aeroPool(tkn, usdc, 20_000e6); // $20k of USDC
-		vm.expectRevert(abi.encodeWithSelector(PoolPriceRegistrarV3.NotEnoughLiquidity.selector, 20_000e18));
+		// 20,000 less the five slices' rounding of the harmonic mean
+		vm.expectRevert(abi.encodeWithSelector(PoolPriceRegistrarV3.NotEnoughLiquidity.selector, 19_999_999_999_000_000_000_000));
 		v3.register(address(tkn), address(pool));
 	}
 

@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
+import {V6Host} from './utils/V6Host.sol';
 import {Test} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
 import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
-import {Comptroller} from '../src/core/Comptroller.sol';
+import {ComptrollerV6 as Comptroller} from '../src/core/ComptrollerV6.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {Shares} from '../src/fund/Shares.sol';
 import {IPolicy} from '../src/interfaces/IPolicy.sol';
@@ -37,7 +38,7 @@ contract PoliciesTest is Test {
 		vm.prank(admin);
 		interpreter.addPrimitive(address(usdc), address(usdcFeed), 7 days);
 
-		factory = new FundFactory(interpreter, new ComptrollerDeployer(), new SharesVaultDeployer());
+		factory = new FundFactory(interpreter, V6Host.deployer(), new SharesVaultDeployer());
 		usdc.mint(alice, 100_000e6);
 		usdc.mint(carol, 100_000e6);
 	}
@@ -77,14 +78,14 @@ contract PoliciesTest is Test {
 		// Alice (whitelisted) can request
 		vm.startPrank(alice);
 		usdc.approve(address(comptroller), 1000e6);
-		comptroller.requestDeposit(1000e6);
+		comptroller.requestDeposit(1000e6, type(uint256).max);
 		vm.stopPrank();
 
 		// Carol (not whitelisted) cannot
 		vm.startPrank(carol);
 		usdc.approve(address(comptroller), 1000e6);
 		vm.expectRevert(abi.encodeWithSelector(AllowedDepositorsPolicy.DepositorNotAllowed.selector, carol));
-		comptroller.requestDeposit(1000e6);
+		comptroller.requestDeposit(1000e6, type(uint256).max);
 		vm.stopPrank();
 
 		// Membership maintenance stays with the manager (the POLICY SET is frozen,
@@ -95,7 +96,7 @@ contract PoliciesTest is Test {
 		policy.addDepositors(newDepositors);
 
 		vm.prank(carol);
-		comptroller.requestDeposit(1000e6);
+		comptroller.requestDeposit(1000e6, type(uint256).max);
 	}
 
 	function test_minMaxDepositPolicy_boundsSize() public {
@@ -106,12 +107,12 @@ contract PoliciesTest is Test {
 		usdc.approve(address(comptroller), 100_000e6);
 
 		vm.expectRevert(abi.encodeWithSelector(MinMaxDepositPolicy.DepositOutOfBounds.selector, 50e6));
-		comptroller.requestDeposit(50e6);
+		comptroller.requestDeposit(50e6, type(uint256).max);
 
 		vm.expectRevert(abi.encodeWithSelector(MinMaxDepositPolicy.DepositOutOfBounds.selector, 20_000e6));
-		comptroller.requestDeposit(20_000e6);
+		comptroller.requestDeposit(20_000e6, type(uint256).max);
 
-		comptroller.requestDeposit(5000e6);
+		comptroller.requestDeposit(5000e6, type(uint256).max);
 		vm.stopPrank();
 	}
 
@@ -170,7 +171,7 @@ contract PoliciesTest is Test {
 		// Alice deposits (mint is untouched by the transfer gate)
 		vm.startPrank(alice);
 		usdc.approve(address(comptroller), 1000e6);
-		comptroller.requestDeposit(1000e6);
+		comptroller.requestDeposit(1000e6, type(uint256).max);
 		vm.stopPrank();
 		skip(30 minutes);
 		comptroller.executeDepositRequest(alice);
@@ -196,7 +197,7 @@ contract PoliciesTest is Test {
 
 		// Redemption (burn) is never gated
 		vm.prank(alice);
-		comptroller.redeemSharesForDenominationAsset(100e18);
+		comptroller.redeemShares(100e18);
 	}
 
 	function test_unrestrictedMandate_isNoOp() public {

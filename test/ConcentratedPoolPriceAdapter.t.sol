@@ -6,14 +6,14 @@ import {Clones} from '@openzeppelin/contracts/proxy/Clones.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {IValueInterpreter} from '../src/interfaces/IValueInterpreter.sol';
 import {IPoolPriceAdapter} from '../src/interfaces/IPoolPriceAdapter.sol';
-import {ConcentratedPoolPriceAdapter} from '../src/pricing/ConcentratedPoolPriceAdapter.sol';
 import {PoolPriceAdapterBase} from '../src/pricing/PoolPriceAdapterBase.sol';
 import {MockERC20, MockAggregator} from './utils/Mocks.sol';
 import {ScriptedCLPool} from './utils/PoolPriceMocks.sol';
 
-contract ConcentratedPoolPriceAdapterTest is Test {
+/// @notice What every ConcentratedPoolPriceAdapter version must do; the concrete suite is on the version the registrars clone (V2).
+abstract contract ConcentratedPoolPriceAdapterTest is Test {
 	ValueInterpreter internal vi;
-	ConcentratedPoolPriceAdapter internal impl;
+	address internal impl;
 	MockERC20 internal usdc;
 	MockERC20 internal weth;
 	MockAggregator internal wethFeed;
@@ -29,8 +29,11 @@ contract ConcentratedPoolPriceAdapterTest is Test {
 		vi.addPrimitive(address(usdc), address(new MockAggregator(8, 1e8)), 25 hours);
 		vi.addPrimitive(address(weth), address(wethFeed), 1 hours);
 		vm.stopPrank();
-		impl = new ConcentratedPoolPriceAdapter();
+		impl = _implementation();
 	}
+
+	/// @dev The implementation every clone in this suite runs.
+	function _implementation() internal virtual returns (address);
 
 	// ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -190,7 +193,7 @@ contract ConcentratedPoolPriceAdapterTest is Test {
 		assertApproxEqRel(_adapter(pool, tkn).liquidityUsd(), 1_000_000e18, 1e14);
 	}
 
-	function test_meanTickRoundsTowardNegativeInfinity() public {
+	function test_meanTickRoundsTowardNegativeInfinity() public virtual {
 		MockERC20 tkn = new MockERC20('Token', 'TKN', 6);
 		ScriptedCLPool pool = _pool(tkn, usdc);
 		usdc.mint(address(pool), 1_000_000e6);
@@ -210,15 +213,6 @@ contract ConcentratedPoolPriceAdapterTest is Test {
 		pool.setOracle(0, 1_000e18);
 
 		assertEq(_adapter(pool, tkn).liquidityUsd(), 20_000e18);
-	}
-
-	function test_pricesNearZeroWhenThePoolWasDrained() public {
-		MockERC20 tkn = new MockERC20('Token', 'TKN', 6);
-		ScriptedCLPool pool = _pool(tkn, usdc);
-		usdc.mint(address(pool), 4_999e6); // under the $5,000 valuation minimum
-		pool.setOracle(0, PLENTY);
-
-		assertEq(_answer(_adapter(pool, tkn)), 1);
 	}
 
 	function test_pricesNearZeroWhenLiquidityLeftDuringTheWindow() public {

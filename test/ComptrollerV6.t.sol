@@ -3,14 +3,14 @@ pragma solidity 0.8.24;
 
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {ComptrollerBlueprintDeployer} from '../src/core/FundComponentDeployers.sol';
-import {ComptrollerV3} from '../src/core/ComptrollerV3.sol';
 import {ComptrollerV6} from '../src/core/ComptrollerV6.sol';
+import {ComptrollerV3Lib} from '../src/core/ComptrollerV3Lib.sol';
 import {ComptrollerV6Lib} from '../src/core/ComptrollerV6Lib.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {Shares} from '../src/fund/Shares.sol';
 import {IExternalPosition} from '../src/interfaces/IExternalPosition.sol';
 import {IExternalPositionTypeFactory} from '../src/interfaces/IExternalPositionTypeFactory.sol';
-import {ComptrollerV3Test} from './ComptrollerV3.t.sol';
+import {ComptrollerV6Base} from './ComptrollerV6Base.sol';
 import {MockERC20, MockAggregator} from './utils/Mocks.sol';
 import {MockUnwindPosition} from './utils/MockUnwindPosition.sol';
 import {LimitOrderPosition, LimitOrderPositionFactory} from '../src/positions/LimitOrderPosition.sol';
@@ -139,7 +139,7 @@ contract MockLossyPositionFactory is IExternalPositionTypeFactory {
 /// @notice Fund version 6 = version 3 with a USDC-only exit (founder 2026-10-11, PLAN_CASH_ONLY_EXIT_2026-10-11.md).
 ///         The whole V3 suite runs here against V6; the tests whose behavior V6 changes are overridden below, then
 ///         V6's own: the instant exit, unreadable balances, the overdue USDC lock, the perp close of 0, liquidation.
-contract ComptrollerV6Test is ComptrollerV3Test {
+contract ComptrollerV6Test is ComptrollerV6Base {
 	uint256 internal constant PERP_TYPE = 98;
 	uint256 internal constant LOSSY_TYPE = 97;
 	uint256 internal constant LIMIT_TYPE = 95;
@@ -163,18 +163,18 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 
 	// ─── helpers ─────────────────────────────────────────────────────────────────
 
-	function _v6(ComptrollerV3 fund) internal pure returns (ComptrollerV6) {
+	function _v6(ComptrollerV6 fund) internal pure returns (ComptrollerV6) {
 		return ComptrollerV6(address(fund));
 	}
 
-	function _escrow(ComptrollerV3 fund, address who, uint256 shares) internal {
+	function _escrow(ComptrollerV6 fund, address who, uint256 shares) internal {
 		Shares fundShares = fund.shares();
 		vm.prank(who);
 		fundShares.transfer(address(queue), shares);
 	}
 
 	/// @dev The keeper's sale of `amountIn` of `tokenIn` into USDC, filled at `usdcOut`.
-	function _liquidate(ComptrollerV3 fund, MockERC20 tokenIn, uint256 amountIn, uint256 usdcOut) internal {
+	function _liquidate(ComptrollerV6 fund, MockERC20 tokenIn, uint256 amountIn, uint256 usdcOut) internal {
 		router.setNextAmountOut(usdcOut);
 		queueV6.liquidateTrade(
 			_v6(fund), address(uniAdapter), abi.encode(address(tokenIn), address(usdc), uint24(3000), amountIn, uint256(0))
@@ -197,7 +197,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 		);
 	}
 
-	function _lossyPosition(ComptrollerV3 fund, uint256 usdcIn, uint256 wethIn) internal returns (MockLossyPosition position) {
+	function _lossyPosition(ComptrollerV6 fund, uint256 usdcIn, uint256 wethIn) internal returns (MockLossyPosition position) {
 		vm.startPrank(manager);
 		position = MockLossyPosition(fund.createExternalPosition(LOSSY_TYPE, ''));
 		(address[] memory assets, uint256[] memory amounts) = _usdc(usdcIn);
@@ -210,7 +210,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 
 	/// V6 pays no token in kind: holding a long-tail token sends the exit through the queue; sold, it exits at once.
 	function test_v6_aLongTailHoldingSendsTheExitToTheQueueUntilSold() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		_swap(fund, usdc, tkn, 2_000e6, 2_000e6); // 8,000 USDC + 2,000 TKN ($1)
 		uint256 half = _sharesOf(fund, alice) / 2;
 		vm.prank(alice);
@@ -226,8 +226,8 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 	}
 
 	/// D1: the redeemer picks this moment, so a pool price never sets it, pumped or not.
-	function test_aPumpedLongTailPriceAddsNoCashToARedemption() public override {
-		ComptrollerV3 fund = _fund(0);
+	function test_aPumpedLongTailPriceAddsNoCashToARedemption() public {
+		ComptrollerV6 fund = _fund(0);
 		_swap(fund, usdc, tkn, 2_000e6, 2_000e6);
 		_setTknPriceTick(23028); // TKN's pool pumped to $10 for the whole window
 		uint256 shares = _sharesOf(fund, alice) / 4;
@@ -239,7 +239,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 
 	/// A price that can't be read now sends the exit through the queue; once it reads, the exit pays it in USDC.
 	function test_v6_anUnreadablePriceSendsTheExitToTheQueueUntilItReads() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		_swap(fund, usdc, weth, 2_000e6, 1e18); // 8,000 USDC + 1 WETH
 		skip(2 hours); // WETH's 1-hour feed is now stale; USDC's 25-hour one is not
 		uint256 half = _sharesOf(fund, alice) / 2;
@@ -256,7 +256,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 
 	/// Exits never pay a token, so a long-tail cost basis moves only with trades.
 	function test_v6_costBasisFollowsBuysAndSalesOnly() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		_swap(fund, usdc, tkn, 2_000e6, 2_000e6);
 		assertEq(fund.costBasis(address(tkn)), 2_000e6);
 		_swap(fund, tkn, usdc, 500e6, 500e6); // a quarter sold
@@ -270,7 +270,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 
 	/// V6 has no in-kind exit (founder 2026-10-11: an investor leaves with USDC).
 	function test_v6_thereIsNoInKindExit() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		_swap(fund, usdc, tkn, 2_000e6, 2_000e6);
 		uint256 shares = _sharesOf(fund, alice) / 2;
 		vm.startPrank(alice);
@@ -286,7 +286,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 	}
 
 	function test_v6_thereIsNoInKindExitWithPositionsHeld() public {
-		(ComptrollerV3 fund,) = _fundWithUnwindPosition();
+		(ComptrollerV6 fund,) = _fundWithUnwindPosition();
 		vm.prank(alice);
 		(bool ok,) = address(fund).call(abi.encodeWithSignature('redeemSharesInKind(uint256)', uint256(1e18)));
 		assertFalse(ok, 'no in-kind exit');
@@ -295,7 +295,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 	/// A price that can't be read sends the exit to the queue, whose settlement waits for it (the valuation is
 	/// incomplete) and charges no performance fee meanwhile; once it reads, the fee settles.
 	function test_v6_anUnreadablePriceQueuesTheExitAndDefersTheFee() public {
-		ComptrollerV3 fund = _fund(2_000);
+		ComptrollerV6 fund = _fund(2_000);
 		_swap(fund, usdc, weth, 2_000e6, 1e18);
 		wethFeed.setAnswer(3000e8); // +$1,000
 		skip(2 hours); // WETH's feed is now stale
@@ -313,14 +313,14 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 		assertGt(_sharesOf(fund, manager), 0, 'and settles once it reads');
 	}
 
-	function test_payOutRedemption_onlyTheQueue() public override {
+	function test_payOutRedemption_onlyTheQueue() public {
 		ComptrollerV6 fund = _v6(_fund(0));
 		vm.expectRevert(ComptrollerV6.OnlyRedemptionQueue.selector);
 		fund.payOutRedemption(alice, 1, 1);
 	}
 
-	function test_payOutRedemption_burnsTheEscrowAndPaysTheAmounts() public override {
-		ComptrollerV3 fund = _fund(0);
+	function test_payOutRedemption_burnsTheEscrowAndPaysTheAmounts() public {
+		ComptrollerV6 fund = _fund(0);
 		uint256 half = _sharesOf(fund, alice) / 2;
 		_escrow(fund, alice, half);
 		uint256 supply = fund.shares().totalSupply();
@@ -333,7 +333,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 
 	/// A payout is USDC only: the long-tail tokens and their cost basis stay.
 	function test_v6_payOutRedemption_paysUsdcAndLeavesTheLongTailCostBasis() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		_swap(fund, usdc, tkn, 2_000e6, 2_000e6);
 		uint256 shares = _sharesOf(fund, alice) / 4;
 		_escrow(fund, alice, shares);
@@ -344,7 +344,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 	}
 
 	function test_v6_liquidatePosition_onlyTheQueue() public {
-		(ComptrollerV3 fund, MockUnwindPosition position) = _fundWithUnwindPosition();
+		(ComptrollerV6 fund, MockUnwindPosition position) = _fundWithUnwindPosition();
 		vm.expectRevert(ComptrollerV6.OnlyRedemptionQueue.selector);
 		_v6(fund).liquidatePosition(address(position), new address[](0), _one(abi.encode(uint8(1), abi.encode(uint256(1)))));
 	}
@@ -352,7 +352,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 	/// The keeper never opens risk (founder 2026-10-11): an action that is neither risk-reducing nor an LP pull-back
 	/// reverts, alone or after a valid close in the same batch.
 	function test_v6_liquidatePosition_refusesAnActionThatOpensRisk() public {
-		(ComptrollerV3 fund, MockUnwindPosition position) = _fundWithUnwindPosition();
+		(ComptrollerV6 fund, MockUnwindPosition position) = _fundWithUnwindPosition();
 		vm.expectRevert(abi.encodeWithSelector(ComptrollerV6Lib.NotAPullBack.selector, uint8(0)));
 		queueV6.liquidatePosition(_v6(fund), address(position), new address[](0), _one(abi.encode(uint8(0), abi.encode(uint256(1)))));
 
@@ -365,7 +365,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 
 	/// On a perp account the keeper may close, cancel and return USDC; never open a trade, set an autopilot or add margin.
 	function test_v6_liquidatePosition_refusesPerpOpensAutopilotAndMargin() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		vm.prank(manager);
 		MockPerpAccount account = MockPerpAccount(fund.createExternalPosition(PERP_TYPE, ''));
 		uint8[3] memory opening = [uint8(VerantaPerpPositionV4.Action.OpenTrade), uint8(VerantaPerpPositionV4.Action.SetAutopilot), uint8(VerantaPerpPositionV4.Action.AddMargin)];
@@ -377,7 +377,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 
 	/// An LP's pull-back (unstake, decrease, collect; every live LP answers isRiskReducing false for them) runs priced.
 	function test_v6_liquidatePosition_lpPullBacksRunPriced() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		MockLossyPosition position = _lossyPosition(fund, 1_000e6, 1e18);
 		bytes[] memory batch = new bytes[](3);
 		batch[0] = abi.encode(uint8(6), abi.encode(uint256(0))); // unstake
@@ -419,14 +419,14 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 	}
 
 	function test_v6_liquidatePosition_refusesAPositionTheFundDoesNotHold() public {
-		(ComptrollerV3 fund,) = _fundWithUnwindPosition();
+		(ComptrollerV6 fund,) = _fundWithUnwindPosition();
 		vm.expectRevert(abi.encodeWithSelector(ComptrollerV6.NotActiveExternalPosition.selector, address(0xbeef)));
 		queueV6.liquidatePosition(_v6(fund), address(0xbeef), new address[](0), _one(abi.encode(uint8(1), abi.encode(uint256(1)))));
 	}
 
 	/// A risk-reducing batch (close, then return to the vault) runs unpriced, so stale feeds never stop it.
 	function test_v6_liquidatePosition_closesAndReturnsTheUsdcToTheVault() public {
-		(ComptrollerV3 fund, MockUnwindPosition position) = _fundWithUnwindPosition();
+		(ComptrollerV6 fund, MockUnwindPosition position) = _fundWithUnwindPosition();
 		uint256 vaultBefore = _held(fund, usdc);
 		skip(26 hours); // every feed stale
 		bytes[] memory batch = new bytes[](2);
@@ -440,8 +440,8 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 	}
 
 	/// The queue's one valuation per settlement: the GAV it pays from, and whether every price read.
-	function test_settleFeesForRedemption_returnsTheSnapshotOfThatValuation() public override {
-		(ComptrollerV3 fund,) = _fundWithUnwindPosition(); // vault 6,000 USDC; position 4,000
+	function test_settleFeesForRedemption_returnsTheSnapshotOfThatValuation() public {
+		(ComptrollerV6 fund,) = _fundWithUnwindPosition(); // vault 6,000 USDC; position 4,000
 		(uint256 gav, bool complete) = queueV6.settleFeesV6(_v6(fund));
 		assertEq(gav, 10_000e6);
 		assertTrue(complete);
@@ -449,55 +449,11 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 
 	// ─── V3 tests that don't apply to V6 (their names say what V3 does; each points to V6's own test) ────
 
-	function test_redeemPaysCashForPricedHoldingsAndTheLongTailSliceInKind() public override {
-		vm.skip(true, 'V3 behavior; V6: test_v6_aLongTailHoldingSendsTheExitToTheQueueUntilSold');
-	}
-
-	function test_aTokenWhosePriceCannotBeReadIsPaidInKind() public override {
-		vm.skip(true, 'V3 behavior; V6: test_v6_anUnreadablePriceSendsTheExitToTheQueueUntilItReads');
-	}
-
-	function test_costBasisFollowsBuysSalesAndInKindPayouts() public override {
-		vm.skip(true, 'V3 behavior; V6: test_v6_costBasisFollowsBuysAndSalesOnly');
-	}
-
-	function test_inKindRedemptionTakesItsShareOfTheCostBasis() public override {
-		vm.skip(true, 'V3 behavior; V6: test_v6_thereIsNoInKindExit');
-	}
-
-	function test_inKindExit_staysOpenWithPositionsHeld() public override {
-		vm.skip(true, 'V3 behavior; V6: test_v6_thereIsNoInKindExitWithPositionsHeld');
-	}
-
-	function test_aPriceThatCannotBeReadSkipsThePerformanceFeeNotTheExit() public override {
-		vm.skip(true, 'V3 behavior; V6: test_v6_anUnreadablePriceQueuesTheExitAndDefersTheFee');
-	}
-
-	function test_payOutRedemption_aPaidLongTailSliceTakesItsCostBasis() public override {
-		vm.skip(true, 'V3 behavior; V6: test_v6_payOutRedemption_paysUsdcAndLeavesTheLongTailCostBasis');
-	}
-
-	function test_forwardUnwind_onlyTheQueue() public override {
-		vm.skip(true, 'V3 behavior; V6: test_v6_liquidatePosition_onlyTheQueue');
-	}
-
-	function test_forwardUnwind_refusesAnActionThatIsNotRiskReducing() public override {
-		vm.skip(true, 'V3 behavior; V6: test_v6_liquidatePosition_refusesAnActionThatOpensRisk');
-	}
-
-	function test_forwardUnwind_refusesAPositionTheFundDoesNotHold() public override {
-		vm.skip(true, 'V3 behavior; V6: test_v6_liquidatePosition_refusesAPositionTheFundDoesNotHold');
-	}
-
-	function test_forwardUnwind_closesAndReturnsTheUsdcToTheVault() public override {
-		vm.skip(true, 'V3 behavior; V6: test_v6_liquidatePosition_closesAndReturnsTheUsdcToTheVault');
-	}
-
 	// ─── V6: the instant exit ────────────────────────────────────────────────────
 
 	/// Short of USDC, the instant exit reverts and the shares stay: the queue is the way out.
 	function test_v6_theInstantExitNeedsTheUsdcInTheVault() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		_swap(fund, usdc, weth, 9_000e6, 4.5e18); // 1,000 USDC + 4.5 WETH ($9,000)
 		uint256 half = _sharesOf(fund, alice) / 2;
 		vm.prank(alice);
@@ -511,7 +467,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 	/// A token whose balance can't be read counts as $0 instead of stopping every exit and deposit, and counts again
 	/// once it reads. Leavers meanwhile aren't paid for it (the founder's accepted cost of D2).
 	function test_v6_aTokenWhoseBalanceCannotBeReadCountsAsZero_untilItReads() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		BrokenBalanceToken brk = _brokenToken();
 		_swap(fund, usdc, MockERC20(address(brk)), 1_000e6, 1e18); // 9,000 USDC + 1 BRK ($1,000)
 		assertEq(fund.calcGav(), 10_000e6);
@@ -533,7 +489,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 
 	/// While a redemption is overdue the manager may sell into USDC, never spend it, by trade or into a position.
 	function test_v6_whileOverdue_theManagerCantSpendTheVaultsUsdc() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		_swap(fund, usdc, weth, 2_000e6, 1e18);
 		queue.setOverdue(address(fund), true);
 
@@ -561,7 +517,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 	/// Veranta takes a CloseTrade of 0, never fills it, and refuses the trade's other closes while it pends: refused
 	/// from the manager and from a liquidation alike; a close of anything goes through.
 	function test_v6_aPerpCloseOfNothingIsRefused() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		vm.prank(manager);
 		MockPerpAccount account = MockPerpAccount(fund.createExternalPosition(PERP_TYPE, ''));
 
@@ -580,7 +536,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 
 	/// The check is for the fund's perp accounts only: another position's action 1 of 0 goes through.
 	function test_v6_aCloseShapedActionOnAnotherPositionIsNotRefused() public {
-		(ComptrollerV3 fund, MockUnwindPosition position) = _fundWithUnwindPosition();
+		(ComptrollerV6 fund, MockUnwindPosition position) = _fundWithUnwindPosition();
 		vm.prank(manager);
 		fund.callOnExternalPosition(
 			address(position), new address[](0), new uint256[](0), new address[](0),
@@ -592,13 +548,13 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 	// ─── V6: liquidation trades ──────────────────────────────────────────────────
 
 	function test_v6_liquidateTrade_onlyTheQueue() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		vm.expectRevert(ComptrollerV6.OnlyRedemptionQueue.selector);
 		_v6(fund).liquidateTrade(address(uniAdapter), '');
 	}
 
 	function test_v6_liquidateTrade_sellsIntoUsdc() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		_swap(fund, usdc, weth, 2_000e6, 1e18); // 8,000 USDC + 1 WETH ($2,000)
 		_liquidate(fund, weth, 1e18, 1_970e6); // 1.5% under the oracle
 		assertEq(_held(fund, weth), 0);
@@ -607,7 +563,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 
 	/// D5: the investors who stay absorb at most 3% of what a liquidation sells.
 	function test_v6_liquidateTrade_losesAtMostThreePercent() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		_swap(fund, usdc, weth, 2_000e6, 1e18);
 		router.setNextAmountOut(1_939e6);
 		vm.expectRevert(abi.encodeWithSelector(ComptrollerV6Lib.LiquidationLoss.selector, 61e6, 60e6));
@@ -617,7 +573,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 	}
 
 	function test_v6_liquidateTrade_onlySellsIntoTheDenomination() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		_swap(fund, usdc, weth, 2_000e6, 1e18);
 		vm.expectRevert(ComptrollerV6Lib.NotASale.selector);
 		queueV6.liquidateTrade(_v6(fund), address(uniAdapter), abi.encode(address(usdc), address(weth), uint24(3000), 1_000e6, uint256(0)));
@@ -628,7 +584,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 	/// Every adapter is single-hop: a long-tail token on a WETH pool sells into WETH (tracked), then WETH into USDC,
 	/// each hop under the cap. Only a long-tail token may stop at a feed-priced asset.
 	function test_v6_liquidateTrade_aLongTailTokenSellsThroughItsPoolsQuote() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		_swap(fund, usdc, tkn, 2_000e6, 2_000e6); // 2,000 TKN ($1, pool-priced); WETH not tracked
 		router.setNextAmountOut(0.99e18); // $1,980
 		queueV6.liquidateTrade(_v6(fund), address(uniAdapter), abi.encode(address(tkn), address(weth), uint24(3000), 2_000e6, uint256(0)));
@@ -647,7 +603,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 
 	/// The hop into the quote is capped too, at the quote's oracle value.
 	function test_v6_liquidateTrade_theHopIntoTheQuoteIsCapped() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		_swap(fund, usdc, tkn, 2_000e6, 2_000e6);
 		router.setNextAmountOut(0.96e18); // $1,920: 4% short
 		vm.expectRevert(abi.encodeWithSelector(ComptrollerV6Lib.LiquidationLoss.selector, 80e6, 60e6));
@@ -655,13 +611,13 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 	}
 
 	function test_v6_liquidateTrade_refusesAnUnregisteredAdapter() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		vm.expectRevert(abi.encodeWithSelector(ComptrollerV6.AdapterNotRegistered.selector, address(0xbeef)));
 		queueV6.liquidateTrade(_v6(fund), address(0xbeef), '');
 	}
 
 	function test_v6_liquidateTrade_aSoldLongTailTokenTakesItsCostBasis() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		_swap(fund, usdc, tkn, 2_000e6, 2_000e6);
 		_liquidate(fund, tkn, 500e6, 500e6);
 		assertEq(fund.costBasis(address(tkn)), 1_500e6);
@@ -669,7 +625,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 
 	/// A sale is checked against the oracle, so a token whose price can't be read now can't be sold until it reads.
 	function test_v6_liquidateTrade_needsThePriceOfWhatItSells() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		_swap(fund, usdc, weth, 2_000e6, 1e18);
 		skip(2 hours); // WETH's feed stale
 		router.setNextAmountOut(2_000e6);
@@ -681,7 +637,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 
 	/// A priced batch may lose at most 3% of the position's value.
 	function test_v6_liquidatePosition_aPricedBatchLosesAtMostThreePercent() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		MockLossyPosition position = _lossyPosition(fund, 1_000e6, 0);
 		vm.expectRevert(abi.encodeWithSelector(ComptrollerV6Lib.LiquidationLoss.selector, 31e6, 30e6));
 		queueV6.liquidatePosition(_v6(fund), address(position), new address[](0), _one(abi.encode(uint8(2), abi.encode(uint256(31e6)))));
@@ -691,7 +647,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 
 	/// What a priced batch sends to the vault counts as kept, and the tokens listed to receive are tracked.
 	function test_v6_liquidatePosition_tracksWhatReachesTheVault() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		MockLossyPosition position = _lossyPosition(fund, 1_000e6, 1e18);
 		address[] memory receive_ = new address[](1);
 		receive_[0] = address(weth);
@@ -704,7 +660,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 	// ─── V6: nothing a position returns drops out of GAV (review 2026-10-11) ────────
 
 	/// @dev The attack's setup: 1 WETH ($2,000) rests in a limit order, and the manager untracks WETH (the vault holds none).
-	function _wethInALimitOrder(ComptrollerV3 fund) internal returns (address order) {
+	function _wethInALimitOrder(ComptrollerV6 fund) internal returns (address order) {
 		_swap(fund, usdc, weth, 2_000e6, 1e18);
 		vm.startPrank(manager);
 		order = fund.createExternalPosition(LIMIT_TYPE, '');
@@ -720,7 +676,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 
 	/// A manager returning the WETH without listing it can't drop it out of GAV (and so can't settle the queue lower).
 	function test_v6_aManagersUnlistedReturnStillCountsInGav() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		address order = _wethInALimitOrder(fund);
 		uint256 gavBefore = fund.calcGav();
 		vm.startPrank(manager);
@@ -733,7 +689,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 
 	/// The same through a liquidation: the keeper's unlisted return still counts.
 	function test_v6_aKeepersUnlistedReturnStillCountsInGav() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		address order = _wethInALimitOrder(fund);
 		uint256 gavBefore = fund.calcGav();
 		bytes[] memory batch = new bytes[](2);
@@ -747,7 +703,7 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 	/// A position whose holdings can't be read now (a perp account on a stale price) still closes, for the manager and
 	/// the keeper: a cut in risk never waits on a price.
 	function test_v6_aPositionWhoseHoldingsCantBeReadStillCloses() public {
-		ComptrollerV3 fund = _fund(0);
+		ComptrollerV6 fund = _fund(0);
 		vm.prank(manager);
 		MockUnreadablePosition position = MockUnreadablePosition(fund.createExternalPosition(UNREADABLE_TYPE, ''));
 		position.setUnreadable(true);
@@ -755,5 +711,82 @@ contract ComptrollerV6Test is ComptrollerV3Test {
 		fund.callOnExternalPosition(address(position), new address[](0), new uint256[](0), new address[](0), abi.encode(uint8(1), ''));
 		queueV6.liquidatePosition(_v6(fund), address(position), new address[](0), _one(abi.encode(uint8(1), '')));
 		assertEq(position.closes(), 2);
+	}
+
+	// ─── V6: a full tracked set never blocks a liquidation (red-team POSITIONS-01 / EXITADAPTERS-01, 2026-10-27) ──
+
+	/// @dev Tracks fresh $1 primitives until the fund tracks MAX_TRACKED_ASSETS (20).
+	function _fillTrackedSet(ComptrollerV6 fund) internal {
+		while (fund.getTrackedAssets().length < _v6(fund).MAX_TRACKED_ASSETS()) {
+			MockERC20 t = new MockERC20('T', 'T', 18);
+			registrar.execute(
+				abi.encodeCall(ValueInterpreter.addPrimitive, (address(t), address(new MockAggregator(8, 1e8)), uint32(25 hours)))
+			);
+			vm.prank(manager);
+			fund.addTrackedAsset(address(t));
+		}
+	}
+
+	/// @dev 1,000 USDC resting in a limit order for WETH (untracked), the set full, and 1 wei of WETH donated to the
+	///      position (anyone can; a taker's fill does the same).
+	function _fullSetWithADonatedOrder(ComptrollerV6 fund) internal returns (address order) {
+		vm.startPrank(manager);
+		order = fund.createExternalPosition(LIMIT_TYPE, '');
+		(address[] memory assets, uint256[] memory amounts) = _usdc(1_000e6);
+		fund.callOnExternalPosition(order, assets, amounts, new address[](0),
+			abi.encode(uint8(0), abi.encode(address(usdc), address(weth), uint128(1_000e6), uint128(0.5e18), uint64(block.timestamp + 1 days))));
+		vm.stopPrank();
+		_fillTrackedSet(fund);
+		weth.mint(order, 1);
+	}
+
+	function _cancelAndReturn() internal view returns (bytes[] memory batch) {
+		batch = new bytes[](2);
+		batch[0] = abi.encode(uint8(1), abi.encode(uint256(1))); // CancelOrder(1)
+		batch[1] = abi.encode(uint8(2), abi.encode(address(usdc), uint256(1_000e6))); // ReturnToVault
+	}
+
+	/// What the manager tracks keeps the cap.
+	function test_v6_aFullTrackedSetRefusesTheManagersNextTrack() public {
+		ComptrollerV6 fund = _fund(0);
+		_fillTrackedSet(fund);
+		vm.prank(manager);
+		vm.expectRevert(ComptrollerV3Lib.TrackedAssetsLimitReached.selector);
+		fund.addTrackedAsset(address(weth));
+	}
+
+	/// The keeper cancels and returns the order at a full set: the donated WETH is tracked past the cap and counted.
+	function test_v6_aFullTrackedSetDoesNotBlockTheKeepersPullBack() public {
+		ComptrollerV6 fund = _fund(0);
+		address order = _fullSetWithADonatedOrder(fund);
+		uint256 vaultUsdc = _held(fund, usdc);
+		queueV6.liquidatePosition(_v6(fund), order, new address[](0), _cancelAndReturn());
+		assertEq(_held(fund, usdc), vaultUsdc + 1_000e6, 'the order came back to the vault');
+		address[] memory tracked = fund.getTrackedAssets();
+		assertEq(tracked.length, 21);
+		assertEq(tracked[20], address(weth), 'what the position holds is tracked');
+	}
+
+	/// The manager's own action on the position isn't blocked either.
+	function test_v6_aFullTrackedSetDoesNotBlockTheManagersPositionAction() public {
+		ComptrollerV6 fund = _fund(0);
+		address order = _fullSetWithADonatedOrder(fund);
+		vm.prank(manager);
+		fund.callOnExternalPosition(order, new address[](0), new uint256[](0), new address[](0), _cancelAndReturn()[0]);
+		assertEq(fund.getTrackedAssets().length, 21);
+		assertEq(LimitOrderPosition(order).committed(address(usdc)), 0, 'cancelled');
+	}
+
+	/// EXITADAPTERS-01: at a full set the keeper's sale of a long-tail token into its pool's WETH quote goes through
+	/// (WETH is tracked past the cap), and the next sale takes the WETH to USDC.
+	function test_v6_aFullTrackedSetStillTakesTheLongTailSaleIntoItsQuote() public {
+		ComptrollerV6 fund = _fund(0);
+		_swap(fund, usdc, tkn, 2_000e6, 2_000e6); // WETH not tracked
+		_fillTrackedSet(fund);
+		router.setNextAmountOut(0.99e18); // $1,980
+		queueV6.liquidateTrade(_v6(fund), address(uniAdapter), abi.encode(address(tkn), address(weth), uint24(3000), 2_000e6, uint256(0)));
+		assertEq(fund.getTrackedAssets().length, 21, 'WETH tracked past the cap');
+		_liquidate(fund, weth, 0.99e18, 1_970e6);
+		assertEq(_held(fund, usdc), 9_970e6);
 	}
 }

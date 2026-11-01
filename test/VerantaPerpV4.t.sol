@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
+import {V6Host} from './utils/V6Host.sol';
 import {Test} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
 import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
-import {Comptroller} from '../src/core/Comptroller.sol';
+import {ComptrollerV6 as Comptroller} from '../src/core/ComptrollerV6.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {VerantaPerpPositionV2Factory} from '../src/positions/VerantaPerpPositionV2.sol';
 import {VerantaPerpPositionV4, VerantaPerpPositionV4Factory} from '../src/positions/VerantaPerpPositionV4.sol';
@@ -64,7 +65,7 @@ contract VerantaPerpV4Test is Test {
 		positionFactory.setPairAsset(ETH_PAIR, address(teth));
 		v4Factory = new VerantaPerpPositionV4Factory(positionFactory);
 
-		factory = new FundFactory(interpreter, new ComptrollerDeployer(), new SharesVaultDeployer());
+		factory = new FundFactory(interpreter, V6Host.deployer(), new SharesVaultDeployer());
 		factory.registerPositionType(VERANTA_TYPE_ID, address(v4Factory));
 
 		comptroller = Comptroller(
@@ -87,7 +88,7 @@ contract VerantaPerpV4Test is Test {
 		usdc.mint(alice, 10_000e6);
 		vm.startPrank(alice);
 		usdc.approve(address(comptroller), 10_000e6);
-		comptroller.requestDeposit(10_000e6);
+		comptroller.requestDeposit(10_000e6, type(uint256).max);
 		vm.stopPrank();
 		skip(30 minutes);
 		comptroller.executeDepositRequest(alice);

@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
+import {V6Host} from './utils/V6Host.sol';
 import {Test} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
 import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
-import {Comptroller} from '../src/core/Comptroller.sol';
+import {ComptrollerV6 as Comptroller} from '../src/core/ComptrollerV6.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {Shares} from '../src/fund/Shares.sol';
 import {Vault} from '../src/fund/Vault.sol';
@@ -31,7 +32,7 @@ contract FundFactoryTest is Test {
 		vm.prank(admin);
 		interpreter.addPrimitive(address(usdc), address(usdcFeed), 1 days);
 
-		factory = new FundFactory(interpreter, new ComptrollerDeployer(), new SharesVaultDeployer());
+		factory = new FundFactory(interpreter, V6Host.deployer(), new SharesVaultDeployer());
 		usdc.mint(alice, 10_000e6);
 	}
 
@@ -179,8 +180,8 @@ contract FundFactoryTest is Test {
 		vm.startPrank(alice);
 		usdc.approve(address(comptroller), 10_000e6);
 		vm.expectRevert();
-		comptroller.requestDeposit(50e6); // below the 100 USDC policy minimum
-		comptroller.requestDeposit(1_000e6); // within mandate — accepted
+		comptroller.requestDeposit(50e6, type(uint256).max); // below the 100 USDC policy minimum
+		comptroller.requestDeposit(1_000e6, type(uint256).max); // within mandate — accepted
 		vm.stopPrank();
 	}
 
