@@ -37,6 +37,15 @@ using ListingModuleBook for ViAdmin global;
 library ListingModuleBook {
 	function admin(Vm vm, string memory genesisJson) internal view returns (ViAdmin memory) {
 		address owner = ValueInterpreter(vm.parseJsonAddress(genesisJson, '.valueInterpreter')).owner();
+		// today's chain (PRICING-POOL-01, 2026-11-01): the VI's owner is the windowed registrar, under the new V2, under the new
+		// V3. A fork pinned before it falls through to the books below.
+		string memory windowedFile = vm.envOr('WINDOWED_PRICING_FILE', string('deployments/base-mainnet-windowed-pricing.json'));
+		if (vm.exists(windowedFile)) {
+			string memory windowed = vm.readFile(windowedFile);
+			if (vm.parseJsonAddress(windowed, '.base') == owner) {
+				return ViAdmin(IValueInterpreterAdmin(owner), IRegistrarV2Passthrough(vm.parseJsonAddress(windowed, '.registrar')));
+			}
+		}
 		string memory poolFile = vm.envOr('POOL_PRICING_FILE', string('deployments/base-mainnet-pool-pricing.json'));
 		if (vm.exists(poolFile) && vm.parseJsonAddress(vm.readFile(poolFile), '.registrar') == owner) {
 			return ViAdmin(IValueInterpreterAdmin(owner), _registrarV2(vm, Ownable(owner).owner()));

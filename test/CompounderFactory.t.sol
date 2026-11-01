@@ -716,7 +716,7 @@ contract CompounderFactoryForkTest is Test {
 		if (bytes(rpc).length == 0) return;
 		uint256 blockNumber = vm.envOr('BASE_FORK_BLOCK', uint256(0));
 		if (blockNumber > 0) vm.createSelectFork(rpc, blockNumber);
-		else vm.createSelectFork(rpc);
+		else vm.createSelectFork(rpc, 53_390_931); // pinned: live state moves under a fork at the latest block (2026-11-01)
 		forked = true;
 
 		factory = new CompounderFactory(_mainnetVenues());
