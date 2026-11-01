@@ -137,9 +137,8 @@ contract V2SwapAdaptersForkTest is B20Mirror {
 	function setUp() public {
 		string memory rpc = vm.envOr('BASE_MAINNET_RPC', string(''));
 		if (bytes(rpc).length == 0) return;
-		uint256 blockNumber = vm.envOr('BASE_FORK_BLOCK', uint256(0));
-		if (blockNumber > 0) vm.createSelectFork(rpc, blockNumber);
-		else vm.createSelectFork(rpc);
+		// pinned before the fixed registrar chain (2026-11-01): this rehearsal lists its tokens through the old registrar
+		vm.createSelectFork(rpc, vm.envOr('BASE_FORK_BLOCK', uint256(53_380_000)));
 		forked = true;
 
 		string memory book = vm.readFile(string.concat(vm.projectRoot(), '/deployments/base-mainnet.json'));

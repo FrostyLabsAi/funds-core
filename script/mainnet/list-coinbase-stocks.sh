@@ -92,7 +92,9 @@ if [ -f "$DEPLOYMENTS" ]; then
 	echo "VI $VI"
 	OWNER=$(call "$VI" 'owner()(address)' | tr '[:upper:]' '[:lower:]')
 	ADMIN=""
-	for BOOK_KEY in "$POOL_PRICING:registrar" "$TWAP_V2:module"; do
+	# today's chain, PRICING-POOL-01 (2026-11-01): the VI's owner is the windowed registrar, under the new V2, under the new V3
+	WINDOWED=${WINDOWED_PRICING_FILE:-deployments/base-mainnet-windowed-pricing.json}
+	for BOOK_KEY in "$WINDOWED:base" "$POOL_PRICING:registrar" "$TWAP_V2:module"; do
 		BOOK=${BOOK_KEY%:*}
 		[ -f "$BOOK" ] || continue
 		NAMED=$(python3 -c "import json; print(json.load(open('$BOOK')).get('${BOOK_KEY##*:}', ''))" | tr '[:upper:]' '[:lower:]')
@@ -101,7 +103,9 @@ if [ -f "$DEPLOYMENTS" ]; then
 	[ -n "$ADMIN" ] || fail "the VI's owner $OWNER is neither the pool-pricing registrar nor the TWAP v2 module"
 	echo "$ADMIN owns the VI"
 	VIA_V2=""
-	if [ -f "$V4_BOOK" ]; then
+	if [ -f "$WINDOWED" ] && [ "$(python3 -c "import json; print(json.load(open('$WINDOWED')).get('base', ''))" | tr '[:upper:]' '[:lower:]')" = "$OWNER" ]; then
+		VIA_V2=$(python3 -c "import json; print(json.load(open('$WINDOWED'))['registrar'])" | tr '[:upper:]' '[:lower:]')
+	elif [ -f "$V4_BOOK" ]; then
 		REGISTRAR_V2=$(python3 -c "import json; print(json.load(open('$V4_BOOK')).get('registrar', ''))" | tr '[:upper:]' '[:lower:]')
 		ADMIN_OWNER=$(call "$ADMIN" 'owner()(address)' | tr '[:upper:]' '[:lower:]')
 		[ -n "$REGISTRAR_V2" ] && [ "$ADMIN_OWNER" = "$REGISTRAR_V2" ] && VIA_V2=$REGISTRAR_V2

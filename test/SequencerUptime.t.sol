@@ -226,7 +226,7 @@ contract SequencerUptimeForkTest is Test {
 	function test_fork_liveSequencerUp_pricesWeth() public {
 		string memory rpc = vm.envOr('BASE_MAINNET_RPC', string(''));
 		if (bytes(rpc).length == 0) return;
-		vm.createSelectFork(rpc);
+		vm.createSelectFork(rpc, 53_390_931); // pinned: live state moves under a fork at the latest block (2026-11-01)
 
 		ValueInterpreter interpreter = new ValueInterpreter(admin);
 		vm.startPrank(admin);

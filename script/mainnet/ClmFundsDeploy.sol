@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
+import {Ownable} from '@openzeppelin/contracts/access/Ownable.sol';
 import {FundFactory} from '../../src/core/FundFactory.sol';
 import {ValueInterpreter} from '../../src/core/ValueInterpreter.sol';
 import {PoolPriceRegistrar} from '../../src/pricing/PoolPriceRegistrar.sol';
@@ -16,15 +17,19 @@ import {ClmVaultPriceFeed} from '../../src/pricing/ClmVaultPriceFeed.sol';
 library ClmFundsDeploy {
 	address internal constant FUND_FACTORY = 0x42F213d7f6018BF293bF0ecB727C59A25b5029a3;
 	address internal constant VALUE_INTERPRETER = 0x3CDbaBE5Bf4E6cfE10A2A326E0ad31b2d16398D4;
-	/// @dev Owns today's registrar, which owns the VI (on chain, 2026-10-13).
-	address internal constant REGISTRAR_V2 = 0x60338a74c63EDeC7EC020cB9208DD234D9a2146F;
 	address internal constant SLIPSTREAM1_ROUTER = 0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5;
 	address internal constant SLIPSTREAM2_ROUTER = 0x698Cb2b6dd822994581fEa6eA4Fc755d1363A92F;
 	address internal constant SLIPSTREAM3_ROUTER = 0xcbBb8035cAc7D4B3Ca7aBb74cF7BdF900215Ce0D;
 
+	/// @notice The registrar V2 in force: it owns the VI's owner. Read from the chain, not a constant: the chain moved on
+	///         2026-11-01 (PRICING-POOL-01), and a fork pinned before that still gets the V2 of its block.
+	function registrarV2() internal view returns (address) {
+		return Ownable(Ownable(VALUE_INTERPRETER).owner()).owner();
+	}
+
 	/// @notice Deploys the feed (for `strategyFactory`'s vaults) and the adapter, and registers the adapter.
 	function deploy(address strategyFactory) internal returns (ClmVaultPriceFeed feed, ClmVaultAdapter adapter) {
-		feed = new ClmVaultPriceFeed(IValueInterpreter(VALUE_INTERPRETER), strategyFactory, REGISTRAR_V2);
+		feed = new ClmVaultPriceFeed(IValueInterpreter(VALUE_INTERPRETER), strategyFactory, registrarV2());
 		adapter = new ClmVaultAdapter(SLIPSTREAM1_ROUTER, SLIPSTREAM2_ROUTER, SLIPSTREAM3_ROUTER);
 		FundFactory(FUND_FACTORY).registerAdapter(address(adapter));
 	}
@@ -48,12 +53,13 @@ library ClmFundsDeploy {
 	///         (ClmVaultPriceFeed._oracleFed) asks registrar V2, which can't see it, and the vault share would carry a
 	///         long-tail token without the long-tail rules (final review 2026-10-08, I1; review 2026-10-25).
 	function list(ClmVaultPriceFeed feed, address[] memory vaults) internal {
-		address v2Owner = PoolPriceRegistrarV2(REGISTRAR_V2).owner();
+		address v2 = registrarV2();
+		address v2Owner = PoolPriceRegistrarV2(v2).owner();
 		// an EOA with an EIP-7702 delegation has code too, `0xef0100 || delegate` (23 bytes): the deployer has had
 		// MetaMask's, so this read it as registrar V3 before V3 existed (2026-11-01, four fork tests)
 		bytes memory ownerCode = v2Owner.code;
 		bool viaV3 = ownerCode.length > 0 && !(ownerCode.length == 23 && bytes3(ownerCode) == 0xef0100);
-		PoolPriceRegistrarV2 via = PoolPriceRegistrarV2(viaV3 ? v2Owner : REGISTRAR_V2);
+		PoolPriceRegistrarV2 via = PoolPriceRegistrarV2(viaV3 ? v2Owner : v2);
 		for (uint256 i; i < vaults.length; ++i) {
 			if (viaV3) _refuseLongTail(PoolPriceRegistrarV3(v2Owner), vaults[i]);
 			via.callOldRegistrar(

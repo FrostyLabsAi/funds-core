@@ -95,7 +95,7 @@ contract ClmKeeperWorld is Script {
 		queue.setKeeper(keeper, true);
 		factory.setComptrollerDeployer(
 			new ComptrollerBlueprintDeployer(
-				type(ComptrollerV6).creationCode, abi.encode(ClmFundsDeploy.REGISTRAR_V2, queue, perpConfig)
+				type(ComptrollerV6).creationCode, abi.encode(ClmFundsDeploy.registrarV2(), queue, perpConfig)
 			)
 		);
 	}

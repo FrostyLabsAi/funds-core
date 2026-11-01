@@ -56,13 +56,14 @@ json() { python3 -c "import json,sys; print(json.load(open('$1'))$2)"; }
 [ -f "$BOOK" ] || fail "no $BOOK — run DeployVerantaStocks first"
 STORE=$(json "$BOOK" "['store']")
 VI=$(json deployments/base-mainnet.json "['valueInterpreter']")
-REGISTRAR_V2=$(json deployments/base-mainnet-v4.json "['registrar']")
+WINDOWED=deployments/base-mainnet-windowed-pricing.json # today's chain, PRICING-POOL-01 (2026-11-01)
+REGISTRAR_V2=$(json "$WINDOWED" "['registrarV2']")
 OLD_REGISTRAR=$(call "$VI" 'owner()(address)')
 [ "$(call "$OLD_REGISTRAR" 'owner()(address)' | lower)" = "$(echo "$REGISTRAR_V2" | lower)" ] || fail "registrar V2 doesn't own the VI's owner"
 VIA=$REGISTRAR_V2
 V2_OWNER=$(call "$REGISTRAR_V2" 'owner()(address)' | lower)
 if [ "$V2_OWNER" != "$(echo "$DEPLOYER" | lower)" ]; then
-	AERO_BOOK=deployments/base-mainnet-aero-registrar.json
+	AERO_BOOK=$WINDOWED
 	[ -f "$AERO_BOOK" ] && [ "$V2_OWNER" = "$(json "$AERO_BOOK" "['registrar']" | lower)" ] \
 		|| fail "registrar V2 is owned by $V2_OWNER: neither the deployer nor the registrar V3 in $AERO_BOOK"
 	[ "$(call "$V2_OWNER" 'owner()(address)' | lower)" = "$(echo "$DEPLOYER" | lower)" ] || fail "the deployer doesn't own registrar V3"

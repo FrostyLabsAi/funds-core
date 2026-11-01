@@ -51,7 +51,7 @@ contract FundsMainnetGenesisForkTest is Test {
 	function setUp() public {
 		string memory rpc = vm.envOr('BASE_MAINNET_RPC', string(''));
 		if (bytes(rpc).length == 0) return;
-		vm.createSelectFork(rpc);
+		vm.createSelectFork(rpc, 53_390_931); // pinned: live state moves under a fork at the latest block (2026-11-01)
 		forked = true;
 
 		// FROST's genesis shape: Safe proposes/cancels, anyone executes, no admin
@@ -364,7 +364,7 @@ contract FundsMainnetGenesisNoFrostForkTest is Test {
 	function setUp() public {
 		string memory rpc = vm.envOr('BASE_MAINNET_RPC', string(''));
 		if (bytes(rpc).length == 0) return;
-		vm.createSelectFork(rpc);
+		vm.createSelectFork(rpc, 53_390_931); // pinned: live state moves under a fork at the latest block (2026-11-01)
 		forked = true;
 
 		// DeployFundsTimelock's shape: Safe proposes/cancels, anyone executes, no admin
