@@ -91,7 +91,10 @@ echo "$P4" | grep -qE 'hedged since .*protected high \$2500' || fail "pass 4: no
 step "price recovers to 2510 (above the protected high) — expect RELEASE"
 cast send --rpc-url "$RPC" --private-key "$KEY0" "$FEED" 'setAnswer(int256)' 251000000000 >/dev/null
 P5=$(run_protect); echo "$P5"
-echo "$P5" | grep -q 'RELEASED' || fail "pass 5: hedge not released"
+echo "$P5" | grep -q 'release order sent' || fail "pass 5: release not sent"
+echo "$P5" | grep -q 'RELEASED' && fail "pass 5: called released before the short was seen gone"
+P5B=$(run_protect); echo "$P5B" | grep -E "RELEASED"
+echo "$P5B" | grep -q 'RELEASED' || fail "pass 5b: release not confirmed"
 echo "✓ SCENARIO 1 PASS — hedge armed on the drawdown, held through the dip, released on recovery"
 
 step "═══ SCENARIO 2: TRAILING STOP — 5% trail on a 2x long"
@@ -114,9 +117,10 @@ echo "$P7" | grep -q 'trailing \$2800' || fail "pass 7: extreme did not ratchet 
 step "price falls to 2600 (−7.1% from 2800, through the 5% trail) — expect CLOSE"
 cast send --rpc-url "$RPC" --private-key "$KEY0" "$FEED" 'setAnswer(int256)' 260000000000 >/dev/null
 P8=$(run_protect); echo "$P8"
-echo "$P8" | grep -q 'STOPPED OUT' || fail "pass 8: trailing stop did not close"
+echo "$P8" | grep -q 'stop close order sent' || fail "pass 8: trailing stop did not send its close"
 
 P9=$(run_protect); echo "$P9" | grep -E "HEDGE|STOP|tracking" | head -2
+echo "$P9" | grep -q 'STOPPED OUT' || fail "pass 9: close not confirmed"
 echo "✓ SCENARIO 2 PASS — stop trailed the run-up and closed on the retrace"
 
 step "═══ SCENARIO 3: PARTIAL HEDGE — too little USDC, then the rest arrives"
@@ -143,8 +147,10 @@ P14=$(run_protect); echo "$P14" | grep -E "HEDGE pair" | head -1
 echo "$P14" | grep -q 'short 2.0000' || fail "pass 14: not whole"
 echo "$P14" | grep -q 'ADDED' && fail "pass 14: added past the holding"
 cast send --rpc-url "$RPC" --private-key "$KEY0" "$FEED" 'setAnswer(int256)' 251000000000 >/dev/null
-P15=$(run_protect); echo "$P15" | grep -E "RELEASED"
-[ "$(echo "$P15" | grep -c 'RELEASED')" = 2 ] || fail "pass 15: both shorts not released"
+P15=$(run_protect); echo "$P15" | grep -E "release order sent"
+[ "$(echo "$P15" | grep -c 'release order sent')" = 2 ] || fail "pass 15: both shorts not closed"
+P15B=$(run_protect); echo "$P15B" | grep -E "RELEASED"
+echo "$P15B" | grep -q 'RELEASED' || fail "pass 15b: release not confirmed"
 echo "✓ SCENARIO 3 PASS — partial hedge opened, reported, grown when USDC arrived, released whole"
 
 step "═══ SCENARIO 4: VERANTA CANCELS A STORED ORDER"
