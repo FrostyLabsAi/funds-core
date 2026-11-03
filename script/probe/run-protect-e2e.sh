@@ -9,6 +9,9 @@
 #   STOP (trailing stop):
 #     user opens a 2x LONG · price runs 2500→2800 (trail arms at the high)
 #     → price 2600 (−7.1% > 5%) → keeper MARKET-CLOSES the position
+#   PARTIAL: too little USDC → keeper hedges what it can and says so → USDC arrives → keeper adds
+#     the rest → recovery closes both shorts
+#   CANCELLED: the venue cancels a stored order → keeper alerts instead of counting it as a hedge
 set -uo pipefail
 
 CORE=/home/dude/FrostyFunds/funds-core
@@ -54,7 +57,7 @@ TUSDC=$(deploy 'test/utils/Mocks.sol:MockERC20' 'Test USDC' tUSDC 6);         [ 
 TETH=$(deploy 'test/utils/Mocks.sol:MockERC20' 'Test ETH' tETH 18);           [ -n "$TETH" ] || fail "tETH deploy"
 FEED=$(deploy 'test/utils/Mocks.sol:MockAggregator' 8 250000000000);          [ -n "$FEED" ] || fail "feed deploy"
 VENUE=$(deploy 'test/utils/MockVeranta.sol:MockVeranta' "$TUSDC");            [ -n "$VENUE" ] || fail "venue deploy"
-REGISTRY=$(deploy 'src/protect/ProtectRegistry.sol:ProtectRegistry');         [ -n "$REGISTRY" ] || fail "registry deploy"
+REGISTRY=$(deploy 'src/protect/ProtectRegistryV2.sol:ProtectRegistryV2');         [ -n "$REGISTRY" ] || fail "registry deploy"
 STATE_FILE=$(mktemp -u /tmp/protect-e2e-state-XXXX.json)
 step "venue $VENUE · registry $REGISTRY"
 
@@ -115,6 +118,51 @@ echo "$P8" | grep -q 'STOPPED OUT' || fail "pass 8: trailing stop did not close"
 
 P9=$(run_protect); echo "$P9" | grep -E "HEDGE|STOP|tracking" | head -2
 echo "✓ SCENARIO 2 PASS — stop trailed the run-up and closed on the retrace"
+
+step "═══ SCENARIO 3: PARTIAL HEDGE — too little USDC, then the rest arrives"
+cast send --rpc-url "$RPC" --private-key "$KEY0" "$FEED" 'setAnswer(int256)' 250000000000 >/dev/null
+IDLE=$(cast call --rpc-url "$RPC" "$TUSDC" 'balanceOf(address)(uint256)' "$USER" | awk '{print $1}')
+# leave $500: at 2x it pays for $1,000 of the 2 tETH (about $4,400 at the trigger)
+cast send --rpc-url "$RPC" --private-key "$KEY1" "$TUSDC" 'transfer(address,uint256)' "$KEEPER" $((IDLE - 500000000)) >/dev/null
+cast send --rpc-url "$RPC" --private-key "$KEY1" "$REGISTRY" \
+	'configure(uint8,uint256,address,uint16,uint16)' 0 0 "$TETH" 800 2 >/dev/null || fail "configure HEDGE"
+P10=$(run_protect); echo "$P10" | grep -E "HEDGE pair|tracking" | head -1
+cast send --rpc-url "$RPC" --private-key "$KEY0" "$FEED" 'setAnswer(int256)' 220000000000 >/dev/null
+P11=$(run_protect); echo "$P11" | grep -E "ALERT|PROTECTED"
+echo "$P11" | grep -q 'USDC only covers' || fail "pass 11: not partial"
+echo "$P11" | grep -q 'PROTECTED: short 0.4545' || fail "pass 11: partial size wrong"
+cast send --rpc-url "$RPC" --private-key "$KEY0" "$VENUE" 'fillPending(uint256)' 22000000000000 >/dev/null
+P12=$(run_protect); echo "$P12" | grep -E "ALERT" | head -1
+echo "$P12" | grep -q 'hedged 0.4545 of 2.0000' || fail "pass 12: partial not reported while waiting for USDC"
+echo "$P12" | grep -q 'ADDED' && fail "pass 12: added with no USDC"
+cast send --rpc-url "$RPC" --private-key "$KEY0" "$TUSDC" 'mint(address,uint256)' "$USER" 3000000000 >/dev/null
+P13=$(run_protect); echo "$P13" | grep -E "ADDED"
+echo "$P13" | grep -q 'ADDED to hedge: short 1.5455' || fail "pass 13: rest not added"
+cast send --rpc-url "$RPC" --private-key "$KEY0" "$VENUE" 'fillPending(uint256)' 22000000000000 >/dev/null
+P14=$(run_protect); echo "$P14" | grep -E "HEDGE pair" | head -1
+echo "$P14" | grep -q 'short 2.0000' || fail "pass 14: not whole"
+echo "$P14" | grep -q 'ADDED' && fail "pass 14: added past the holding"
+cast send --rpc-url "$RPC" --private-key "$KEY0" "$FEED" 'setAnswer(int256)' 251000000000 >/dev/null
+P15=$(run_protect); echo "$P15" | grep -E "RELEASED"
+[ "$(echo "$P15" | grep -c 'RELEASED')" = 2 ] || fail "pass 15: both shorts not released"
+echo "✓ SCENARIO 3 PASS — partial hedge opened, reported, grown when USDC arrived, released whole"
+
+step "═══ SCENARIO 4: VERANTA CANCELS A STORED ORDER"
+cast send --rpc-url "$RPC" --private-key "$KEY0" "$FEED" 'setAnswer(int256)' 250000000000 >/dev/null
+cast send --rpc-url "$RPC" --private-key "$KEY1" "$REGISTRY" \
+	'configure(uint8,uint256,address,uint16,uint16)' 0 0 "$TETH" 800 2 >/dev/null || fail "configure HEDGE"
+P16=$(run_protect); echo "$P16" | grep -E "HEDGE pair" | head -1
+cast send --rpc-url "$RPC" --private-key "$KEY0" "$FEED" 'setAnswer(int256)' 220000000000 >/dev/null
+P17=$(run_protect); echo "$P17" | grep -E "PROTECTED"
+echo "$P17" | grep -q 'PROTECTED' || fail "pass 17: hedge did not open"
+# getPendingOrder returns one static struct per order: offset, length, then the first order's id
+RAW=$(cast call --rpc-url "$RPC" "$VENUE" 'getPendingOrder(address)' "$USER")
+ORDER=$((16#${RAW:130:64}))
+cast send --rpc-url "$RPC" --private-key "$KEY0" "$VENUE" 'cancelPendingMarketOrder(uint256)' "$ORDER" >/dev/null || fail "cancel"
+P18=$(run_protect); echo "$P18" | grep -E "ALERT"
+echo "$P18" | grep -q 'Veranta cancelled the hedge order' || fail "pass 18: cancel not noticed"
+echo "$P18" | grep -q 'PROTECTED' && fail "pass 18: re-sent in the same pass as the cancel"
+echo "✓ SCENARIO 4 PASS — a cancelled order is noticed, not taken for a hedge"
 
 rm -f "$STATE_FILE"
 echo "✓✓✓ PROTECT E2E COMPLETE — both products lifecycle-proven against the demo venue"
