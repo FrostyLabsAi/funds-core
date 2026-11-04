@@ -10,7 +10,8 @@ import {IExternalPositionTypeFactory} from '../src/interfaces/IExternalPositionT
 import {LimitOrderPositionFactory} from '../src/positions/LimitOrderPosition.sol';
 import {VerantaPriceAdapterV2} from '../src/pricing/VerantaPriceAdapterV2.sol';
 import {VerantaPriceStoreV2} from '../src/pricing/VerantaPriceStoreV2.sol';
-import {MockStoreV2} from './B20VerantaPriceAdapter.t.sol';
+import {B20VerantaPriceAdapter} from '../src/pricing/B20VerantaPriceAdapter.sol';
+import {MockB20, MockStoreV2} from './B20VerantaPriceAdapter.t.sol';
 import {RedemptionQueueV2} from '../src/redemption/RedemptionQueueV2.sol';
 import {PoolPriceRegistrarWindowed} from '../src/pricing/PoolPriceRegistrarWindowed.sol';
 import {MockERC20, MockAggregator, MockERC4626Vault} from './utils/Mocks.sol';
@@ -470,6 +471,84 @@ contract ComptrollerV6MarketClosedTest is RedemptionFixtureV6 {
 		vm.prank(keeper);
 		vm.expectRevert(RedemptionQueueV2.PriceUnreadable.selector);
 		queue.settle(address(fund), 1);
+	}
+
+	// ─── a Veranta-priced stock follows the same rule (founder 2026-11-04) ───────────
+
+	/// @dev As live: a B20VerantaPriceAdapter on the V2 store with a 2-minute heartbeat. Half the fund in the stock at $100.
+	function _verantaStockFund() internal returns (ComptrollerV6 fund, MockStoreV2 prices) {
+		prices = new MockStoreV2();
+		MockB20 sharesPerToken = new MockB20();
+		sharesPerToken.setMultiplier(1e18);
+		MockERC20 veranta = new MockERC20('Micron', 'MUc', 18);
+		B20VerantaPriceAdapter feed =
+			new B20VerantaPriceAdapter(VerantaPriceStoreV2(address(prices)), 105, address(sharesPerToken), 2 minutes, 5 days, 'MUc');
+		registrar.execute(abi.encodeCall(ValueInterpreter.addPrimitive, (address(veranta), address(feed), uint32(2 minutes))));
+		fund = ComptrollerV6(factory.createFund(_config(0, 0, 0)));
+		_deposit(fund, alice, 10_000e6);
+		_deposit(fund, bob, 10_000e6);
+		_confirm(prices, block.timestamp);
+		_swap(fund, usdc, veranta, 10_000e6, 100e18);
+	}
+
+	/// @dev The weekend: Pyth still signs the price as current, and the stock last traded 5 hours ago.
+	function _closeVerantaMarket(MockStoreV2 prices) internal returns (uint256 lastTrade) {
+		lastTrade = block.timestamp;
+		skip(5 hours);
+		_refreshFeeds();
+		_confirm(prices, lastTrade);
+	}
+
+	function test_veranta_aClosedMarketSendsTheInstantExitToTheQueue() public {
+		(ComptrollerV6 fund, MockStoreV2 prices) = _verantaStockFund();
+		_closeVerantaMarket(prices);
+		uint256 shares = _sharesOf(fund, bob);
+		vm.prank(bob);
+		vm.expectRevert(ComptrollerV6.UseRedemptionQueue.selector);
+		fund.redeemShares(shares);
+	}
+
+	function test_veranta_theQueueWaitsForTheMarket_thenPays() public {
+		(ComptrollerV6 fund, MockStoreV2 prices) = _verantaStockFund();
+		uint256 lastTrade = _closeVerantaMarket(prices);
+		_request(fund, bob, _sharesOf(fund, bob));
+		_confirm(prices, lastTrade);
+		vm.prank(keeper);
+		vm.expectRevert(RedemptionQueueV2.PriceUnreadable.selector);
+		queue.settle(address(fund), 1);
+
+		_confirm(prices, block.timestamp); // the market reopens
+		vm.prank(keeper);
+		queue.settle(address(fund), 1);
+		assertApproxEqRel(usdc.balanceOf(bob), 10_000e6, 1e15);
+	}
+
+	function test_veranta_aClosedMarketNeverStopsADeposit() public {
+		(ComptrollerV6 fund, MockStoreV2 prices) = _verantaStockFund();
+		uint256 lastTrade = _closeVerantaMarket(prices);
+		_requestDeposit(fund, carol, 10_000e6);
+		_confirm(prices, lastTrade);
+		fund.executeDepositRequest(carol);
+		assertApproxEqRel(_worth(fund, carol), 10_000e6, 1e15);
+	}
+
+	/// Just inside the age a quiet stock pays at once; just past it, it waits. It's the same limit as a Chainlink stock's.
+	function test_veranta_theAgeLimitIsFourHours() public {
+		(ComptrollerV6 fund, MockStoreV2 prices) = _verantaStockFund();
+		uint256 lastTrade = block.timestamp;
+		uint256 shares = _sharesOf(fund, bob) / 10;
+		skip(4 hours);
+		_refreshFeeds();
+		_confirm(prices, lastTrade);
+		vm.prank(bob);
+		fund.redeemShares(shares);
+		assertApproxEqRel(usdc.balanceOf(bob), 1_000e6, 1e15);
+
+		skip(1);
+		_confirm(prices, lastTrade);
+		vm.prank(bob);
+		vm.expectRevert(ComptrollerV6.UseRedemptionQueue.selector);
+		fund.redeemShares(shares);
 	}
 
 	// ─── perps on markets that close (red-team PF-01; founder 2026-11-03) ──────────

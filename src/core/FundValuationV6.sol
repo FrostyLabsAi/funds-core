@@ -11,6 +11,7 @@ import {IFrostyClmStrategy} from '../interfaces/external/IFrostyClm.sol';
 import {IPoolPriceAdapter} from '../interfaces/IPoolPriceAdapter.sol';
 import {IPoolWatch} from '../interfaces/IPoolWatch.sol';
 import {PoolPriceRegistrar} from '../pricing/PoolPriceRegistrar.sol';
+import {B20VerantaPriceAdapter} from '../pricing/B20VerantaPriceAdapter.sol';
 import {BalanceRead} from './BalanceRead.sol';
 import {ValueInterpreter} from './ValueInterpreter.sol';
 
@@ -215,6 +216,13 @@ library FundValuationV6 {
 			if (ctx.registrar.poolPricedAdapter(asset) != address(0)) {
 				(closed, unsettled) = _priceFlags(ctx, IPoolPriceAdapter(aggregator).config().quoteAsset);
 				return (closed, unsettled || _poolUnsettled(aggregator));
+			}
+			// a Veranta-priced stock follows the same rule (founder 2026-11-04): Pyth keeps re-confirming a closed market's price, so
+			// its feed time is never old. Only this adapter family answers maxFeedAge(), and its store holds the last trade
+			(bool stored,) = aggregator.staticcall(abi.encodeWithSignature('maxFeedAge()'));
+			if (stored) {
+				B20VerantaPriceAdapter feed = B20VerantaPriceAdapter(aggregator);
+				return (block.timestamp > feed.store().feedUpdatedUs(feed.pairIndex()) / 1e6 + MAX_SESSION_PRICE_AGE, false);
 			}
 			if (heartbeat <= SESSION_HEARTBEAT) return (false, false);
 			(,,, uint256 updatedAt,) = AggregatorV3Interface(aggregator).latestRoundData();
