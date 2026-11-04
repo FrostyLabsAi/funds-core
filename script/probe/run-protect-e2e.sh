@@ -98,13 +98,14 @@ echo "$P5B" | grep -q 'RELEASED' || fail "pass 5b: release not confirmed"
 echo "✓ SCENARIO 1 PASS — hedge armed on the drawdown, held through the dip, released on recovery"
 
 step "═══ SCENARIO 2: TRAILING STOP — 5% trail on a 2x long"
-cast send --rpc-url "$RPC" --private-key "$KEY1" "$REGISTRY" \
-	'configure(uint8,uint256,address,uint16,uint16)' 1 0 0x0000000000000000000000000000000000000000 500 0 >/dev/null || fail "configure STOP"
 # user opens a 1,000 USDC 2x LONG at 2510 and the operator fills it
 cast send --rpc-url "$RPC" --private-key "$KEY1" "$VENUE" \
 	'openTrade((address,uint256,uint256,uint256,uint256,uint256,bool,uint256,uint256,uint256,uint256),uint8,uint256)' \
 	"(${USER},0,0,0,1000000000,25100000000000,true,20000000000,0,0,0)" 0 10000000000 >/dev/null || fail "user openTrade"
 cast send --rpc-url "$RPC" --private-key "$KEY0" "$VENUE" 'fillPending(uint256)' 25100000000000 >/dev/null
+# saved after the trade: a trailing stop covers the trades open when it's saved (founder 2026-11-03)
+cast send --rpc-url "$RPC" --private-key "$KEY1" "$REGISTRY" \
+	'configure(uint8,uint256,address,uint16,uint16)' 1 0 0x0000000000000000000000000000000000000000 500 0 >/dev/null || fail "configure STOP"
 
 P6=$(run_protect); echo "$P6"
 echo "$P6" | grep -q 'long trailing' || fail "pass 6: stop not tracking the long"

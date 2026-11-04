@@ -7,6 +7,8 @@ import {VerantaPerpPositionV2Factory} from '../../src/positions/VerantaPerpPosit
 import {PriceMarker} from '../../src/pricing/PriceMarker.sol';
 import {VerantaPriceStore} from '../../src/pricing/VerantaPriceStore.sol';
 import {VerantaPriceAdapter} from '../../src/pricing/VerantaPriceAdapter.sol';
+import {VerantaPriceAdapterV2} from '../../src/pricing/VerantaPriceAdapterV2.sol';
+import {VerantaPriceStoreV2} from '../../src/pricing/VerantaPriceStoreV2.sol';
 import {ViAdmin} from './ListingModuleBook.sol';
 import {FundsMainnet} from './FundsMainnet.sol';
 
@@ -39,6 +41,17 @@ library VerantaListing {
 	IVerantaPairCatalog internal constant CATALOG = IVerantaPairCatalog(FundsMainnet.VERANTA_PAIR_STORAGE);
 	/// @notice How old a stored Veranta price may be when the VI reads it (the primitive's heartbeat).
 	uint32 internal constant PRICE_LIFETIME = 10 minutes;
+	/// @notice A closing market's last trade may be this old (VerantaPriceAdapterV2.maxFeedAge and the primitive's heartbeat):
+	///         the same 5 days as a Coinbase stock's Chainlink primitive, over FundValuationV6.SESSION_HEARTBEAT.
+	uint32 internal constant CLOSED_MARKET_LIFETIME = 5 days;
+
+	/// @notice One pair moved by moveClosingMarkets, for the address book and an undo.
+	struct MovedPair {
+		uint256 pairIndex;
+		address marker;
+		address oldAdapter;
+		address adapter;
+	}
 
 	function listAll(VerantaPriceStore store, ViAdmin memory admin, VerantaPerpPositionV2Factory factory)
 		internal
@@ -125,6 +138,42 @@ library VerantaListing {
 			admin.execute(abi.encodeCall(ValueInterpreter.addPrimitive, (marker, aggregator, lifetime)));
 			++updated;
 		}
+	}
+
+	/// @notice Perps on markets that close stay priced while closed (red-team PF-01; founder 2026-11-03): every pair of those
+	///         groups still on `storeV1` gets a VerantaPriceAdapterV2 on `storeV2`, registered on its SAME marker at
+	///         CLOSED_MARKET_LIFETIME. addPrimitive overwrites the entry in one call, so it is safe with open fund trades.
+	///         Crypto trades around the clock and stays where it is. A second run is a no-op.
+	function moveClosingMarkets(
+		VerantaPriceStore storeV1,
+		VerantaPriceStoreV2 storeV2,
+		ViAdmin memory admin,
+		VerantaPerpPositionV2Factory factory,
+		ValueInterpreter vi
+	) internal returns (MovedPair[] memory moved) {
+		uint256 count = CATALOG.pairsCount();
+		MovedPair[] memory rows = new MovedPair[](count);
+		uint256 n;
+		for (uint256 i; i < count; ++i) {
+			address marker = factory.pairAsset(i);
+			if (marker == address(0) || !_marketCloses(CATALOG.pairGroupIndex(i))) continue;
+			(address aggregator,,,) = vi.getAssetInfo(marker);
+			if (aggregator == address(0) || !_isStoreAdapter(aggregator, storeV1, i)) continue;
+			(string memory from, string memory to,) = CATALOG.pairData(i);
+			VerantaPriceAdapterV2 adapter = new VerantaPriceAdapterV2(
+				storeV2, i, PRICE_LIFETIME, CLOSED_MARKET_LIFETIME, string.concat(from, '/', to, ' (Veranta)')
+			);
+			admin.execute(abi.encodeCall(ValueInterpreter.addPrimitive, (marker, address(adapter), CLOSED_MARKET_LIFETIME)));
+			rows[n++] = MovedPair(i, marker, aggregator, address(adapter));
+		}
+		moved = new MovedPair[](n);
+		for (uint256 k; k < n; ++k) moved[k] = rows[k];
+	}
+
+	/// @dev Veranta's pair groups that close, read from PairStorage on Base 2026-11-03: 2 FX (EUR, GBP), 3 commodities (XAU,
+	///      XAG, WTI), 6 stocks and indices (US500, NVDA). 0, 1, 4 and 5 are crypto.
+	function _marketCloses(uint256 group) private pure returns (bool) {
+		return group == 2 || group == 3 || group == 6;
 	}
 
 	/// @dev A VerantaPriceAdapter on `store` for exactly this pair (a Chainlink feed answers neither).

@@ -23,11 +23,12 @@ library FundValuationV6 {
 	using EnumerableSet for EnumerableSet.AddressSet;
 
 	/// @notice A VI heartbeat above this marks a market-session feed: a tokenized stock's Chainlink feed (5 days, listed so
-	///         a closed market stays readable) stops from Friday's close to the next open. Every other feed is 25 h or less.
+	///         a closed market stays readable) stops from Friday's close to the next open, and so does a perp on a market
+	///         that closes (VerantaPriceAdapterV2, which answers its last trade's time). Every other feed is 25 h or less.
 	uint256 internal constant SESSION_HEARTBEAT = 2 days;
-	/// @notice A session feed's price older than this reads as a closed market: nobody may trade the fund at it (red-team
-	///         PF-02, 2026-10-27). NVDAc's feed moved on 0.5% around the clock on weekdays (longest quiet gap 8.4 h in 60
-	///         rounds, cast 2026-11-01); a quiet feed only delays an exit or deposit until its next update.
+	/// @notice A session feed's price older than this reads as a closed market: no exit is paid at it (red-team PF-02,
+	///         2026-10-27); deposits buy at it (founder 2026-11-03). NVDAc's feed moved on 0.5% around the clock on weekdays
+	///         (longest quiet gap 8.4 h in 60 rounds, cast 2026-11-01); a quiet feed only delays an exit until its next update.
 	uint256 internal constant MAX_SESSION_PRICE_AGE = 4 hours;
 
 	/// @dev The fund's fixed wiring.
@@ -52,7 +53,7 @@ library FundValuationV6 {
 	///      can't be read bubbles its revert unless `tolerant`, which marks the holding in kind and the valuation
 	///      incomplete instead. A balance that can't be read counts as 0 either way. Positions always revert. A closed
 	///      market's price still values the holding (the fund stays readable) but marks the valuation incomplete, so exits
-	///      and deposits wait for the market instead of trading at a price everyone knows is old.
+	///      wait for the market instead of paying at a price everyone knows is old. Deposits don't wait (founder 2026-11-03).
 	function value(
 		EnumerableSet.AddressSet storage trackedAssets,
 		EnumerableSet.AddressSet storage externalPositions,
@@ -194,6 +195,9 @@ library FundValuationV6 {
 		for (uint256 i; i < debtAssets.length; ++i) {
 			if (debtAmounts[i] == 0) continue;
 			debt += ctx.valueInterpreter.calcCanonicalAssetValue(debtAssets[i], debtAmounts[i], ctx.denominationAsset);
+			// a short's coin leg is owed: it reads a closed market's price just as a long's does
+			(bool assetClosed,) = _priceFlags(ctx, debtAssets[i]);
+			if (assetClosed) closed = true;
 		}
 
 		return (managed > debt ? managed - debt : 0, closed, unsettled);

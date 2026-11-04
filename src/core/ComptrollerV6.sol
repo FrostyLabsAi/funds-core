@@ -185,7 +185,6 @@ contract ComptrollerV6 is ReentrancyGuard {
 	error ZeroAddressConfig();
 	error RiskyAssetsNotAllowed(address asset);
 	error BootstrapDepositTooSmall();
-	error MarketClosed();
 	error PoolPriceUnsettled();
 	error ZeroGavWithSupply();
 	error HookNotImplemented(IPolicy.PolicyHook hook, address policy);
@@ -430,7 +429,13 @@ contract ComptrollerV6 is ReentrancyGuard {
 		if (supplyBefore == 0) return;
 		uint256 before = Math.mulDiv(feeGav, SHARES_UNIT, supplyBefore);
 		uint256 afterDeposit = Math.mulDiv(feeGav + assetsIn, SHARES_UNIT, shares.totalSupply());
-		if (afterDeposit > before) highWaterMark += afterDeposit - before;
+		// above the mark, the fee is waiting on a closed market: the mark takes the new money at cost, so the gain to charge
+		// stays the holders' alone (founder 2026-11-03)
+		if (before > highWaterMark) {
+			highWaterMark = Math.mulDiv(Math.mulDiv(highWaterMark, supplyBefore, SHARES_UNIT) + assetsIn, SHARES_UNIT, shares.totalSupply());
+		} else if (afterDeposit > before) {
+			highWaterMark += afterDeposit - before;
+		}
 	}
 
 	/// @notice Value of the vault's holding of one asset, in denomination units.
@@ -530,7 +535,7 @@ contract ComptrollerV6 is ReentrancyGuard {
 	function _settleFeesTolerant() private returns (FundValuationV6.Valuation memory v) {
 		_settleManagementFee();
 		v = _value(true);
-		if (v.complete) _settlePerformanceFee(v.feeGav, v.gav, shares.totalSupply());
+		if (v.complete) _performanceFee(v.feeGav, v.gav, shares.totalSupply(), true);
 		_settleProtocolFee();
 	}
 
@@ -548,18 +553,18 @@ contract ComptrollerV6 is ReentrancyGuard {
 
 		FundValuationV6.Valuation memory v = _value(false);
 		if (v.gav == 0) revert ZeroGavWithSupply();
-		if (deposit) {
-			// a closed market's price: a depositor could pick it, knowing where the market reopens (red-team PF-02, 2026-10-27)
-			if (!v.complete) revert MarketClosed();
-			// an LP's own pulls would sell the depositor the token's share for nothing (review 2026-11-01)
-			if (v.unsettled) revert PoolPriceUnsettled();
-		}
+		// a closed market never stops a deposit: it buys at the last price (founder 2026-11-03). Accepted: someone who saw the
+		// weekend's move keeps it, from the holders (red-team PF-02's deposit side); a manager can pause deposits for that.
+		// an LP's own pulls would sell the depositor the token's share for nothing (review 2026-11-01)
+		if (deposit && v.unsettled) revert PoolPriceUnsettled();
 
-		// the performance fee waits for a real price; settling the rest must not, or a cancel loses its fee stop (Low 6)
-		if (v.complete) _settlePerformanceFee(v.feeGav, v.gav, totalSupply);
+		// the performance fee waits for a real price; settling the rest must not, or a cancel loses its fee stop (Low 6).
+		// A deposit buys at the price after a waiting fee, so new money pays none of it. Charging it here instead let a dust
+		// deposit take a fee on a live gain over a stock that had really fallen (review 2026-11-03)
+		uint256 feeWaiting = v.complete || deposit ? _performanceFee(v.feeGav, v.gav, totalSupply, v.complete) : 0;
 		// After the manager's fees, before pricing the action.
 		_settleProtocolFee();
-		return (Math.mulDiv(v.gav, SHARES_UNIT, shares.totalSupply()), v.feeGav);
+		return (Math.mulDiv(v.gav - feeWaiting, SHARES_UNIT, shares.totalSupply()), v.feeGav);
 	}
 
 	/// @dev sharesDue = (rpow(scaledPerSecondRate, dt, 1e27) - 1e27) * totalSupply / 1e27
@@ -585,31 +590,35 @@ contract ComptrollerV6 is ReentrancyGuard {
 	///      of value and cost): g = feeGAV/TS; W = max(g - hwm, 0)*TS; F = W*rate; hwm' = feeGAV/TS' when paid.
 	///      feeShares = F*TS/(fullGAV - F): a share claims the full GAV, so shares sized on the fee GAV paid the manager
 	///      F*gav/feeGav, past the rate and the bytecode cap (red-team V6FEES-02, 2026-10-27).
-	function _settlePerformanceFee(uint256 feeGav, uint256 gav, uint256 totalSupply) private {
+	/// @dev With `charge`, settles the performance fee. Without it, changes nothing and returns what the fee would take: none
+	///      under the fee stop, which charges nothing.
+	function _performanceFee(uint256 feeGav, uint256 gav, uint256 totalSupply, bool charge) private returns (uint256 feeValue) {
 		uint256 rate = feeConfig.perfFeeBps;
-		if (rate == 0) return;
+		if (rate == 0) return 0;
 
 		uint256 grossSharePrice = Math.mulDiv(feeGav, SHARES_UNIT, totalSupply);
 		uint256 hwm = highWaterMark;
-		if (grossSharePrice <= hwm) return;
+		if (grossSharePrice <= hwm) return 0;
 		// fee stop: gains made while a redemption is overdue are never charged (founder 2026-10-06)
 		if (_overdue()) {
-			highWaterMark = grossSharePrice;
-			return;
+			if (charge) highWaterMark = grossSharePrice;
+			return 0;
 		}
 
 		uint256 wealthCreated = Math.mulDiv(grossSharePrice - hwm, totalSupply, SHARES_UNIT);
-		uint256 feeValue = (wealthCreated * rate) / BPS;
-		if (feeValue == 0 || feeValue >= gav) return;
+		feeValue = (wealthCreated * rate) / BPS;
+		if (!charge) return feeValue;
+		if (feeValue == 0 || feeValue >= gav) return 0;
 
 		uint256 feeShares = Math.mulDiv(feeValue, totalSupply, gav - feeValue);
-		if (feeShares == 0) return;
+		if (feeShares == 0) return 0;
 
 		shares.mint(fundOwner, feeShares);
 		uint256 newHwm = Math.mulDiv(feeGav, SHARES_UNIT, shares.totalSupply());
 		highWaterMark = newHwm;
 
 		emit PerformanceFeeSettled(feeShares, newHwm);
+		return 0;
 	}
 
 	/// @dev Protocol AUM fee: factory-set bps/yr of share supply, minted to the factory's

@@ -5,7 +5,12 @@ import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {ComptrollerV6} from '../src/core/ComptrollerV6.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {IDerivativePriceFeed} from '../src/interfaces/IDerivativePriceFeed.sol';
+import {IExternalPosition} from '../src/interfaces/IExternalPosition.sol';
+import {IExternalPositionTypeFactory} from '../src/interfaces/IExternalPositionTypeFactory.sol';
 import {LimitOrderPositionFactory} from '../src/positions/LimitOrderPosition.sol';
+import {VerantaPriceAdapterV2} from '../src/pricing/VerantaPriceAdapterV2.sol';
+import {VerantaPriceStoreV2} from '../src/pricing/VerantaPriceStoreV2.sol';
+import {MockStoreV2} from './B20VerantaPriceAdapter.t.sol';
 import {RedemptionQueueV2} from '../src/redemption/RedemptionQueueV2.sol';
 import {PoolPriceRegistrarWindowed} from '../src/pricing/PoolPriceRegistrarWindowed.sol';
 import {MockERC20, MockAggregator, MockERC4626Vault} from './utils/Mocks.sol';
@@ -52,13 +57,54 @@ contract StubVaultFeed is IDerivativePriceFeed {
 	}
 }
 
-/// @notice A tokenized stock's feed stops from Friday's close to the next open, so nobody may trade the fund at that price
-///         while everyone can see where the market will reopen (red-team PF-02, 2026-10-27). Exits go to the queue, the
-///         queue and deposits wait for the feed, and the fund stays readable.
+/// @dev A perp account as the fund sees it: what it holds and what it owes, set by the test.
+contract StubPerpAccount is IExternalPosition {
+	address internal managedAsset;
+	uint256 internal managedAmount;
+	address internal debtAsset;
+	uint256 internal debtAmount;
+
+	function set(address managedAsset_, uint256 managedAmount_, address debtAsset_, uint256 debtAmount_) external {
+		(managedAsset, managedAmount, debtAsset, debtAmount) = (managedAsset_, managedAmount_, debtAsset_, debtAmount_);
+	}
+
+	function _leg(address asset, uint256 amount) private pure returns (address[] memory assets, uint256[] memory amounts) {
+		if (asset == address(0)) return (new address[](0), new uint256[](0));
+		assets = new address[](1);
+		amounts = new uint256[](1);
+		assets[0] = asset;
+		amounts[0] = amount;
+	}
+
+	function getManagedAssets() external view returns (address[] memory, uint256[] memory) {
+		return _leg(managedAsset, managedAmount);
+	}
+
+	function getDebtAssets() external view returns (address[] memory, uint256[] memory) {
+		return _leg(debtAsset, debtAmount);
+	}
+
+	function receiveCallFromFund(bytes calldata) external {}
+
+	function isRiskReducing(bytes calldata) external pure returns (bool) {
+		return false;
+	}
+}
+
+contract StubPerpAccountFactory is IExternalPositionTypeFactory {
+	function deployPosition(address, bytes calldata) external returns (address) {
+		return address(new StubPerpAccount());
+	}
+}
+
+/// @notice A tokenized stock's feed stops from Friday's close to the next open, while everyone can see where the market
+///         will reopen (red-team PF-02, 2026-10-27). Exits go to the queue, the queue waits for the feed, and the fund stays
+///         readable. Deposits never wait (founder 2026-11-03): they buy at the last price.
 contract ComptrollerV6MarketClosedTest is RedemptionFixtureV6 {
 	using stdStorage for StdStorage;
 
 	uint256 internal constant LIMIT_TYPE = 95;
+	uint256 internal constant PERP_TYPE = 94;
 	MockERC20 internal stock;
 	MockAggregator internal stockFeed;
 
@@ -69,6 +115,7 @@ contract ComptrollerV6MarketClosedTest is RedemptionFixtureV6 {
 		// as the live Coinbase-stock primitives: a 5-day heartbeat, so a closed market stays readable
 		registrar.execute(abi.encodeCall(ValueInterpreter.addPrimitive, (address(stock), address(stockFeed), uint32(5 days))));
 		factory.registerPositionType(LIMIT_TYPE, address(new LimitOrderPositionFactory()));
+		factory.registerPositionType(PERP_TYPE, address(new StubPerpAccountFactory()));
 	}
 
 	/// @dev Alice and Bob in for 10,000 each, half the fund in the stock at $100.
@@ -129,24 +176,155 @@ contract ComptrollerV6MarketClosedTest is RedemptionFixtureV6 {
 
 	// ─── deposits ────────────────────────────────────────────────────────────────
 
-	/// The red team's other side: +20% over the weekend. Carol asks Sunday at Friday's price and would hold a free gain;
-	/// her deposit waits, then buys at Monday's.
-	function test_aDepositWaitsForTheMarket_andBuysAtMondaysPrice() public {
-		ComptrollerV6 fund = _stockFund();
-		_closeTheMarket();
-		deal(address(usdc), carol, 10_000e6);
-		vm.startPrank(carol);
-		usdc.approve(address(fund), 10_000e6);
-		fund.requestDeposit(10_000e6, type(uint256).max);
+	function _requestDeposit(ComptrollerV6 fund, address who, uint256 amount) internal {
+		deal(address(usdc), who, amount);
+		vm.startPrank(who);
+		usdc.approve(address(fund), amount);
+		fund.requestDeposit(amount, type(uint256).max);
 		vm.stopPrank();
 		skip(1 minutes);
-		vm.expectRevert(ComptrollerV6.MarketClosed.selector);
+	}
+
+	/// @dev Half the fund in the stock, up 20% before the close: 22,000 against a mark of 20,000, a 20% fee of 400.
+	function _stockFundAboveItsMark() internal returns (ComptrollerV6 fund) {
+		fund = ComptrollerV6(factory.createFund(_config(0, 2_000, 0)));
+		_deposit(fund, alice, 10_000e6);
+		_deposit(fund, bob, 10_000e6);
+		_swap(fund, usdc, stock, 10_000e6, 100e18);
+		stockFeed.setAnswer(120e8);
+	}
+
+	/// Founder 2026-11-03: a closed market never stops a deposit, it buys at the last price. The cost he accepted is the red
+	/// team's other side, recorded here: +20% over the weekend, and Carol's 10,000 takes a third of the gain from the holders.
+	function test_aClosedMarketNeverStopsADeposit_itBuysAtTheLastPrice() public {
+		ComptrollerV6 fund = _stockFund();
+		_closeTheMarket();
+		_requestDeposit(fund, carol, 10_000e6);
 		fund.executeDepositRequest(carol);
+		assertApproxEqRel(_worth(fund, carol), 10_000e6, 1e15, 'she buys at the last price');
+		assertApproxEqRel(_worth(fund, alice), 10_000e6, 1e15, 'the holders are unchanged');
 
 		stockFeed.setAnswer(120e8);
+		assertApproxEqRel(_worth(fund, carol), 10_667e6, 1e15, 'the accepted cost: a share of the weekend');
+		assertApproxEqRel(_worth(fund, alice), 10_667e6, 1e15, 'alice would have held 11,000');
+	}
+
+	/// New money pays no fee on gains made before it arrived: the fee waits for a real price, and the deposit buys at the
+	/// price after it. Nothing is charged at the closed price.
+	function test_aClosedMarketDepositPaysNoneOfTheFeeWaiting() public {
+		ComptrollerV6 fund = _stockFundAboveItsMark();
+		_closeTheMarket();
+		_requestDeposit(fund, carol, 10_000e6);
 		fund.executeDepositRequest(carol);
-		assertApproxEqRel(_worth(fund, carol), 10_000e6, 1e15, 'no free gain');
-		assertApproxEqRel(_worth(fund, alice), 11_000e6, 1e15, 'the gain stays with who held it');
+		assertEq(_sharesOf(fund, manager), 0, 'no fee at a closed price');
+
+		stockFeed.setAnswer(120e8); // the market reopens where it closed
+		fund.settleFees();
+		assertApproxEqRel(_worth(fund, manager), 400e6, 1e15, 'the fee is 20% of the holders 2,000 gain, none on her money');
+		assertApproxEqRel(_worth(fund, carol), 10_000e6, 1e15, 'she still holds what she paid');
+		assertApproxEqRel(_worth(fund, alice), 10_800e6, 1e15, 'alice pays her half of the fee');
+		assertApproxEqRel(fund.highWaterMark(), fund.calcGav() * 1e18 / fund.shares().totalSupply(), 1e15, 'the mark sits at the price after the fee');
+	}
+
+	/// Two deposits over one weekend each buy clean.
+	function test_twoClosedMarketDepositsEachPayNoneOfTheFeeWaiting() public {
+		ComptrollerV6 fund = _stockFundAboveItsMark();
+		_closeTheMarket();
+		address dave = makeAddr('dave');
+		_requestDeposit(fund, carol, 10_000e6);
+		fund.executeDepositRequest(carol);
+		_requestDeposit(fund, dave, 5_000e6);
+		fund.executeDepositRequest(dave);
+
+		stockFeed.setAnswer(120e8);
+		fund.settleFees();
+		assertApproxEqRel(_worth(fund, manager), 400e6, 1e15, 'the same 400');
+		assertApproxEqRel(_worth(fund, carol), 10_000e6, 1e15);
+		assertApproxEqRel(_worth(fund, dave), 5_000e6, 1e15);
+		assertApproxEqRel(_worth(fund, alice), 10_800e6, 1e15);
+	}
+
+	/// The review's attack (2026-11-03): WETH up 2,000 over the weekend, the stock really down 2,000 behind its frozen feed. A
+	/// dust deposit could take a fee on a gain that never existed. It charges nothing, and Monday's flat NAV owes nothing.
+	function test_aDustDepositCantChargeAFeeOnAStalePrice() public {
+		ComptrollerV6 fund = ComptrollerV6(factory.createFund(_config(0, 2_000, 0)));
+		_deposit(fund, alice, 10_000e6);
+		_deposit(fund, bob, 10_000e6);
+		_swap(fund, usdc, stock, 10_000e6, 100e18);
+		_swap(fund, usdc, weth, 5_000e6, 2.5e18);
+		skip(5 hours);
+		_refreshFeeds();
+		wethFeed.setAnswer(2_800e8);
+
+		_requestDeposit(fund, manager, 1e6);
+		fund.executeDepositRequest(manager);
+		assertLt(_sharesOf(fund, manager), 1e18, 'only what the dust bought');
+
+		stockFeed.setAnswer(80e8);
+		_refreshFeeds();
+		wethFeed.setAnswer(2_800e8);
+		fund.settleFees();
+		assertLt(_sharesOf(fund, manager), 1e18, 'no gain, no fee');
+		assertApproxEqRel(_worth(fund, alice), 10_000e6, 1e15, 'alice keeps her half');
+	}
+
+	/// A loss on Monday means no fee was owed after all: the deposit's cheaper price is the same kind of edge as the last
+	/// price, and the mark stays where the holders left it.
+	function test_aDropBelowTheMarkOwesNoFee() public {
+		ComptrollerV6 fund = _stockFundAboveItsMark();
+		_closeTheMarket();
+		_requestDeposit(fund, carol, 10_000e6);
+		fund.executeDepositRequest(carol);
+		stockFeed.setAnswer(90e8); // 19,000 of the 20,000 mark
+		fund.settleFees();
+		assertEq(_sharesOf(fund, manager), 0, 'below the mark');
+	}
+
+	/// The fee stop: a gain while a redemption is overdue is never charged, so nothing comes off the deposit's price.
+	function test_anOverdueFundsDepositPaysTheFullPrice() public {
+		ComptrollerV6 fund = _stockFundAboveItsMark();
+		vm.mockCall(address(queue), abi.encodeCall(queue.isOverdue, (address(fund))), abi.encode(true));
+		_closeTheMarket();
+		_requestDeposit(fund, carol, 11_000e6);
+		fund.executeDepositRequest(carol);
+		assertApproxEqRel(_worth(fund, carol), 11_000e6, 1e15, 'the full price, with no fee to come');
+		assertApproxEqRel(fund.highWaterMark(), 31_000e6 * 1e18 / fund.shares().totalSupply(), 1e15, 'a closed price never resets the mark');
+
+		stockFeed.setAnswer(120e8);
+		fund.settleFees();
+		assertEq(_sharesOf(fund, manager), 0, 'the fee stop charges nothing');
+		assertApproxEqRel(_worth(fund, alice), 11_000e6, 1e15, 'alice keeps the whole gain');
+	}
+
+	/// A stock in a limit order is the same stock: the deposit still buys.
+	function test_aStockInAPositionDoesntStopADeposit() public {
+		ComptrollerV6 fund = _stockFund();
+		vm.prank(manager);
+		address order = fund.createExternalPosition(LIMIT_TYPE, '');
+		address[] memory assets = new address[](1);
+		uint256[] memory amounts = new uint256[](1);
+		assets[0] = address(stock);
+		amounts[0] = 100e18;
+		vm.prank(manager);
+		fund.callOnExternalPosition(order, assets, amounts, new address[](0),
+			abi.encode(uint8(0), abi.encode(address(stock), address(usdc), uint128(100e18), uint128(10_000e6), uint64(block.timestamp + 30 days))));
+		_closeTheMarket();
+		_requestDeposit(fund, carol, 10_000e6);
+		fund.executeDepositRequest(carol);
+		assertApproxEqRel(_worth(fund, carol), 10_000e6, 1e15);
+	}
+
+	/// settleFees still leaves the performance fee to a real price.
+	function test_settleFeesStillLeavesThePerformanceFeeToARealPrice() public {
+		ComptrollerV6 fund = _stockFundAboveItsMark();
+		_closeTheMarket();
+		uint256 grossBeforeTheFee = fund.calcGrossShareValue();
+		assertEq(fund.settleFees(), grossBeforeTheFee, 'only a deposit prices after the waiting fee');
+		assertEq(_sharesOf(fund, manager), 0, 'no fee at a closed price');
+
+		stockFeed.setAnswer(120e8);
+		fund.settleFees();
+		assertApproxEqRel(_worth(fund, manager), 400e6, 1e15, 'charged once the price is real');
 	}
 
 	/// Cancelling never waits on the market.
@@ -270,7 +448,7 @@ contract ComptrollerV6MarketClosedTest is RedemptionFixtureV6 {
 		fund.redeemShares(shares);
 	}
 
-	/// A pool-priced token quoted against a stock reads the stock: its queue and deposits wait.
+	/// A pool-priced token quoted against a stock reads the stock: its queue waits.
 	function test_aTokenQuotedInAStockHoldsTheQueueToo() public {
 		MockERC20 token = new MockERC20('Quoted', 'QTD', 18);
 		MockUniswapV3Factory uniswap = MockUniswapV3Factory(address(PoolPriceRegistrarWindowed(address(registrar)).uniswapV3Factory()));
@@ -292,6 +470,103 @@ contract ComptrollerV6MarketClosedTest is RedemptionFixtureV6 {
 		vm.prank(keeper);
 		vm.expectRevert(RedemptionQueueV2.PriceUnreadable.selector);
 		queue.settle(address(fund), 1);
+	}
+
+	// ─── perps on markets that close (red-team PF-01; founder 2026-11-03) ──────────
+
+	/// @dev As live after MoveClosingMarketsToStoreV2: a perp's marker priced from the V2 store with a 5-day heartbeat.
+	///      Alice and Bob in for 10,000 each, with `manage`d or owed units at $100 in a perp account.
+	function _perpFund() internal returns (ComptrollerV6 fund, StubPerpAccount account, MockERC20 marker, MockStoreV2 prices) {
+		prices = new MockStoreV2();
+		marker = new MockERC20('Veranta MU', 'vmMU', 18);
+		VerantaPriceAdapterV2 adapter = new VerantaPriceAdapterV2(VerantaPriceStoreV2(address(prices)), 105, 10 minutes, 5 days, 'MU/USD (Veranta)');
+		registrar.execute(abi.encodeCall(ValueInterpreter.addPrimitive, (address(marker), address(adapter), uint32(5 days))));
+		_confirm(prices, block.timestamp);
+		fund = ComptrollerV6(factory.createFund(_config(0, 0, 0)));
+		vm.prank(manager);
+		account = StubPerpAccount(fund.createExternalPosition(PERP_TYPE, ''));
+		_deposit(fund, alice, 10_000e6);
+		_deposit(fund, bob, 10_000e6);
+	}
+
+	/// @dev The keeper's push: Pyth signs $100 as current now, and the pair last traded at `lastTrade`.
+	function _confirm(MockStoreV2 prices, uint256 lastTrade) internal {
+		prices.set(10_000_000, -5, uint64(block.timestamp) * 1e6, uint64(lastTrade) * 1e6);
+	}
+
+	function test_aPerpOnAClosedMarketIsPriced_takesADeposit_andHoldsTheQueue() public {
+		(ComptrollerV6 fund, StubPerpAccount account, MockERC20 marker, MockStoreV2 prices) = _perpFund();
+		account.set(address(marker), 10e18, address(0), 0); // long: 10 units, $1,000
+		uint256 close = block.timestamp;
+		skip(5 hours);
+		_refreshFeeds();
+		_confirm(prices, close);
+		assertApproxEqRel(fund.calcGav(), 21_000e6, 1e15, 'the fund stays priced');
+
+		_requestDeposit(fund, carol, 10_500e6);
+		_confirm(prices, close);
+		fund.executeDepositRequest(carol);
+		assertApproxEqRel(_worth(fund, carol), 10_500e6, 1e15, 'the deposit goes through at the last price');
+
+		_request(fund, bob, _sharesOf(fund, bob));
+		vm.prank(keeper);
+		vm.expectRevert(RedemptionQueueV2.PriceUnreadable.selector);
+		queue.settle(address(fund), 1);
+
+		_confirm(prices, block.timestamp); // the market reopens
+		vm.prank(keeper);
+		queue.settle(address(fund), 1);
+		assertApproxEqRel(usdc.balanceOf(bob), 10_500e6, 1e15, 'paid once the price is real');
+	}
+
+	/// A short's coin leg is owed, not held: the queue waits for it just the same.
+	function test_aShortPerpOnAClosedMarketHoldsTheQueueToo() public {
+		(ComptrollerV6 fund, StubPerpAccount account, MockERC20 marker, MockStoreV2 prices) = _perpFund();
+		deal(address(usdc), address(account), 2_000e6);
+		account.set(address(usdc), 2_000e6, address(marker), 10e18); // short: $2,000 of collateral, owes 10 units, $1,000
+		uint256 close = block.timestamp;
+		skip(5 hours);
+		_refreshFeeds();
+		_confirm(prices, close);
+		assertApproxEqRel(fund.calcGav(), 21_000e6, 1e15, 'the fund stays priced');
+		_requestDeposit(fund, carol, 10_500e6);
+		_confirm(prices, close);
+		fund.executeDepositRequest(carol);
+
+		_request(fund, bob, _sharesOf(fund, bob));
+		vm.prank(keeper);
+		vm.expectRevert(RedemptionQueueV2.PriceUnreadable.selector);
+		queue.settle(address(fund), 1);
+	}
+
+	/// An open market isn't held up: a recent trade pays the queue as before.
+	function test_aPerpOnAnOpenMarketPaysTheQueue() public {
+		(ComptrollerV6 fund, StubPerpAccount account, MockERC20 marker, MockStoreV2 prices) = _perpFund();
+		account.set(address(marker), 10e18, address(0), 0);
+		skip(1 hours);
+		_refreshFeeds();
+		_confirm(prices, block.timestamp - 1 hours); // an hour since its last trade is well inside the 4
+		_request(fund, bob, _sharesOf(fund, bob) / 2);
+		vm.prank(keeper);
+		queue.settle(address(fund), 1);
+		assertApproxEqRel(usdc.balanceOf(bob), 5_250e6, 1e15);
+	}
+
+	/// The price still has to be stored recently, as every store-priced read does: the keeper stores it before a deposit.
+	function test_aPerpPriceNobodyStoredWaitsForTheKeeper() public {
+		(ComptrollerV6 fund, StubPerpAccount account, MockERC20 marker, MockStoreV2 prices) = _perpFund();
+		account.set(address(marker), 10e18, address(0), 0);
+		uint256 stored = block.timestamp;
+		_confirm(prices, stored);
+		skip(5 hours);
+		_refreshFeeds();
+		_requestDeposit(fund, carol, 10_500e6);
+		vm.expectRevert(abi.encodeWithSelector(VerantaPriceAdapterV2.StalePush.selector, stored));
+		fund.executeDepositRequest(carol);
+
+		_confirm(prices, stored);
+		fund.executeDepositRequest(carol);
+		assertGt(_sharesOf(fund, carol), 0);
 	}
 
 	/// `settleFees` no longer waits on the market: a cancel's fee stop must hold (review 2026-11-01, Low 6).
