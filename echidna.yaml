@@ -5,5 +5,5 @@ shrinkLimit: 2000
 coverage: true
 corpusDir: echidna-corpus
 # fund v6 and the older comptrollers --foundry-compile-all also builds link external libraries (echidna deploys them here)
-deployContracts: [['0x1f1', 'ComptrollerV3Lib'], ['0x1f2', 'FundValuationV6'], ['0x1f3', 'ComptrollerV6Lib'], ['0x1f4', 'FundValuation'], ['0x1f5', 'InKindRedemption']]
-cryticArgs: ['--foundry-compile-all', '--compile-libraries=(ComptrollerV3Lib,0x1f1),(FundValuationV6,0x1f2),(ComptrollerV6Lib,0x1f3),(FundValuation,0x1f4),(InKindRedemption,0x1f5)']
+deployContracts: [['0x1f1', 'ComptrollerV3Lib'], ['0x1f2', 'FundValuationV6'], ['0x1f3', 'ComptrollerV6Lib'], ['0x1f4', 'FundValuation']]
+cryticArgs: ['--foundry-compile-all', '--compile-libraries=(ComptrollerV3Lib,0x1f1),(FundValuationV6,0x1f2),(ComptrollerV6Lib,0x1f3),(FundValuation,0x1f4)']

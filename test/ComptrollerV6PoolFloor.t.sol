@@ -252,4 +252,136 @@ contract ComptrollerV6PoolFloorTest is RedemptionFixtureV6 {
 		vm.expectRevert(abi.encodeWithSelector(ComptrollerV6Lib.NotAtFloor.selector, address(weth)));
 		fund.writeOffAsset(address(weth));
 	}
+
+	// ─── a holding too small to matter (founder 2026-11-04) ───────────────────
+
+	/// @dev Alice and Bob in for 10,000 each, `cost` USDC of it in TKN at $1.
+	function _fundWithTokenCosting(uint256 cost) internal returns (ComptrollerV6 fund) {
+		fund = ComptrollerV6(factory.createFund(_config(0, 0, 0)));
+		_deposit(fund, alice, 10_000e6);
+		_deposit(fund, bob, 10_000e6);
+		_swap(fund, usdc, tkn, cost, cost);
+	}
+
+	/// A deposit has no line: it waits at any size. Exits keep the line, so the queue still pays.
+	function test_aSmallTokenAtTheFloorStopsDepositsButNotTheQueue() public {
+		ComptrollerV6 fund = _fundWithTokenCosting(10e6); // 0.05% of 20,000
+		_requestDeposit(fund, carol, 20_000e6);
+		_request(fund, bob, _sharesOf(fund, bob));
+		_floor();
+		vm.expectRevert(ComptrollerV6.PoolPriceUnsettled.selector);
+		fund.executeDepositRequest(carol);
+		vm.prank(keeper);
+		queue.settle(address(fund), 1);
+		assertApproxEqRel(usdc.balanceOf(bob), 10_000e6, 2e15, 'the queue paid');
+	}
+
+	/// Tool run 2026-11-05, Finding 1. With no wait here a deposit bought in at each floor and left with the token's worth, and the
+	/// token stayed in the fund to do it again: $1M fell to $900,486 over 122 rounds on a $900 holding, to $250,024 over 3,182 on $250.
+	function test_aDepositCantBuyInAtASmallFloor_soTheLoopIsClosed() public {
+		ComptrollerV6 fund = ComptrollerV6(factory.createFund(_config(0, 0, 0)));
+		_deposit(fund, alice, 1_000_000e6);
+		_swap(fund, usdc, tkn, 900e6, 900e6); // 0.09%
+		uint256 before = _worth(fund, alice);
+		_requestDeposit(fund, carol, 10_000_000e6);
+		_floor();
+		vm.expectRevert(ComptrollerV6.PoolPriceUnsettled.selector);
+		fund.executeDepositRequest(carol);
+		_floorLifted();
+		fund.executeDepositRequest(carol);
+		assertApproxEqRel(_worth(fund, alice), before, 1e13, 'alice keeps her share of the token');
+	}
+
+	/// A drained token reads $0, so a real holding is judged by what it cost: 0.2% of the fund still stops everything.
+	function test_aRealHoldingAtTheFloorStillStopsDeposits_byWhatItCost() public {
+		ComptrollerV6 fund = _fundWithTokenCosting(40e6);
+		_requestDeposit(fund, carol, 1_000e6);
+		_request(fund, bob, _sharesOf(fund, bob));
+		_floor();
+		vm.expectRevert(ComptrollerV6.PoolPriceUnsettled.selector);
+		fund.executeDepositRequest(carol);
+		vm.prank(keeper);
+		vm.expectRevert(RedemptionQueueV2.PriceUnreadable.selector);
+		queue.settle(address(fund), 1);
+	}
+
+	/// The griefing case, now that a sale takes the token off the list (founder 2026-11-05): the fund sold the token, its pool is
+	/// dead, and anyone sends it 1 wei. It isn't tracked, so it stops nothing: the deposit goes in and the queue pays.
+	function test_aWeiSentToASoldDeadTokenStopsNothing() public {
+		ComptrollerV6 fund = _fundWithTokenCosting(10_000e6);
+		_swap(fund, tkn, usdc, 10_000e6, 10_000e6);
+		_requestDeposit(fund, carol, 1_000e6);
+		_request(fund, bob, _sharesOf(fund, bob));
+		_floor();
+		tkn.mint(address(fund.vault()), 1);
+		fund.executeDepositRequest(carol);
+		assertGt(_sharesOf(fund, carol), 0, 'the deposit went in');
+		vm.prank(keeper);
+		queue.settle(address(fund), 1);
+		assertApproxEqRel(usdc.balanceOf(bob), 10_000e6, 2e15, 'the queue paid');
+	}
+
+	/// A wei the sale left behind is still a holding: at a dead pool it stops deposits until the manager writes the token off,
+	/// once: written off, it's off the list, so another wei does nothing. The queue never waits.
+	function test_aWeiLeftOfADeadTokenStopsDepositsUntilWrittenOff_andNeverTheQueue() public {
+		ComptrollerV6 fund = _fundWithTokenCosting(10_000e6);
+		_swap(fund, tkn, usdc, 10_000e6 - 1, 10_000e6);
+		_requestDeposit(fund, carol, 1_000e6);
+		_request(fund, bob, _sharesOf(fund, bob));
+		_floor();
+		vm.expectRevert(ComptrollerV6.PoolPriceUnsettled.selector);
+		fund.executeDepositRequest(carol);
+		vm.prank(keeper);
+		queue.settle(address(fund), 1);
+		assertApproxEqRel(usdc.balanceOf(bob), 10_000e6, 2e15, 'the queue paid');
+
+		vm.prank(manager);
+		fund.writeOffAsset(address(tkn));
+		tkn.mint(address(fund.vault()), 1);
+		fund.executeDepositRequest(carol);
+		assertGt(_sharesOf(fund, carol), 0, 'the deposit went in');
+	}
+
+	function test_aSmallDrainingTokenStopsDepositsButNotTheQueue() public {
+		ComptrollerV6 fund = _fundWithTokenCosting(10e6);
+		_requestDeposit(fund, carol, 1_000e6);
+		_request(fund, bob, _sharesOf(fund, bob));
+		pool.setSpotLiquidity(PLENTY / 3);
+		vm.expectRevert(ComptrollerV6.PoolPriceUnsettled.selector);
+		fund.executeDepositRequest(carol);
+		vm.prank(keeper);
+		queue.settle(address(fund), 1);
+		assertApproxEqRel(usdc.balanceOf(bob), 10_000e6, 2e15, 'the queue paid');
+	}
+
+	function test_aSmallTokenDoesntBlockTheInstantExit() public {
+		ComptrollerV6 fund = _fundWithTokenCosting(10e6);
+		uint256 shares = _sharesOf(fund, bob) / 10;
+		vm.prank(bob);
+		fund.redeemShares(shares);
+		assertApproxEqRel(usdc.balanceOf(bob), 1_000e6, 1e15);
+	}
+
+	function test_aRealTokenHoldingStillGoesThroughTheQueue() public {
+		ComptrollerV6 fund = _fundWithTokenCosting(20e6); // 0.1%
+		uint256 shares = _sharesOf(fund, bob);
+		vm.prank(bob);
+		vm.expectRevert(ComptrollerV6.UseRedemptionQueue.selector);
+		fund.redeemShares(shares);
+	}
+
+	/// A vault share has no cost on record and reads next to nothing once its pool drains, so its size can't be told: it waits.
+	function test_aSmallVaultShareOnADrainedPoolStillStopsDeposits() public {
+		ComptrollerV6 fund = _fundWithTokenCosting(10e6);
+		StubClmVault vault = new StubClmVault(address(new StubClmStrategy(address(tkn), address(usdc))));
+		registrar.execute(abi.encodeCall(ValueInterpreter.addDerivative, (address(vault), address(new StubVaultFeed(address(tkn))))));
+		vm.prank(manager);
+		fund.addTrackedAsset(address(vault));
+		vault.mint(address(fund.vault()), 1);
+		_swap(fund, tkn, usdc, 10e6, 10e6);
+		_requestDeposit(fund, carol, 1_000e6);
+		_floor();
+		vm.expectRevert(ComptrollerV6.PoolPriceUnsettled.selector);
+		fund.executeDepositRequest(carol);
+	}
 }

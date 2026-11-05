@@ -76,7 +76,9 @@ contract ComptrollerV6 is ReentrancyGuard {
 	// reclaims). Short windows remove the "wait and pick your moment" free option.
 	uint256 public constant MIN_EXECUTION_WINDOW = 15 minutes;
 	uint256 public constant MAX_EXECUTION_WINDOW = 7 days;
-	uint256 public constant MAX_TRACKED_ASSETS = 20;
+	// Every valuation walks the list: 30 keeps it well inside Base's per-transaction gas cap (about 43 long-tail tokens fit,
+	// measured 2026-11-04), and sold tokens leave it (FundValuationV6.followTrade). Founder 2026-11-05.
+	uint256 public constant MAX_TRACKED_ASSETS = 30;
 	uint256 public constant MAX_EXTERNAL_POSITIONS = 10;
 	/// @dev Donation-inflation defense: the bootstrap deposit mints this many shares to an
 	///      unredeemable sink, so supply can never be dusted below it. 1e18 = one whole
@@ -488,7 +490,7 @@ contract ComptrollerV6 is ReentrancyGuard {
 			trackedAssets, _tracking(), address(vault), incomingAssets, balancesBefore, minIncomingAmounts
 		);
 		// from here spendAmounts is what left the vault: a deposit's refund is no loss to the policies (review 2026-11-01, Medium 4)
-		spendAmounts = FundValuationV6.followTrade(costBasis, _context(), spendAssets, spendBefore, incomingAssets, incomingAmounts);
+		spendAmounts = FundValuationV6.followTrade(trackedAssets, costBasis, _context(), spendAssets, spendBefore, incomingAssets, incomingAmounts);
 		_keepUsdc(usdcFloor);
 
 		_runPolicies(

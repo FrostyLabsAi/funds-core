@@ -715,7 +715,7 @@ contract ComptrollerV6Test is ComptrollerV6Base {
 
 	// ─── V6: a full tracked set never blocks a liquidation (red-team POSITIONS-01 / EXITADAPTERS-01, 2026-10-27) ──
 
-	/// @dev Tracks fresh $1 primitives until the fund tracks MAX_TRACKED_ASSETS (20).
+	/// @dev Tracks fresh $1 primitives until the fund tracks MAX_TRACKED_ASSETS.
 	function _fillTrackedSet(ComptrollerV6 fund) internal {
 		while (fund.getTrackedAssets().length < _v6(fund).MAX_TRACKED_ASSETS()) {
 			MockERC20 t = new MockERC20('T', 'T', 18);
@@ -763,8 +763,9 @@ contract ComptrollerV6Test is ComptrollerV6Base {
 		queueV6.liquidatePosition(_v6(fund), order, new address[](0), _cancelAndReturn());
 		assertEq(_held(fund, usdc), vaultUsdc + 1_000e6, 'the order came back to the vault');
 		address[] memory tracked = fund.getTrackedAssets();
-		assertEq(tracked.length, 21);
-		assertEq(tracked[20], address(weth), 'what the position holds is tracked');
+		uint256 max = _v6(fund).MAX_TRACKED_ASSETS();
+		assertEq(tracked.length, max + 1);
+		assertEq(tracked[max], address(weth), 'what the position holds is tracked');
 	}
 
 	/// The manager's own action on the position isn't blocked either.
@@ -773,20 +774,131 @@ contract ComptrollerV6Test is ComptrollerV6Base {
 		address order = _fullSetWithADonatedOrder(fund);
 		vm.prank(manager);
 		fund.callOnExternalPosition(order, new address[](0), new uint256[](0), new address[](0), _cancelAndReturn()[0]);
-		assertEq(fund.getTrackedAssets().length, 21);
+		assertEq(fund.getTrackedAssets().length, _v6(fund).MAX_TRACKED_ASSETS() + 1);
 		assertEq(LimitOrderPosition(order).committed(address(usdc)), 0, 'cancelled');
 	}
 
 	/// EXITADAPTERS-01: at a full set the keeper's sale of a long-tail token into its pool's WETH quote goes through
-	/// (WETH is tracked past the cap), and the next sale takes the WETH to USDC.
+	/// (WETH is tracked past the cap), and the next sale takes the WETH to USDC. It sells half the token, so the token
+	/// stays listed and WETH is the one past the cap (a sale that empties a token takes it off, founder 2026-11-05).
 	function test_v6_aFullTrackedSetStillTakesTheLongTailSaleIntoItsQuote() public {
 		ComptrollerV6 fund = _fund(0);
 		_swap(fund, usdc, tkn, 2_000e6, 2_000e6); // WETH not tracked
 		_fillTrackedSet(fund);
-		router.setNextAmountOut(0.99e18); // $1,980
-		queueV6.liquidateTrade(_v6(fund), address(uniAdapter), abi.encode(address(tkn), address(weth), uint24(3000), 2_000e6, uint256(0)));
-		assertEq(fund.getTrackedAssets().length, 21, 'WETH tracked past the cap');
-		_liquidate(fund, weth, 0.99e18, 1_970e6);
-		assertEq(_held(fund, usdc), 9_970e6);
+		router.setNextAmountOut(0.495e18); // $990
+		queueV6.liquidateTrade(_v6(fund), address(uniAdapter), abi.encode(address(tkn), address(weth), uint24(3000), 1_000e6, uint256(0)));
+		assertEq(fund.getTrackedAssets().length, _v6(fund).MAX_TRACKED_ASSETS() + 1, 'WETH tracked past the cap');
+		_liquidate(fund, weth, 0.495e18, 985e6);
+		assertEq(_held(fund, usdc), 8_985e6);
+	}
+
+	// ─── V6: a sale that empties a token takes it off the tracked list (founder 2026-11-05, Melon v1's auto-prune) ──
+
+	event TrackedAssetRemoved(address indexed asset);
+
+	function _isTracked(ComptrollerV6 fund, address asset) internal view returns (bool) {
+		address[] memory tracked = fund.getTrackedAssets();
+		for (uint256 i; i < tracked.length; ++i) {
+			if (tracked[i] == asset) return true;
+		}
+		return false;
+	}
+
+	/// The manager sells all of a token: it leaves the list in that trade, with the event a manual removal emits, from the fund.
+	function test_v6_aSaleThatEmptiesATokenTakesItOffTheList() public {
+		ComptrollerV6 fund = _fund(0);
+		_swap(fund, usdc, weth, 2_000e6, 1e18);
+		router.setNextAmountOut(2_000e6);
+		vm.expectEmit(address(fund));
+		emit TrackedAssetRemoved(address(weth));
+		vm.prank(manager);
+		fund.callOnIntegration(address(uniAdapter), abi.encode(address(weth), address(usdc), uint24(3000), 1e18, uint256(0)));
+		assertFalse(_isTracked(fund, address(weth)));
+	}
+
+	/// A sale that leaves even 1 wei keeps the token, as a manual removal would.
+	function test_v6_aSaleThatLeavesAWeiKeepsTheToken() public {
+		ComptrollerV6 fund = _fund(0);
+		_swap(fund, usdc, weth, 2_000e6, 1e18);
+		_swap(fund, weth, usdc, 1e18 - 1, 2_000e6);
+		assertTrue(_isTracked(fund, address(weth)));
+	}
+
+	/// USDC never leaves, even when a buy spends all of it.
+	function test_v6_aBuyThatSpendsAllTheUsdcKeepsItListed() public {
+		ComptrollerV6 fund = _fund(0);
+		_swap(fund, usdc, weth, _held(fund, usdc), 5e18);
+		assertEq(_held(fund, usdc), 0);
+		assertTrue(_isTracked(fund, address(usdc)));
+	}
+
+	/// The keeper's sale for the queue does the same.
+	function test_v6_aKeeperSaleThatEmptiesATokenTakesItOffTheList() public {
+		ComptrollerV6 fund = _fund(0);
+		_swap(fund, usdc, weth, 2_000e6, 1e18);
+		_liquidate(fund, weth, 1e18, 1_990e6);
+		assertFalse(_isTracked(fund, address(weth)));
+	}
+
+	/// What anyone sends to a sold token afterwards isn't counted and doesn't put the token back on the list.
+	function test_v6_whatIsSentToASoldTokenIsNotCounted() public {
+		ComptrollerV6 fund = _fund(0);
+		_swap(fund, usdc, weth, 2_000e6, 1e18);
+		_swap(fund, weth, usdc, 1e18, 2_000e6);
+		uint256 gavBefore = fund.calcGav();
+		weth.mint(address(fund.vault()), 1e18);
+		assertEq(fund.calcGav(), gavBefore);
+		assertFalse(_isTracked(fund, address(weth)));
+	}
+
+	/// A token moved into a limit order isn't sold: it stays listed, so it counts when it comes back.
+	function test_v6_aTokenMovedIntoALimitOrderStaysListed() public {
+		ComptrollerV6 fund = _fund(0);
+		_swap(fund, usdc, weth, 2_000e6, 1e18);
+		address[] memory assets = new address[](1);
+		uint256[] memory amounts = new uint256[](1);
+		assets[0] = address(weth);
+		amounts[0] = 1e18;
+		vm.startPrank(manager);
+		address order = fund.createExternalPosition(LIMIT_TYPE, '');
+		fund.callOnExternalPosition(order, assets, amounts, new address[](0),
+			abi.encode(uint8(0), abi.encode(address(weth), address(usdc), uint128(1e18), uint128(2_000e6), uint64(block.timestamp + 1 days))));
+		vm.stopPrank();
+		assertEq(_held(fund, weth), 0);
+		assertTrue(_isTracked(fund, address(weth)));
+	}
+
+	/// A sold token bought again is tracked again.
+	function test_v6_aSoldTokenBoughtAgainIsTrackedAgain() public {
+		ComptrollerV6 fund = _fund(0);
+		_swap(fund, usdc, weth, 2_000e6, 1e18);
+		_swap(fund, weth, usdc, 1e18, 2_000e6);
+		assertFalse(_isTracked(fund, address(weth)), 'sold');
+		_swap(fund, usdc, weth, 2_000e6, 1e18);
+		assertTrue(_isTracked(fund, address(weth)), 'bought again');
+	}
+
+	/// The NVDA case (founder 2026-11-04): a fund that has traded through more tokens than the limit can still buy, because
+	/// only what it holds counts.
+	function test_v6_aFundThatTradedThroughMoreTokensThanTheLimitCanStillBuy() public {
+		ComptrollerV6 fund = _fund(0);
+		uint256 rounds = _v6(fund).MAX_TRACKED_ASSETS() + 5;
+		for (uint256 i; i < rounds; ++i) {
+			MockERC20 t = new MockERC20('T', 'T', 18);
+			registrar.execute(
+				abi.encodeCall(ValueInterpreter.addPrimitive, (address(t), address(new MockAggregator(8, 1e8)), uint32(25 hours)))
+			);
+			_swap(fund, usdc, t, 100e6, 100e18);
+			_swap(fund, t, usdc, 100e18, 100e6);
+		}
+		_swap(fund, usdc, weth, 2_000e6, 1e18);
+		assertEq(fund.getTrackedAssets().length, 2, 'USDC and WETH');
+	}
+
+	/// The limit is 30 (founder 2026-11-05), USDC included; the 31st is refused (test_v6_aFullTrackedSetRefusesTheManagersNextTrack).
+	function test_v6_aFundTracksThirtyTokens() public {
+		ComptrollerV6 fund = _fund(0);
+		_fillTrackedSet(fund);
+		assertEq(fund.getTrackedAssets().length, 30);
 	}
 }

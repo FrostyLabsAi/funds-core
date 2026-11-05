@@ -4,6 +4,8 @@ broadcast/
 .env
 foundry.lock
 node_modules/
+medusa-corpus/
+crytic-export/
 
 # agent tooling: never committed (founder 2026-10-13)
 .claude/

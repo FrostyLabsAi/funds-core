@@ -31,6 +31,15 @@ library FundValuationV6 {
 	///         2026-10-27); deposits buy at it (founder 2026-11-03). NVDAc's feed moved on 0.5% around the clock on weekdays
 	///         (longest quiet gap 8.4 h in 60 rounds, cast 2026-11-01); a quiet feed only delays an exit until its next update.
 	uint256 internal constant MAX_SESSION_PRICE_AGE = 4 hours;
+	/// @notice The holdings causing an exit's wait must add up to this share of the fund's value (0.1%) or it doesn't apply: $2 of a
+	///         token held up a $1M fund, and since a sold token stays tracked, anyone could switch a wait on by sending it 1 wei (founder
+	///         2026-11-04). This far under the line can't move an exit's price by more than about 0.1%. A position's flags and a
+	///         price that can't be read aren't sized: a perp's value is its margin, not its risk, and no price means no size.
+	///         A deposit has no line (founder 2026-11-05, tool run Finding 1). At a token's $0 it buys in without paying for the token,
+	///         which stays in the fund, so the same deposit repeats: in a $1M fund a $900 holding cost the holders 10% over 122 rounds,
+	///         a $250 one 75% over 3,182. A dead token stops deposits until the manager writes it off, which also takes it off the list.
+	uint256 internal constant MIN_WAITING_SHARE_BPS = 10;
+	uint256 private constant BPS = 10_000;
 
 	/// @dev The fund's fixed wiring.
 	struct Context {
@@ -40,12 +49,22 @@ library FundValuationV6 {
 		address denominationAsset;
 	}
 
+	/// @dev The holdings each wait would rest on, and what they add up to; applied once the fund's whole value is known.
+	struct Waiting {
+		bool[] closed;
+		bool[] longTail;
+		bool unsettled;
+		uint256 closedSize;
+		uint256 longTailSize;
+		uint256 unsettledSize;
+	}
+
 	/// @dev Everything the fund's pricing needs, from one pass over the holdings.
 	struct Valuation {
 		uint256 gav; // every holding at its price: deposits are priced on it, exits paid on it
 		uint256 feeGav; // pool-priced tokens at the lower of value and cost basis
 		bool complete; // every price was read, and none is a closed market's
-		bool unsettled; // a pool-priced holding reads 1 wei, or its pool is draining: a rug, or an LP's own pulls (review 2026-11-01)
+		bool unsettled; // a pool-priced holding reads 1 wei, or its pool is draining: a rug, or an LP's own pulls (review 2026-11-01). At any size for a deposit, from the line up for the queue
 		address[] assets;
 		bool[] inKind; // held, and pool-priced, or its price can't be read or is a closed market's: the instant exit refuses
 	}
@@ -55,6 +74,7 @@ library FundValuationV6 {
 	///      incomplete instead. A balance that can't be read counts as 0 either way. Positions always revert. A closed
 	///      market's price still values the holding (the fund stays readable) but marks the valuation incomplete, so exits
 	///      wait for the market instead of paying at a price everyone knows is old. Deposits don't wait (founder 2026-11-03).
+	///      `tolerant` is the valuation exits run on; the one a deposit prices on isn't, so that's where a draining pool has no line.
 	function value(
 		EnumerableSet.AddressSet storage trackedAssets,
 		EnumerableSet.AddressSet storage externalPositions,
@@ -65,32 +85,11 @@ library FundValuationV6 {
 		v.assets = trackedAssets.values();
 		v.inKind = new bool[](v.assets.length);
 		v.complete = true;
+		Waiting memory waiting;
+		waiting.closed = new bool[](v.assets.length);
+		waiting.longTail = new bool[](v.assets.length);
 		for (uint256 i; i < v.assets.length; ++i) {
-			address asset = v.assets[i];
-			(, uint256 balance) = BalanceRead.tryRead(asset, ctx.vault);
-			if (balance == 0) continue;
-			bool poolPriced = ctx.registrar.poolPricedAdapter(asset) != address(0);
-			v.inKind[i] = poolPriced;
-			try ctx.valueInterpreter.calcCanonicalAssetValue(asset, balance, ctx.denominationAsset) returns (
-				uint256 assetValue
-			) {
-				v.gav += assetValue;
-				v.feeGav += poolPriced ? Math.min(assetValue, costBasis[asset]) : assetValue;
-				(bool closed, bool unsettled) = _priceFlags(ctx, asset);
-				if (closed) {
-					v.inKind[i] = true;
-					v.complete = false;
-				}
-				if (unsettled) v.unsettled = true;
-			} catch (bytes memory reason) {
-				if (!tolerant) {
-					assembly ('memory-safe') {
-						revert(add(reason, 32), mload(reason))
-					}
-				}
-				v.inKind[i] = true;
-				v.complete = false;
-			}
+			_addHolding(v, waiting, i, costBasis, ctx, tolerant);
 		}
 
 		uint256 positionsValue;
@@ -103,13 +102,83 @@ library FundValuationV6 {
 		}
 		v.gav += positionsValue;
 		v.feeGav += positionsValue;
+		_applyWaits(v, waiting, tolerant);
 	}
+
+	/// @dev One tracked token into the valuation.
+	function _addHolding(
+		Valuation memory v,
+		Waiting memory waiting,
+		uint256 i,
+		mapping(address => uint256) storage costBasis,
+		Context memory ctx,
+		bool tolerant
+	) private {
+		address asset = v.assets[i];
+		(, uint256 balance) = BalanceRead.tryRead(asset, ctx.vault);
+		if (balance == 0) return;
+		bool poolPriced = ctx.registrar.poolPricedAdapter(asset) != address(0);
+		try ctx.valueInterpreter.calcCanonicalAssetValue(asset, balance, ctx.denominationAsset) returns (uint256 assetValue) {
+			v.gav += assetValue;
+			v.feeGav += poolPriced ? Math.min(assetValue, costBasis[asset]) : assetValue;
+			// a drained token reads $0, so a long-tail holding also counts at what the fund paid for it
+			_noteWaits(waiting, v, i, ctx, poolPriced, poolPriced ? Math.max(assetValue, costBasis[asset]) : assetValue);
+		} catch (bytes memory reason) {
+			if (!tolerant) {
+				assembly ('memory-safe') {
+					revert(add(reason, 32), mload(reason))
+				}
+			}
+			v.inKind[i] = true;
+			v.complete = false;
+		}
+	}
+
+	/// @dev Which waits this holding would rest on. A vault share has no cost on record and reads next to nothing once its pool
+	///      drains, so its size can't be told: its pool stops the queue at any size too.
+	function _noteWaits(Waiting memory waiting, Valuation memory v, uint256 i, Context memory ctx, bool poolPriced, uint256 size) private view {
+		(bool closed, bool unsettled) = _priceFlags(ctx, v.assets[i]);
+		if (poolPriced) {
+			waiting.longTail[i] = true;
+			waiting.longTailSize += size;
+		}
+		if (closed) {
+			waiting.closed[i] = true;
+			waiting.closedSize += size;
+		}
+		if (unsettled) {
+			if (poolPriced) {
+				waiting.unsettled = true;
+				waiting.unsettledSize += size;
+			} else {
+				v.unsettled = true;
+			}
+		}
+	}
+
+	/// @dev Each exit's wait applies once its holdings add up to the line, so many small holdings can't hide a real one between them.
+	///      A deposit waits on any unsettled pool (see MIN_WAITING_SHARE_BPS).
+	function _applyWaits(Valuation memory v, Waiting memory waiting, bool tolerant) private pure {
+		uint256 line = Math.mulDiv(v.gav, MIN_WAITING_SHARE_BPS, BPS);
+		if (waiting.unsettled && (!tolerant || waiting.unsettledSize >= line)) v.unsettled = true;
+		for (uint256 i; i < v.assets.length; ++i) {
+			bool closed = waiting.closed[i] && waiting.closedSize >= line;
+			if (closed) v.complete = false;
+			if (closed || (waiting.longTail[i] && waiting.longTailSize >= line)) v.inKind[i] = true;
+		}
+	}
+
+	event TrackedAssetRemoved(address indexed asset);
 
 	/// @notice Keep long-tail cost bases in step with a trade: bought pool-priced units add what was spent on them, at
 	///         most their value now; units that left the vault take their share of the basis. Booked at the value alone, a
 	///         buy under a lagging 30-minute price read as an instant gain and paid the manager a fee on it (red-team
 	///         V6FEES-01, 2026-10-27). Returns what left the vault: a deposit's refund was never spent.
+	/// @dev A sold token the trade leaves at exactly 0 in the vault leaves the tracked list, USDC never (founder 2026-11-05,
+	///      Melon v1's auto-prune): the limit counts what a fund holds, and a sold token can't be dusted into a full price read.
+	///      A token moved into a position isn't a sale and stays; trackHeld lists what a position holds before it acts.
 	function followTrade(
+		EnumerableSet.AddressSet storage trackedAssets,
 		mapping(address => uint256) storage costBasis,
 		Context memory ctx,
 		address[] memory spendAssets,
@@ -121,6 +190,7 @@ library FundValuationV6 {
 		for (uint256 i; i < spendAssets.length; ++i) {
 			uint256 left = IERC20(spendAssets[i]).balanceOf(ctx.vault);
 			if (left < spendBefore[i]) spent[i] = spendBefore[i] - left;
+			if (left == 0 && spendAssets[i] != ctx.denominationAsset && trackedAssets.remove(spendAssets[i])) emit TrackedAssetRemoved(spendAssets[i]);
 		}
 		_addBasis(costBasis, ctx, spendAssets, spent, incomingAssets, incomingAmounts);
 		for (uint256 i; i < spendAssets.length; ++i) {

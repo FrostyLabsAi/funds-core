@@ -72,7 +72,7 @@ library ComptrollerV6Lib {
 			if (left < spendBefore[i]) spent[i] = spendBefore[i] - left;
 		}
 		_capLoss(soldValue, FundValuationV6.assetsValue(incoming, received, ctx), soldValue);
-		FundValuationV6.followTrade(costBasis, ctx, spendAssets, spendBefore, incoming, received);
+		FundValuationV6.followTrade(trackedAssets, costBasis, ctx, spendAssets, spendBefore, incoming, received);
 		emit Liquidated(adapter, spendAssets, spent, incoming[0], received[0]);
 	}
 

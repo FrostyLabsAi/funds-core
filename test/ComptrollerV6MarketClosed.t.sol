@@ -654,4 +654,102 @@ contract ComptrollerV6MarketClosedTest is RedemptionFixtureV6 {
 		_closeTheMarket();
 		fund.settleFees();
 	}
+
+	// ─── a holding too small to matter (founder 2026-11-04) ───────────────────
+
+	/// @dev Alice and Bob in for 10,000 each, `value` USDC of it in the stock at $100.
+	function _fundWithStockWorth(uint256 value) internal returns (ComptrollerV6 fund) {
+		fund = ComptrollerV6(factory.createFund(_config(0, 0, 0)));
+		_deposit(fund, alice, 10_000e6);
+		_deposit(fund, bob, 10_000e6);
+		_swap(fund, usdc, stock, value, value * 1e12 / 100);
+	}
+
+	function test_aSmallClosedStockSendsNobodyToTheQueue() public {
+		ComptrollerV6 fund = _fundWithStockWorth(10e6); // 0.05% of 20,000
+		_closeTheMarket();
+		uint256 shares = _sharesOf(fund, bob) / 10;
+		vm.prank(bob);
+		fund.redeemShares(shares);
+		assertApproxEqRel(usdc.balanceOf(bob), 1_000e6, 1e15);
+	}
+
+	function test_aSmallClosedStockDoesntHoldTheQueue() public {
+		ComptrollerV6 fund = _fundWithStockWorth(10e6);
+		_closeTheMarket();
+		_request(fund, bob, _sharesOf(fund, bob));
+		vm.prank(keeper);
+		queue.settle(address(fund), 1);
+		assertApproxEqRel(usdc.balanceOf(bob), 10_000e6, 1e15, 'paid, the small stock at its last price');
+	}
+
+	function test_aClosedStockAtTheLineStillWaits() public {
+		ComptrollerV6 fund = _fundWithStockWorth(20e6); // 0.1% of 20,000
+		_closeTheMarket();
+		uint256 shares = _sharesOf(fund, bob);
+		vm.prank(bob);
+		vm.expectRevert(ComptrollerV6.UseRedemptionQueue.selector);
+		fund.redeemShares(shares);
+		_request(fund, bob, shares);
+		vm.prank(keeper);
+		vm.expectRevert(RedemptionQueueV2.PriceUnreadable.selector);
+		queue.settle(address(fund), 1);
+	}
+
+	/// The griefing case: the fund sold the stock, it stays tracked, and anyone can send it 1 wei over a weekend.
+	function test_aWeiOfAStockSentToTheVaultHoldsNothingUp() public {
+		ComptrollerV6 fund = _stockFund();
+		_swap(fund, stock, usdc, 100e18, 10_000e6);
+		_closeTheMarket();
+		stock.mint(address(fund.vault()), 1);
+
+		uint256 shares = _sharesOf(fund, bob) / 10;
+		vm.prank(bob);
+		fund.redeemShares(shares);
+		assertApproxEqRel(usdc.balanceOf(bob), 1_000e6, 1e15, 'the instant exit still works');
+
+		_request(fund, alice, _sharesOf(fund, alice));
+		vm.prank(keeper);
+		queue.settle(address(fund), 1);
+		assertApproxEqRel(usdc.balanceOf(alice), 10_000e6, 1e15, 'and the queue still pays');
+	}
+
+	/// Twenty tracked tokens can't each sit under the line and hide 2% of the fund: the holdings causing a wait add up.
+	function test_smallClosedStocksAddUp() public {
+		MockERC20 second = new MockERC20('Stock 2', 'TWOc', 18);
+		MockAggregator secondFeed = new MockAggregator(8, 100e8);
+		registrar.execute(abi.encodeCall(ValueInterpreter.addPrimitive, (address(second), address(secondFeed), uint32(5 days))));
+		ComptrollerV6 fund = _fundWithStockWorth(15e6); // 0.075%
+		_swap(fund, usdc, second, 15e6, 15e16); // another 0.075%
+		_closeTheMarket();
+		_request(fund, bob, _sharesOf(fund, bob));
+		vm.prank(keeper);
+		vm.expectRevert(RedemptionQueueV2.PriceUnreadable.selector);
+		queue.settle(address(fund), 1);
+	}
+
+	/// A perp's value is its margin, not its risk: your perp rule stands at any size.
+	function test_aSmallPerpOnAClosedMarketStillHoldsTheQueue() public {
+		(ComptrollerV6 fund, StubPerpAccount account, MockERC20 marker, MockStoreV2 prices) = _perpFund();
+		account.set(address(marker), 1e16, address(0), 0); // $1 in a fund of 20,000
+		uint256 close = block.timestamp;
+		skip(5 hours);
+		_refreshFeeds();
+		_confirm(prices, close);
+		_request(fund, bob, _sharesOf(fund, bob));
+		vm.prank(keeper);
+		vm.expectRevert(RedemptionQueueV2.PriceUnreadable.selector);
+		queue.settle(address(fund), 1);
+	}
+
+	/// A price nobody can read has no size to judge, so the wait stands however small the holding looks.
+	function test_aPriceNobodyCanReadStillWaits() public {
+		ComptrollerV6 fund = _fundWithStockWorth(10e6);
+		skip(5 days + 1);
+		_refreshFeeds();
+		_request(fund, bob, _sharesOf(fund, bob));
+		vm.prank(keeper);
+		vm.expectRevert(RedemptionQueueV2.PriceUnreadable.selector);
+		queue.settle(address(fund), 1);
+	}
 }
