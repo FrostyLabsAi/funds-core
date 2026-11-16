@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
-interface IProfiledComptroller {
-	function fundOwner() external view returns (address);
-}
+import {IComptroller} from '../interfaces/IComptroller.sol';
 
 /// @title FundProfileRegistry
 /// @notice A fund's public links, set by its manager for investors (founder 2026-10-11): website, X, Telegram, Discord,
@@ -23,7 +21,7 @@ contract FundProfileRegistry {
 
 	/// @notice Publish or replace the fund's links (an empty `profile` clears them). Only the fund's owner.
 	function setProfile(address comptroller, string calldata profile) external {
-		if (IProfiledComptroller(comptroller).fundOwner() != msg.sender) revert NotFundOwner();
+		if (IComptroller(comptroller).fundOwner() != msg.sender) revert NotFundOwner();
 		if (bytes(profile).length > MAX_PROFILE_BYTES) revert ProfileTooLong(bytes(profile).length);
 		profileOf[comptroller] = profile;
 		emit ProfileSet(comptroller, profile);

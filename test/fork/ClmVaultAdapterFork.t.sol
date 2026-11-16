@@ -2,67 +2,39 @@
 pragma solidity 0.8.24;
 
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
-import {FundFactory} from '../../src/core/FundFactory.sol';
-import {ComptrollerV6} from '../../src/core/ComptrollerV6.sol';
-import {ValueInterpreter} from '../../src/core/ValueInterpreter.sol';
-import {PoolPriceRegistrar} from '../../src/pricing/PoolPriceRegistrar.sol';
-import {PoolPriceRegistrarV2} from '../../src/pricing/PoolPriceRegistrarV2.sol';
-import {IValueInterpreter} from '../../src/interfaces/IValueInterpreter.sol';
+import {Comptroller} from '../../src/core/Comptroller.sol';
 import {IFrostyClmVault} from '../../src/interfaces/external/IFrostyClm.sol';
 import {ClmVaultAdapter} from '../../src/adapters/ClmVaultAdapter.sol';
 import {ClmVaultPriceFeed} from '../../src/pricing/ClmVaultPriceFeed.sol';
-import {FundV6Deploy} from '../../script/mainnet/FundV6Deploy.sol';
+import {ReleaseFork} from './utils/ReleaseFork.sol';
 import {ClmFixture, MockClmVi} from './utils/ClmFixture.sol';
 
-/// @notice A real v6 fund deposits into and leaves FrostyFi's real CLM vault through ClmVaultAdapter, valued by
-///         ClmVaultPriceFeed in the real VI (Base fork, block 52,385,115: the fund v6 rehearsal's block). Plus a
-///         Slipstream-1 pair with no USDC side, exited to USDC in one action.
-contract ClmVaultAdapterForkTest is ClmFixture {
-	uint256 internal constant FORK_BLOCK = 52_385_115;
-	address internal constant SLIPSTREAM2_SWAP_ADAPTER = 0xB09f3467eE7039bcA58F4b2E778E2bE3C7Cf7C1E;
+/// @notice A fund deposits into and leaves a FrostyFi CLM vault (built from funds-yield's own artifacts) through the
+///         release's ClmVaultAdapter, valued by a ClmVaultPriceFeed on the release's VI (Base fork, block 52,385,115).
+///         Plus a Slipstream-1 pair with no USDC side, exited to USDC in one action.
+contract ClmVaultAdapterForkTest is ReleaseFork, ClmFixture {
 	bool internal ready;
-	address internal deployer;
-	FundFactory internal factory;
-	address internal registrarV2;
-	address internal perpConfig;
-	address internal vi;
 	address internal poolDeployer;
-	FundV6Deploy.Deployed internal d;
 	ClmVaultAdapter internal adapter;
 	ClmVaultPriceFeed internal feed;
 	address internal clmVault;
 	address internal clmStrategy;
-	address internal manager = makeAddr('manager');
-	address internal investor = makeAddr('investor');
-	address internal keeper = makeAddr('keeper');
 
-	function setUp() public virtual {
-		string memory rpc = vm.envOr('BASE_MAINNET_RPC', string(''));
-		if (bytes(rpc).length == 0 || !_clmReady()) return;
-		vm.createSelectFork(rpc, FORK_BLOCK);
+	function _forkBlock() internal pure virtual override returns (uint256) {
+		return 52_385_115;
+	}
+
+	function setUp() public virtual override {
+		if (!_clmReady()) return;
+		super.setUp();
+		if (!forked) return;
 		ready = true;
-		string memory genesis = vm.readFile('deployments/base-mainnet.json');
-		deployer = vm.parseJsonAddress(genesis, '.deployer');
-		factory = FundFactory(vm.parseJsonAddress(genesis, '.factory'));
-		perpConfig = vm.parseJsonAddress(genesis, '.verantaFactory');
-		vi = vm.parseJsonAddress(genesis, '.valueInterpreter');
-		registrarV2 = vm.parseJsonAddress(vm.readFile('deployments/base-mainnet-v4.json'), '.registrar');
-
 		address strategyFactory;
 		(strategyFactory, poolDeployer) = _deployClm(keeper, address(new MockClmVi()));
 		(clmVault, clmStrategy) = _deployCbBtcVault(poolDeployer);
-		feed = new ClmVaultPriceFeed(IValueInterpreter(vi), strategyFactory, registrarV2);
-		adapter = new ClmVaultAdapter(SLIPSTREAM1_ROUTER, SLIPSTREAM2_ROUTER, SLIPSTREAM3_ROUTER);
-
-		vm.startPrank(deployer);
-		d = FundV6Deploy.deploy(deployer, address(factory), registrarV2, perpConfig, keeper);
-		factory.setComptrollerDeployer(d.fundV6Deployer);
-		factory.registerAdapter(address(adapter));
-		// The mainnet VI admin path: registrar V2 → today's registrar → VI.
-		PoolPriceRegistrarV2(registrarV2).callOldRegistrar(
-			abi.encodeCall(PoolPriceRegistrar.execute, (abi.encodeCall(ValueInterpreter.addDerivative, (clmVault, address(feed)))))
-		);
-		vm.stopPrank();
+		feed = new ClmVaultPriceFeed(r.valueInterpreter, strategyFactory, address(r.registrar));
+		adapter = r.adapters.clm;
+		_listDerivative(clmVault, address(feed));
 	}
 
 	/// @dev The exit route for the cbBTC vault: cbBTC → USDC on its own Slipstream-2 pool (ts50).
@@ -72,37 +44,16 @@ contract ClmVaultAdapterForkTest is ClmFixture {
 		return abi.encode(uint8(2), clmVault, shares, uint256(0), USDC, routes);
 	}
 
-	function _fund(uint256 amount) internal returns (ComptrollerV6 fund) {
-		fund = ComptrollerV6(
-			factory.createFund(
-				FundFactory.FundConfig({
-					name: 'CLM fund',
-					symbol: 'frCLM',
-					denominationAsset: IERC20(USDC),
-					fundOwner: manager,
-					mgmtScaledPerSecondRate: 0,
-					perfFeeBps: 0,
-					sharesActionTimelock: 0,
-					minRequestDuration: 1 minutes,
-					executionWindow: 1 days,
-					allowRiskyAssets: false
-				})
-			)
-		);
-		deal(USDC, investor, amount);
-		vm.startPrank(investor);
-		IERC20(USDC).approve(address(fund), amount);
-		fund.requestDeposit(amount, type(uint256).max);
-		vm.stopPrank();
-		vm.warp(block.timestamp + 1 minutes);
-		vm.roll(block.number + 30);
-		fund.executeDepositRequest(investor);
+	function _fund(uint256 amount) internal returns (Comptroller fund) {
+		fund = _fundWithDeposit(amount);
 	}
 
 	/// @dev The manager buys cbBTC with part of the USDC, then deposits both into the CLM vault.
-	function _managerDeposits(ComptrollerV6 fund, uint256 usdcForBtc) internal {
+	function _managerDeposits(Comptroller fund, uint256 usdcForBtc) internal {
 		vm.startPrank(manager);
-		fund.callOnIntegration(SLIPSTREAM2_SWAP_ADAPTER, abi.encode(USDC, CBBTC, int24(50), usdcForBtc, uint256(0)));
+		fund.callOnIntegration(
+			address(r.adapters.slipstream2), abi.encode(USDC, CBBTC, int24(50), usdcForBtc, uint256(0), uint256(0))
+		);
 		_settle(clmStrategy);
 		address v = address(fund.vault());
 		fund.callOnIntegration(
@@ -123,7 +74,7 @@ contract ClmVaultAdapterForkTest is ClmFixture {
 		IFrostyClmVault(clmVault).deposit(IERC20(USDC).balanceOf(address(this)), 0.05e8, 0);
 		_settle(clmStrategy);
 
-		ComptrollerV6 fund = _fund(20_000e6);
+		Comptroller fund = _fund(20_000e6);
 		uint256 gavBefore = fund.calcGav();
 		_managerDeposits(fund, 5_000e6); // ~15k USDC + ~5k of cbBTC: the vault's ratio leaves USDC over
 		address v = address(fund.vault());
@@ -138,7 +89,7 @@ contract ClmVaultAdapterForkTest is ClmFixture {
 
 	function test_withdraw_bringsBothTokensBack() public {
 		vm.skip(!ready);
-		ComptrollerV6 fund = _fund(20_000e6);
+		Comptroller fund = _fund(20_000e6);
 		_managerDeposits(fund, 10_000e6);
 		address v = address(fund.vault());
 		uint256 shares = IFrostyClmVault(clmVault).balanceOf(v);
@@ -152,7 +103,7 @@ contract ClmVaultAdapterForkTest is ClmFixture {
 
 	function test_exit_sellsTheOtherSideIntoUsdc() public {
 		vm.skip(!ready);
-		ComptrollerV6 fund = _fund(20_000e6);
+		Comptroller fund = _fund(20_000e6);
 		_managerDeposits(fund, 10_000e6);
 		address v = address(fund.vault());
 		uint256 btcBefore = IERC20(CBBTC).balanceOf(v);
@@ -196,7 +147,7 @@ contract ClmVaultAdapterForkTest is ClmFixture {
 
 	function test_exit_withAMissingRouteReverts() public {
 		vm.skip(!ready);
-		ComptrollerV6 fund = _fund(20_000e6);
+		Comptroller fund = _fund(20_000e6);
 		_managerDeposits(fund, 10_000e6);
 		uint256 shares = IFrostyClmVault(clmVault).balanceOf(address(fund.vault()));
 		_settle(clmStrategy);

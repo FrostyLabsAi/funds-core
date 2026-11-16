@@ -3,7 +3,7 @@ pragma solidity 0.8.24;
 
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {IPolicy} from '../interfaces/IPolicy.sol';
-import {Comptroller} from '../core/Comptroller.sol';
+import {IComptroller} from '../interfaces/IComptroller.sol';
 
 /// @title MaxPositionsPolicy
 /// @notice After any adapter trade, the fund may hold at most N distinct non-denomination assets.
@@ -21,7 +21,7 @@ contract MaxPositionsPolicy is IPolicy {
 
 	/// @inheritdoc IPolicy
 	function validate(PolicyHook, bytes calldata) external view {
-		Comptroller comptroller = Comptroller(msg.sender);
+		IComptroller comptroller = IComptroller(msg.sender);
 		address denominationAsset = address(comptroller.denominationAsset());
 
 		(address[] memory assets, uint256[] memory balances) = comptroller.getFundHoldings();

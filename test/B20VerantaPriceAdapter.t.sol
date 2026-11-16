@@ -3,10 +3,10 @@ pragma solidity 0.8.24;
 
 import {Test} from 'forge-std/Test.sol';
 import {B20VerantaPriceAdapter} from '../src/pricing/B20VerantaPriceAdapter.sol';
-import {VerantaPriceStoreV2} from '../src/pricing/VerantaPriceStoreV2.sol';
+import {VerantaPriceStore} from '../src/pricing/VerantaPriceStore.sol';
 
-/// @dev Answers only what the adapter reads from the V2 store.
-contract MockStoreV2 {
+/// @dev Answers only what the adapter reads from the store.
+contract MockStore {
 	int64 public price;
 	int16 public exponent;
 	uint64 public confirmedUs;
@@ -40,18 +40,18 @@ contract B20VerantaPriceAdapterTest is Test {
 	uint32 internal constant MAX_FEED_AGE = 432_000;
 	uint256 internal constant MU_MULTIPLIER = 1_000_537_939_576_369_481; // NVDAc's, read on Base 2026-10-25
 
-	MockStoreV2 internal store;
+	MockStore internal store;
 	MockB20 internal token;
 	B20VerantaPriceAdapter internal adapter;
 	uint256 internal now_ = 1_792_972_549; // Sun 2026-10-25 23:55:49 UTC
 
 	function setUp() public {
 		vm.warp(now_);
-		store = new MockStoreV2();
+		store = new MockStore();
 		token = new MockB20();
 		token.setMultiplier(MU_MULTIPLIER);
 		adapter = new B20VerantaPriceAdapter(
-			VerantaPriceStoreV2(address(store)), PAIR, address(token), MAX_PUSH_AGE, MAX_FEED_AGE, 'MUc / USD (Veranta x multiplier)'
+			VerantaPriceStore(address(store)), PAIR, address(token), MAX_PUSH_AGE, MAX_FEED_AGE, 'MUc / USD (Veranta x multiplier)'
 		);
 		// MU 879.92, confirmed now, last traded Friday close (two days earlier)
 		store.set(87_992_000, -5, uint64(now_) * 1e6, uint64(now_ - 172_800) * 1e6);
@@ -116,12 +116,12 @@ contract B20VerantaPriceAdapterTest is Test {
 
 	function test_constructorRefusesZeroes() public {
 		vm.expectRevert(B20VerantaPriceAdapter.ZeroArgument.selector);
-		new B20VerantaPriceAdapter(VerantaPriceStoreV2(address(0)), PAIR, address(token), MAX_PUSH_AGE, MAX_FEED_AGE, '');
+		new B20VerantaPriceAdapter(VerantaPriceStore(address(0)), PAIR, address(token), MAX_PUSH_AGE, MAX_FEED_AGE, '');
 		vm.expectRevert(B20VerantaPriceAdapter.ZeroArgument.selector);
-		new B20VerantaPriceAdapter(VerantaPriceStoreV2(address(store)), PAIR, address(0), MAX_PUSH_AGE, MAX_FEED_AGE, '');
+		new B20VerantaPriceAdapter(VerantaPriceStore(address(store)), PAIR, address(0), MAX_PUSH_AGE, MAX_FEED_AGE, '');
 		vm.expectRevert(B20VerantaPriceAdapter.ZeroArgument.selector);
-		new B20VerantaPriceAdapter(VerantaPriceStoreV2(address(store)), PAIR, address(token), 0, MAX_FEED_AGE, '');
+		new B20VerantaPriceAdapter(VerantaPriceStore(address(store)), PAIR, address(token), 0, MAX_FEED_AGE, '');
 		vm.expectRevert(B20VerantaPriceAdapter.ZeroArgument.selector);
-		new B20VerantaPriceAdapter(VerantaPriceStoreV2(address(store)), PAIR, address(token), MAX_PUSH_AGE, 0, '');
+		new B20VerantaPriceAdapter(VerantaPriceStore(address(store)), PAIR, address(token), MAX_PUSH_AGE, 0, '');
 	}
 }

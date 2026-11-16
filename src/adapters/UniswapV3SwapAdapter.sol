@@ -4,18 +4,21 @@ pragma solidity 0.8.24;
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {SafeERC20} from '@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol';
 import {IIntegrationAdapter} from '../interfaces/IIntegrationAdapter.sol';
+import {ProtocolFeeAdapter} from './ProtocolFeeAdapter.sol';
 import {IUniswapV3SwapRouter} from '../interfaces/external/IUniswapV3SwapRouter.sol';
 
 /// @title UniswapV3SwapAdapter
-/// @notice Single-hop exactIn swaps on Uniswap v3 pools.
+/// @notice Single-hop exactIn swaps on Uniswap v3 pools, with the protocol fee (ProtocolFeeAdapter).
 /// @dev integrationData = abi.encode(tokenIn, tokenOut, fee, amountIn, minAmountOut).
-///      Stateless and holds no funds between calls; output goes directly to the vault.
-contract UniswapV3SwapAdapter is IIntegrationAdapter {
+///      Holds no funds between calls (the fee goes straight to the Treasury); output goes directly to the vault.
+contract UniswapV3SwapAdapter is IIntegrationAdapter, ProtocolFeeAdapter {
 	using SafeERC20 for IERC20;
 
 	IUniswapV3SwapRouter public immutable router;
 
-	constructor(IUniswapV3SwapRouter router_) {
+	constructor(IUniswapV3SwapRouter router_, address treasury_, uint16 feeBps_, address owner_)
+		ProtocolFeeAdapter(treasury_, feeBps_, owner_)
+	{
 		router = router_;
 	}
 
@@ -48,6 +51,7 @@ contract UniswapV3SwapAdapter is IIntegrationAdapter {
 		(address tokenIn, address tokenOut, uint24 fee, uint256 amountIn, uint256 minAmountOut) =
 			abi.decode(integrationData, (address, address, uint24, uint256, uint256));
 
+		amountIn = _takeFee(tokenIn, amountIn);
 		IERC20(tokenIn).forceApprove(address(router), amountIn);
 		router.exactInputSingle(
 			IUniswapV3SwapRouter.ExactInputSingleParams({

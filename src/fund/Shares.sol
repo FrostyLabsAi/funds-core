@@ -2,15 +2,13 @@
 pragma solidity 0.8.24;
 
 import {ERC20} from '@openzeppelin/contracts/token/ERC20/ERC20.sol';
-
-interface ISharesTransferValidator {
-	function validateSharesTransfer(address from, address to, uint256 amount) external;
-}
+import {IShares} from '../interfaces/IShares.sol';
+import {ISharesTransferValidator} from '../interfaces/ISharesTransferValidator.sol';
 
 /// @title Shares
 /// @notice Fund share token (18 decimals). Only the fund's Comptroller mints and burns;
 ///         transfers are validated by it (sharesActionTimelock + PreTransferShares policies).
-contract Shares is ERC20 {
+contract Shares is ERC20, IShares {
 	address public immutable factory;
 	address public comptroller;
 

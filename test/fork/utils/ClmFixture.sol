@@ -4,6 +4,7 @@ pragma solidity 0.8.24;
 import {Test} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {TickMath} from '../../../src/libraries/TickMath.sol';
+import {ForkTokens} from './ForkTokens.sol';
 
 /// @dev funds-yield's ClmPoolDeployer.PoolConfig (plan 1b), same field order.
 struct ClmPoolConfig {
@@ -70,14 +71,12 @@ contract MockClmVi {
 /// @notice Deploys FrostyFi's real CLM contracts (funds-yield, compiled to ../funds-yield/out) on a Base fork, over the
 ///         USDC/cbBTC Slipstream-2 pool: USDC is token0 as in the stock pools, and cbBTC, unlike stock tokens (B20),
 ///         runs on a fork. Addresses read 2026-10-11/13 with `cast`.
-abstract contract ClmFixture is Test {
+abstract contract ClmFixture is Test, ForkTokens {
 	string internal constant OUT = '../funds-yield/out/';
-	address internal constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
 	address internal constant CBBTC = 0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf;
 	address internal constant AERO = 0x940181a94A35A4569E4529A3CDfB74e38FD98631;
 	address internal constant CLM_POOL = 0x160D7E9d948B16c163332a277b393c288408eb12; // USDC/cbBTC ts50, Slipstream-2
 	address internal constant CLM_GAUGE = 0x7B0f1103746648FBfce9222f1266f79B934E16b2;
-	address internal constant WETH = 0x4200000000000000000000000000000000000006;
 	address internal constant CBLTC = 0xcb17C9Db87B595717C857a08468793f5bAb6445F;
 	address internal constant S1_POOL_WETH_CBLTC = 0x200681425b0C8D78C6a467512C5D49FA56BaC88A; // ts200, no USDC side
 	address internal constant S1_GAUGE_WETH_CBLTC = 0x88040de1F5811090b638Fa70633B24a3e319D06f;

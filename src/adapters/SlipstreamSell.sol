@@ -3,7 +3,7 @@ pragma solidity 0.8.24;
 
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {SafeERC20} from '@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol';
-import {ISlipstreamMultiHopRouter} from './ClmVaultAdapter.sol';
+import {ISlipstreamSwapRouter} from '../interfaces/external/ISlipstreamSwapRouter.sol';
 
 /// @title SlipstreamSell
 /// @notice The keeper exit adapters' Slipstream sale (review 2026-10-14): a path's shape, and a sale of the seller's whole
@@ -44,8 +44,8 @@ library SlipstreamSell {
 			routerHeld[i] = IERC20(_tokenAt(path, i * HOP_SIZE)).balanceOf(router);
 		}
 		IERC20(tokenIn).forceApprove(router, amountIn);
-		ISlipstreamMultiHopRouter(router).exactInput(
-			ISlipstreamMultiHopRouter.ExactInputParams({
+		ISlipstreamSwapRouter(router).exactInput(
+			ISlipstreamSwapRouter.ExactInputParams({
 				path: path, recipient: recipient, deadline: block.timestamp, amountIn: amountIn, amountOutMinimum: 0
 			})
 		);

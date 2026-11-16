@@ -18,4 +18,13 @@ interface IValueInterpreter {
 
 	/// @notice Side-pocket asset: holdable but valued at zero until sold; only allowRiskyAssets funds may hold it.
 	function isZeroPricedAsset(address asset) external view returns (bool);
+
+	/// @notice The band a primitive's feed answer must sit in (both zero: none).
+	function answerBounds(address asset) external view returns (int256 min, int256 max);
+
+	/// @notice A primitive's feed and decimals; a non-zero aggregator means a priced primitive.
+	function getAssetInfo(address asset)
+		external
+		view
+		returns (address aggregator, uint32 heartbeat, uint8 assetDecimals, uint8 rateDecimals);
 }

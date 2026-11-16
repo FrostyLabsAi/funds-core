@@ -3,9 +3,9 @@ pragma solidity 0.8.24;
 
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {FundFactory} from '../../src/core/FundFactory.sol';
-import {SharesVaultDeployer} from '../../src/core/FundComponentDeployers.sol';
-import {ComptrollerV6 as Comptroller} from '../../src/core/ComptrollerV6.sol';
-import {V6Host} from '../utils/V6Host.sol';
+import {SharesVaultDeployer} from '../../src/core/SharesVaultDeployer.sol';
+import {Comptroller} from '../../src/core/Comptroller.sol';
+import {FundHost} from '../utils/FundHost.sol';
 import {ValueInterpreter} from '../../src/core/ValueInterpreter.sol';
 import {MockERC20, MockAggregator} from '../utils/Mocks.sol';
 
@@ -30,7 +30,7 @@ contract EchidnaFund {
 		usdcFeed = new MockAggregator(8, 1e8);
 		interpreter.addPrimitive(address(usdc), address(usdcFeed), 7 days);
 
-		factory = new FundFactory(interpreter, V6Host.deployer(), new SharesVaultDeployer());
+		factory = new FundFactory(interpreter, FundHost.deployer(), new SharesVaultDeployer());
 		comptroller = Comptroller(
 			factory.createFund(
 				FundFactory.FundConfig({

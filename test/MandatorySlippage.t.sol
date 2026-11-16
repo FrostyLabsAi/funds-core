@@ -2,7 +2,7 @@
 pragma solidity 0.8.24;
 
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
-import {ComptrollerV6} from '../src/core/ComptrollerV6.sol';
+import {Comptroller} from '../src/core/Comptroller.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
 import {IPolicy} from '../src/interfaces/IPolicy.sol';
 import {IUniswapV3SwapRouter} from '../src/interfaces/external/IUniswapV3SwapRouter.sol';
@@ -10,7 +10,8 @@ import {UniswapV3SwapAdapter} from '../src/adapters/UniswapV3SwapAdapter.sol';
 import {CumulativeSlippageTolerancePolicy} from '../src/policies/CumulativeSlippageTolerancePolicy.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {MockERC20, MockAggregator} from './utils/Mocks.sol';
-import {RedemptionFixtureV6} from './utils/RedemptionFixtureV6.sol';
+import {RedemptionFixture} from './utils/RedemptionFixture.sol';
+import {MockSaleTaxAdapter} from './utils/MockSaleTaxAdapter.sol';
 
 /// @notice A venue that pays a set amount out of the manager's own inventory, so the fund's loss is the manager's gain.
 contract ManagerRouter {
@@ -61,7 +62,7 @@ contract RefundingAdapter {
 /// @dev Before this a manager could trade a fund's value away to themselves in one transaction: no mandatory policy bound a
 ///      trade's price, and `minIncomingAmounts` is the manager's own. The factory attaches the policy to every new fund,
 ///      as WindowedPricing.switchNewFunds lists it.
-contract MandatorySlippageTest is RedemptionFixtureV6 {
+contract MandatorySlippageTest is RedemptionFixture {
 	uint256 internal constant TOLERANCE_BPS = 500;
 	CumulativeSlippageTolerancePolicy internal slippage;
 	ManagerRouter internal managerVenue;
@@ -75,28 +76,28 @@ contract MandatorySlippageTest is RedemptionFixtureV6 {
 		regs[1] = FundFactory.PolicyReg({hook: IPolicy.PolicyHook.PostCallOnExternalPosition, policy: address(slippage)});
 		factory.setMandatoryPolicies(regs);
 		managerVenue = new ManagerRouter(manager);
-		adapter = new UniswapV3SwapAdapter(IUniswapV3SwapRouter(address(managerVenue)));
+		adapter = new UniswapV3SwapAdapter(IUniswapV3SwapRouter(address(managerVenue)), address(0xFEE), 0, address(this));
 		factory.registerAdapter(address(adapter));
 		deal(address(weth), manager, 1_000e18);
 		vm.prank(manager);
 		weth.approve(address(managerVenue), type(uint256).max);
 	}
 
-	function _plainFund() internal returns (ComptrollerV6 fund) {
+	function _plainFund() internal returns (Comptroller fund) {
 		// no ruleset of its own: the manager opted into nothing
-		fund = ComptrollerV6(factory.createFund(_config(0, 0, 0)));
+		fund = Comptroller(factory.createFund(_config(0, 0, 0)));
 		_deposit(fund, alice, 10_000e6);
 	}
 
 	/// @dev Buys WETH ($2,000) with `usdcIn` USDC, getting `lossUsdc` less than it's worth.
-	function _lossyBuy(ComptrollerV6 fund, uint256 usdcIn, uint256 lossUsdc) internal {
+	function _lossyBuy(Comptroller fund, uint256 usdcIn, uint256 lossUsdc) internal {
 		managerVenue.setNextAmountOut((usdcIn - lossUsdc) * 5e8);
 		vm.prank(manager);
 		fund.callOnIntegration(address(adapter), abi.encode(address(usdc), address(weth), uint24(10_000), usdcIn, uint256(0)));
 	}
 
 	function test_aNewFundCarriesThePolicyWithoutOptingIn() public {
-		ComptrollerV6 fund = _plainFund();
+		Comptroller fund = _plainFund();
 		address[] memory onTrades = fund.getPolicies(IPolicy.PolicyHook.PostCallOnIntegration);
 		bool found;
 		for (uint256 i; i < onTrades.length; ++i) {
@@ -107,7 +108,7 @@ contract MandatorySlippageTest is RedemptionFixtureV6 {
 
 	/// The drain: the whole fund for almost nothing, in one transaction.
 	function test_tradingTheFundAwayInOneTransactionIsRefused() public {
-		ComptrollerV6 fund = _plainFund();
+		Comptroller fund = _plainFund();
 		managerVenue.setNextAmountOut(1);
 		vm.prank(manager);
 		vm.expectRevert();
@@ -117,7 +118,7 @@ contract MandatorySlippageTest is RedemptionFixtureV6 {
 
 	/// Just over the budget in one trade is refused; a normal fill's cost passes.
 	function test_theBudgetIsFivePercentOfTheFund() public {
-		ComptrollerV6 fund = _plainFund();
+		Comptroller fund = _plainFund();
 		managerVenue.setNextAmountOut((1_000e6 - 510e6) * 5e8);
 		vm.prank(manager);
 		vm.expectRevert(abi.encodeWithSelector(CumulativeSlippageTolerancePolicy.CumulativeSlippageExceeded.selector, 510, TOLERANCE_BPS));
@@ -128,9 +129,30 @@ contract MandatorySlippageTest is RedemptionFixtureV6 {
 		assertEq(accrued, 3);
 	}
 
+	/// A recorded sale tax is for the keeper only: through an adapter reporting the 5% maximum, the manager's trade is
+	/// charged and refused exactly as through the plain one (founder 2026-11-15: a tax still counts in the budget).
+	function test_aRecordedSaleTaxLeavesTheManagersBudgetAlone() public {
+		Comptroller fund = _plainFund();
+		MockSaleTaxAdapter taxed = new MockSaleTaxAdapter(IUniswapV3SwapRouter(address(managerVenue)));
+		taxed.setTax(500);
+		factory.registerAdapter(address(taxed));
+		bytes memory buy = abi.encode(address(usdc), address(weth), uint24(10_000), uint256(1_000e6), uint256(0));
+
+		managerVenue.setNextAmountOut((1_000e6 - 510e6) * 5e8);
+		vm.prank(manager);
+		vm.expectRevert(abi.encodeWithSelector(CumulativeSlippageTolerancePolicy.CumulativeSlippageExceeded.selector, 510, TOLERANCE_BPS));
+		fund.callOnIntegration(address(taxed), buy);
+
+		managerVenue.setNextAmountOut((1_000e6 - 3e6) * 5e8);
+		vm.prank(manager);
+		fund.callOnIntegration(address(taxed), buy);
+		(uint128 accrued,) = slippage.slippageStates(address(fund));
+		assertEq(accrued, 3, 'the same 3 bps the plain adapter is charged');
+	}
+
 	/// Many small losses share the budget, and it refills over the week.
 	function test_smallLossesShareTheBudget_andItRefills() public {
-		ComptrollerV6 fund = _plainFund();
+		Comptroller fund = _plainFund();
 		for (uint256 i; i < 4; ++i) {
 			_lossyBuy(fund, 500e6, 100e6); // about 1% each
 		}
@@ -146,7 +168,7 @@ contract MandatorySlippageTest is RedemptionFixtureV6 {
 
 	/// The policy never holds the keeper: a liquidation has its own 3% cap.
 	function test_theKeepersLiquidationIsNotHeldByThePolicy() public {
-		ComptrollerV6 fund = _plainFund();
+		Comptroller fund = _plainFund();
 		_swap(fund, usdc, weth, 2_000e6, 1e18);
 		_request(fund, alice, _sharesOf(fund, alice));
 		skip(5 days);
@@ -159,7 +181,7 @@ contract MandatorySlippageTest is RedemptionFixtureV6 {
 
 	/// A deposit's refund is no loss: the policy reads what left the vault, not what was stated (review 2026-11-01, Medium 4).
 	function test_aRefundIsNoLoss() public {
-		ComptrollerV6 fund = _plainFund();
+		Comptroller fund = _plainFund();
 		RefundingAdapter refunding = new RefundingAdapter();
 		factory.registerAdapter(address(refunding));
 		// stated 3,000, refunded 2,000: 1,000 spent, for 1,000 of WETH
@@ -172,7 +194,7 @@ contract MandatorySlippageTest is RedemptionFixtureV6 {
 	/// A price elsewhere in the fund going stale (a Veranta stock's 2-minute store) doesn't stop a plain swap: without GAV the
 	/// loss is charged against the trade itself, which can only overstate it (review 2026-11-01, Medium 5).
 	function test_aStaleHoldingElsewhereDoesNotStopASwap_andChargesAgainstTheTrade() public {
-		ComptrollerV6 fund = _plainFund();
+		Comptroller fund = _plainFund();
 		MockERC20 stock = new MockERC20('Stock', 'STK', 18);
 		registrar.execute(abi.encodeCall(ValueInterpreter.addPrimitive, (address(stock), address(new MockAggregator(8, 100e8)), uint32(2 minutes))));
 		_swap(fund, usdc, stock, 1_000e6, 10e18);
@@ -188,7 +210,7 @@ contract MandatorySlippageTest is RedemptionFixtureV6 {
 
 	/// Where GAV reads, the loss is charged against the fund, as before.
 	function test_aFreshFundChargesAgainstItsValue() public {
-		ComptrollerV6 fund = _plainFund();
+		Comptroller fund = _plainFund();
 		_swap(fund, usdc, weth, 1_000e6, 0.495e18); // a 10 loss of a 10,000 fund: 10 bps
 		(uint256 accrued,) = slippage.slippageStates(address(fund));
 		assertEq(accrued, 10);

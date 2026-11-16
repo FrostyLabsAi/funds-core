@@ -3,7 +3,7 @@ pragma solidity 0.8.24;
 
 import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
 import {IPolicy} from '../interfaces/IPolicy.sol';
-import {Comptroller} from '../core/Comptroller.sol';
+import {IComptroller} from '../interfaces/IComptroller.sol';
 import {IValueInterpreter} from '../interfaces/IValueInterpreter.sol';
 
 /// @title CumulativeSlippageTolerancePolicy
@@ -50,7 +50,7 @@ contract CumulativeSlippageTolerancePolicy is IPolicy {
 			(, address[] memory spendAssets, uint256[] memory spendAmounts, address[] memory incomingAssets, uint256[] memory incomingAmounts)
 			= abi.decode(validationData, (address, address[], uint256[], address[], uint256[]));
 
-			Comptroller trader = Comptroller(msg.sender);
+			IComptroller trader = IComptroller(msg.sender);
 			IValueInterpreter interpreter = trader.valueInterpreter();
 			address denominationAsset = address(trader.denominationAsset());
 
@@ -91,7 +91,7 @@ contract CumulativeSlippageTolerancePolicy is IPolicy {
 	///      2-minute store, an open perp) must not stop a plain swap (review 2026-11-01, Medium 5): without GAV the loss is charged
 	///      against the trade's own value, which can only overstate it.
 	function _preActionValue(uint256 loss, uint256 spendValue) private returns (uint256) {
-		try Comptroller(msg.sender).calcGav() returns (uint256 gav) {
+		try IComptroller(msg.sender).calcGav() returns (uint256 gav) {
 			return gav + loss;
 		} catch {
 			return spendValue > loss ? spendValue : loss;

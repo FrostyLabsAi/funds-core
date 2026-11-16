@@ -8,7 +8,7 @@ import {SlipstreamSell} from './SlipstreamSell.sol';
 /// @title ERC4626ExitAdapter
 /// @notice The v6 keeper's exit from any ERC-4626 vault share (founder 2026-10-14): redeems, then sells the underlying
 ///         into `outToken` along one Slipstream route. One asset comes back, the shape a v6 liquidation sale needs
-///         (ComptrollerV6Lib._checkSale), with its 3% oracle cap on the whole exit. ERC4626Adapter's plain redeem returns
+///         (ComptrollerLib._checkSale), with its 3% oracle cap on the whole exit. ERC4626Adapter's plain redeem returns
 ///         the underlying, which isn't a sale unless the underlying is the denomination.
 /// @dev integrationData = abi.encode(vault4626, shares, minOut, outToken, Route[] routes):
 ///      - underlying == outToken: no route; the redeem pays the fund's Vault directly.

@@ -9,8 +9,6 @@ import {Comptroller} from '../../src/core/Comptroller.sol';
 ///         0xef, which reverts here. This stand-in answers ONLY what the test loaded from the real
 ///         chain (eth_call through `vm.rpc` at the fork block) and reverts for any other holder, so
 ///         no value is invented. Used for ALPHA's tokenized-stock holdings at live head.
-/// @dev Moved here from CompoundersMainnetFork (retired 2026-10-04) for V2SwapAdaptersFork, whose
-///      live fund ALPHA holds METAc / MSTRc.
 contract B20ChainSnapshot {
 	uint8 public decimals;
 	mapping(address => uint256) internal balances;
@@ -38,17 +36,24 @@ contract B20ChainSnapshot {
 ///         starts with the real decimals and the real balances of the holders a test names (B20Mirror._standIn), so a
 ///         pool keeps its real reserves and everything around the token runs as live code. The token's own transfer
 ///         rules (Base's Policy Registry) it can't stand in for: B20Mirror._b20Allows reads them from Base.
+///         `multiplier` is the real token's too, for a stock priced through B20VerantaPriceAdapter (funds-keeper
+///         test/fork/release-rehearsal.test.ts, 2026-11-16); declared last, so the earlier fields keep their slots.
 contract B20StandIn {
 	uint8 public decimals;
 	uint256 public totalSupply;
 	mapping(address => uint256) public balanceOf;
 	mapping(address => mapping(address => uint256)) public allowance;
+	uint256 public multiplier;
 
 	event Transfer(address indexed from, address indexed to, uint256 value);
 	event Approval(address indexed owner, address indexed spender, uint256 value);
 
 	function setDecimals(uint8 decimals_) external {
 		decimals = decimals_;
+	}
+
+	function setMultiplier(uint256 multiplier_) external {
+		multiplier = multiplier_;
 	}
 
 	function mint(address to, uint256 amount) external {

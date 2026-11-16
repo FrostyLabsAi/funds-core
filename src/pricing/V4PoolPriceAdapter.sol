@@ -4,16 +4,16 @@ pragma solidity 0.8.24;
 import {Clones} from '@openzeppelin/contracts/proxy/Clones.sol';
 import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
 import {IPoolPriceAdapter} from '../interfaces/IPoolPriceAdapter.sol';
+import {IV4PoolPriceAdapter} from '../interfaces/IV4PoolPriceAdapter.sol';
 import {IPoolWatch} from '../interfaces/IPoolWatch.sol';
-import {V4PriceSampler} from './V4PriceSampler.sol';
-import {IV4StateView} from '../interfaces/external/IUniswapV4.sol';
+import {IV4PriceSampler} from '../interfaces/IV4PriceSampler.sol';
 import {TickMath} from '../libraries/TickMath.sol';
 import {PoolPriceMath} from '../libraries/PoolPriceMath.sol';
 
 /// @title V4PoolPriceAdapter
 /// @notice Prices one asset from its Uniswap v4 pool, which keeps no price history: the median of the
 ///         V4PriceSampler readings from the last hour (at least four), times the ValueInterpreter's USD price of
-///         the pool's other token (WETH for a native-ETH pool). One minimal clone per asset (PoolPriceRegistrarV2);
+///         the pool's other token (WETH for a native-ETH pool). One minimal clone per asset (PoolPriceRegistrar);
 ///         its clone args are abi.encode(Config, V4Extra) (spec 2026-10-08 §4.2).
 /// @dev - Under four readings in the window both the price and the liquidity revert NoPriceHistory: a new
 ///        registration warms up before anyone can buy (the buy-floor policy reads liquidityUsd), and a stopped
@@ -30,7 +30,7 @@ import {PoolPriceMath} from '../libraries/PoolPriceMath.sol';
 ///        stays as deployed for today's adapters).
 ///      - Two readings pumped out of six don't move the median; moving it takes holding the price through at
 ///        least half the readings, ≈ 30 minutes at the keeper's 10-minute cadence.
-contract V4PoolPriceAdapter is IPoolPriceAdapter, IPoolWatch {
+contract V4PoolPriceAdapter is IV4PoolPriceAdapter, IPoolWatch {
 	uint32 public constant SAMPLE_WINDOW = 1 hours;
 	uint256 public constant MIN_SAMPLES = 4;
 	/// @notice Whole USD of sampled pool liquidity under which the asset is valued at ≈ $0 (PoolPriceAdapterBase's).
@@ -40,18 +40,12 @@ contract V4PoolPriceAdapter is IPoolPriceAdapter, IPoolWatch {
 	/// @notice Fewer than MIN_SAMPLES readings within SAMPLE_WINDOW (a new registration warming up, or a stopped keeper).
 	error NoPriceHistory();
 
-	struct V4Extra {
-		V4PriceSampler sampler;
-		IV4StateView stateView;
-		bytes32 poolId;
-	}
-
 	/// @inheritdoc IPoolPriceAdapter
 	function config() public view returns (Config memory c) {
 		(c,) = abi.decode(Clones.fetchCloneArgs(address(this)), (Config, V4Extra));
 	}
 
-	/// @notice The v4 half of the clone args.
+	/// @inheritdoc IV4PoolPriceAdapter
 	function v4Extra() public view returns (V4Extra memory e) {
 		(, e) = abi.decode(Clones.fetchCloneArgs(address(this)), (Config, V4Extra));
 	}
@@ -112,7 +106,7 @@ contract V4PoolPriceAdapter is IPoolPriceAdapter, IPoolWatch {
 	/// @dev Median tick (an even count averages the two middles, rounded toward −∞ like Uniswap's mean tick) and
 	///      median in-range liquidity (the lower middle) of the readings taken within SAMPLE_WINDOW.
 	function _window(V4Extra memory e) internal view returns (int24 medianTick, uint128 medianLiquidity) {
-		V4PriceSampler.Sample[] memory all = e.sampler.samples(e.poolId);
+		IV4PriceSampler.Sample[] memory all = e.sampler.samples(e.poolId);
 		uint256 cutoff = block.timestamp > SAMPLE_WINDOW ? block.timestamp - SAMPLE_WINDOW : 0;
 		int24[] memory ticks = new int24[](all.length);
 		uint128[] memory liquidities = new uint128[](all.length);

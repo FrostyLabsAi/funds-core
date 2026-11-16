@@ -10,17 +10,20 @@ import {ISlipstreamSwapRouter} from '../interfaces/external/ISlipstreamSwapRoute
 import {IAerodromeRouter} from '../interfaces/external/IAerodromeRouter.sol';
 
 /// @title ViaWethSellAdapter
-/// @notice The v6 keeper's sale of a feed-priced token whose liquidity is against WETH, not USDC (founder 2026-10-14;
+/// @notice The keeper's sale of a feed-priced token whose liquidity is against WETH, not USDC (founder 2026-10-14;
 ///         the exit audit found cbETH with $1.5k of USDC on its deepest USDC pool and $2.09M of WETH on its WETH pool,
 ///         and WELL, LINK, DEGEN, ZRO alike): token → WETH → `outToken` in one action, each hop on one pool of Uniswap
-///         v3, Slipstream-1/2/3 or Aerodrome basic (volatile). A feed-priced token can't be sold into WETH first
-///         (ComptrollerV6Lib._checkSale: NotASale), so both hops go in one call, and one asset comes back, under the 3%
-///         oracle cap on the whole sale.
+///         v3, Slipstream-1/2/3, Aerodrome basic (volatile) or Aero. A feed-priced token can't be sold into WETH first
+///         (ComptrollerLib._checkSale: NotASale), so both hops go in one call, and one asset comes back, under the 3%
+///         oracle cap on the whole sale. Aero (venue 5, FrostyFi 2026-10-25): since the Aerodrome/Velodrome merger on
+///         2026-10-22 most WETH-side liquidity is in Aero's Slipstream pools (cbETH/WETH: 756 WETH on Aero's
+///         tick-spacing-1 pool, cast 2026-10-25); Aero's SwapRouter takes the Slipstream exactInputSingle params unchanged
+///         (metadex-slipstream-public ISwapRouter).
 /// @dev integrationData = abi.encode(token, amount, minOut, outToken, Hop toWeth, Hop fromWeth), Hop = (venue, param):
-///      param is the Uniswap v3 fee, the Slipstream tick spacing, or 0 for Aerodrome's volatile pool. Each hop sells
-///      this adapter's whole balance of its input on one pool; a pool out of liquidity fills part and leaves the rest
-///      here, so a hop reverts Unsold unless all of its input went. The first hop pays this adapter, the second the
-///      fund's Vault. The protocol fee (ProtocolFeeAdapter: `feeBps` of the input to the Treasury, as the V2 spot
+///      param is the Uniswap v3 fee, the Slipstream or Aero tick spacing, or 0 for Aerodrome's volatile pool. Each hop
+///      sells this adapter's whole balance of its input on one pool; a pool out of liquidity fills part and leaves the
+///      rest here, so a hop reverts Unsold unless all of its input went. The first hop pays this adapter, the second the
+///      fund's Vault. The protocol fee (ProtocolFeeAdapter: `feeBps` of the input to the Treasury, as the spot
 ///      adapters) is taken once per sale, before the first hop (founder 2026-10-14: registered on the shared factory, a
 ///      fee-free two-hop swap would let any manager skip the fee). Minimums are the Comptroller's to check (vault
 ///      balance deltas); the swaps take none of their own. It never holds tokens after a call.
@@ -32,7 +35,8 @@ contract ViaWethSellAdapter is IIntegrationAdapter, ProtocolFeeAdapter {
 		Slipstream1,
 		Slipstream2,
 		Slipstream3,
-		AerodromeBasic
+		AerodromeBasic,
+		Aero
 	}
 
 	struct Hop {
@@ -50,6 +54,8 @@ contract ViaWethSellAdapter is IIntegrationAdapter, ProtocolFeeAdapter {
 	/// @notice The Aerodrome Router (Base 0xcF77…4E43) and its default basic pool factory (0x420D…40Da).
 	address public immutable aerodromeRouter;
 	address public immutable aerodromePoolFactory;
+	/// @notice Aero's Slipstream SwapRouter (Base 0x9Ee3…D418; factory() = Aero's CL factory 0x9CB2…7a76).
+	address public immutable aeroRouter;
 
 	error BadSale();
 	error BadHop();
@@ -63,6 +69,7 @@ contract ViaWethSellAdapter is IIntegrationAdapter, ProtocolFeeAdapter {
 		address slipstream3Router_,
 		address aerodromeRouter_,
 		address aerodromePoolFactory_,
+		address aeroRouter_,
 		address treasury_,
 		uint16 feeBps_,
 		address owner_
@@ -70,7 +77,7 @@ contract ViaWethSellAdapter is IIntegrationAdapter, ProtocolFeeAdapter {
 		if (
 			weth_ == address(0) || uniswapV3Router_ == address(0) || slipstream1Router_ == address(0)
 				|| slipstream2Router_ == address(0) || slipstream3Router_ == address(0) || aerodromeRouter_ == address(0)
-				|| aerodromePoolFactory_ == address(0)
+				|| aerodromePoolFactory_ == address(0) || aeroRouter_ == address(0)
 		) revert ZeroAddress();
 		weth = weth_;
 		uniswapV3Router = uniswapV3Router_;
@@ -79,6 +86,7 @@ contract ViaWethSellAdapter is IIntegrationAdapter, ProtocolFeeAdapter {
 		slipstream3Router = slipstream3Router_;
 		aerodromeRouter = aerodromeRouter_;
 		aerodromePoolFactory = aerodromePoolFactory_;
+		aeroRouter = aeroRouter_;
 	}
 
 	/// @inheritdoc IIntegrationAdapter
@@ -135,9 +143,7 @@ contract ViaWethSellAdapter is IIntegrationAdapter, ProtocolFeeAdapter {
 				amountIn, 0, routes, recipient, block.timestamp
 			);
 		} else {
-			address router = hop.venue == Venue.Slipstream1
-				? slipstream1Router
-				: hop.venue == Venue.Slipstream2 ? slipstream2Router : slipstream3Router;
+			address router = _clRouter(hop.venue);
 			IERC20(tokenIn).forceApprove(router, amountIn);
 			ISlipstreamSwapRouter(router).exactInputSingle(
 				ISlipstreamSwapRouter.ExactInputSingleParams({
@@ -153,6 +159,14 @@ contract ViaWethSellAdapter is IIntegrationAdapter, ProtocolFeeAdapter {
 			);
 		}
 		if (IERC20(tokenIn).balanceOf(address(this)) != 0) revert Unsold(tokenIn);
+	}
+
+	/// @dev The SwapRouter of a Slipstream-shaped venue: Slipstream-1/2/3 or Aero.
+	function _clRouter(Venue venue) private view returns (address) {
+		if (venue == Venue.Slipstream1) return slipstream1Router;
+		if (venue == Venue.Slipstream2) return slipstream2Router;
+		if (venue == Venue.Slipstream3) return slipstream3Router;
+		return aeroRouter;
 	}
 
 	function _one(address asset) private pure returns (address[] memory assets) {

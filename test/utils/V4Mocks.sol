@@ -110,9 +110,14 @@ contract MockHookRegistrar {
 	mapping(address => bool) public approved;
 	mapping(address => bytes) internal data;
 	mapping(bytes32 => bool) public isPoolApproved;
+	mapping(bytes32 => uint16) public poolSaleTaxBps;
 
 	function setPoolApproved(bytes32 poolId, bool ok) external {
 		isPoolApproved[poolId] = ok;
+	}
+
+	function setPoolSaleTax(bytes32 poolId, uint16 taxBps) external {
+		poolSaleTaxBps[poolId] = taxBps;
 	}
 
 	function setHook(address hook, bool ok, bytes calldata hookData) external {

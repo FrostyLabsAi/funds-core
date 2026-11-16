@@ -4,7 +4,7 @@ pragma solidity 0.8.24;
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
 import {IPolicy} from '../interfaces/IPolicy.sol';
-import {Comptroller} from '../core/Comptroller.sol';
+import {IComptroller} from '../interfaces/IComptroller.sol';
 
 /// @title MaxConcentrationPolicy
 /// @notice After any adapter trade, no single non-denomination asset may exceed a fixed share of GAV.
@@ -27,7 +27,7 @@ contract MaxConcentrationPolicy is IPolicy {
 		(,,, address[] memory incomingAssets,) =
 			abi.decode(validationData, (address, address[], uint256[], address[], uint256[]));
 
-		Comptroller comptroller = Comptroller(msg.sender);
+		IComptroller comptroller = IComptroller(msg.sender);
 		address denominationAsset = address(comptroller.denominationAsset());
 		uint256 gav = comptroller.calcGav();
 		if (gav == 0) return;

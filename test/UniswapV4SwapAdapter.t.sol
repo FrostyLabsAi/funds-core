@@ -3,12 +3,12 @@ pragma solidity 0.8.24;
 
 import {Test} from 'forge-std/Test.sol';
 import {UniswapV4SwapAdapter} from '../src/adapters/UniswapV4SwapAdapter.sol';
-import {PoolPriceRegistrarV2} from '../src/pricing/PoolPriceRegistrarV2.sol';
+import {IPoolPriceRegistrar} from '../src/interfaces/IPoolPriceRegistrar.sol';
 import {IV4PoolManager, PoolKey, PoolKeyId} from '../src/interfaces/external/IUniswapV4.sol';
 import {MockERC20} from './utils/Mocks.sol';
 import {MockV4PoolManager, MockHookRegistrar, MockWETH} from './utils/V4Mocks.sol';
 
-/// @dev A fund stand-in: answers `registrar()` and calls the adapter the way ComptrollerV3.callOnIntegration does.
+/// @dev A fund stand-in: answers `registrar()` and calls the adapter the way Comptroller.callOnIntegration does.
 contract FakeFund {
 	address public registrar;
 
@@ -44,7 +44,7 @@ contract UniswapV4SwapAdapterTest is Test {
 		usdc = new MockERC20('USD Coin', 'USDC', 6);
 		meme = new MockERC20('Memestock', 'MEME', 18);
 		adapter = new UniswapV4SwapAdapter(
-			IV4PoolManager(address(manager)), PoolPriceRegistrarV2(address(registrar)), address(weth), treasury, 5, owner
+			IV4PoolManager(address(manager)), IPoolPriceRegistrar(address(registrar)), address(weth), treasury, 5, owner
 		);
 		fund = new FakeFund(address(registrar));
 		manager.setNextAmountOut(1_000e18);
@@ -112,6 +112,16 @@ contract UniswapV4SwapAdapterTest is Test {
 		bytes memory data = abi.encode(key, true, uint256(1e6), uint256(1));
 		vm.expectRevert(abi.encodeWithSelector(UniswapV4SwapAdapter.PoolNotApproved.selector, id));
 		fund.trade(adapter, vault, data);
+	}
+
+	/// The adapter reports the tax recorded for the pool a sale goes through, and nothing for any other pool, even one
+	/// trading the same token: the keeper's raised cap follows the taxed pool, never the token.
+	function test_saleTaxBps_isThePoolsOwn() public {
+		PoolKey memory taxed = _key(address(0));
+		PoolKey memory other = PoolKey({currency0: address(0), currency1: taxed.currency1, fee: 500, tickSpacing: 10, hooks: address(0)});
+		registrar.setPoolSaleTax(PoolKeyId.toId(taxed), 290);
+		assertEq(adapter.saleTaxBps(abi.encode(taxed, false, uint256(1e18), uint256(0))), 290);
+		assertEq(adapter.saleTaxBps(abi.encode(other, false, uint256(1e18), uint256(0))), 0, 'the same token elsewhere: no tax');
 	}
 
 	/// Old funds (built on today's registrar) are refused: v4 tokens aren't long-tail for them (founder 2026-10-08).

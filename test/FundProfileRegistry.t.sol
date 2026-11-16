@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
-import {ComptrollerV6} from '../src/core/ComptrollerV6.sol';
+import {Comptroller} from '../src/core/Comptroller.sol';
 import {FundProfileRegistry} from '../src/profile/FundProfileRegistry.sol';
-import {RedemptionFixtureV6} from './utils/RedemptionFixtureV6.sol';
+import {RedemptionFixture} from './utils/RedemptionFixture.sol';
 
 /// @notice A fund's links (founder 2026-10-11): only its owner publishes them, on a real fund v6.
-contract FundProfileRegistryTest is RedemptionFixtureV6 {
+contract FundProfileRegistryTest is RedemptionFixture {
 	FundProfileRegistry internal profiles;
 	string internal constant LINKS = '{"website":"https://example.com","x":"https://x.com/example"}';
 
@@ -16,7 +16,7 @@ contract FundProfileRegistryTest is RedemptionFixtureV6 {
 	}
 
 	function test_theManagerPublishesTheFundsLinks() public {
-		ComptrollerV6 fund = _fund();
+		Comptroller fund = _fund();
 		vm.expectEmit(address(profiles));
 		emit FundProfileRegistry.ProfileSet(address(fund), LINKS);
 		vm.prank(manager);
@@ -25,7 +25,7 @@ contract FundProfileRegistryTest is RedemptionFixtureV6 {
 	}
 
 	function test_onlyTheFundsOwner() public {
-		ComptrollerV6 fund = _fund();
+		Comptroller fund = _fund();
 		_deposit(fund, alice, 1_000e6);
 		vm.prank(alice); // an investor of the fund
 		vm.expectRevert(FundProfileRegistry.NotFundOwner.selector);
@@ -47,7 +47,7 @@ contract FundProfileRegistryTest is RedemptionFixtureV6 {
 	}
 
 	function test_aRecordIsAtMost1024Bytes() public {
-		ComptrollerV6 fund = _fund();
+		Comptroller fund = _fund();
 		string memory atCap = string(new bytes(1024));
 		vm.prank(manager);
 		profiles.setProfile(address(fund), atCap);
@@ -59,7 +59,7 @@ contract FundProfileRegistryTest is RedemptionFixtureV6 {
 	}
 
 	function test_theManagerReplacesOrClearsTheLinks() public {
-		ComptrollerV6 fund = _fund();
+		Comptroller fund = _fund();
 		vm.startPrank(manager);
 		profiles.setProfile(address(fund), LINKS);
 		profiles.setProfile(address(fund), '{"website":"https://example.org"}');

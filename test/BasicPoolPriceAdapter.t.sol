@@ -6,12 +6,17 @@ import {Clones} from '@openzeppelin/contracts/proxy/Clones.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {IValueInterpreter} from '../src/interfaces/IValueInterpreter.sol';
 import {IPoolPriceAdapter} from '../src/interfaces/IPoolPriceAdapter.sol';
+import {IPoolWatch} from '../src/interfaces/IPoolWatch.sol';
 import {PoolPriceAdapterBase} from '../src/pricing/PoolPriceAdapterBase.sol';
+import {BasicPoolPriceAdapter} from '../src/pricing/BasicPoolPriceAdapter.sol';
 import {MockERC20, MockAggregator} from './utils/Mocks.sol';
 import {ScriptedBasicPool} from './utils/PoolPriceMocks.sol';
 
-/// @notice What every BasicPoolPriceAdapter version must do; the concrete suite is on the version the registrars clone (V2).
-abstract contract BasicPoolPriceAdapterTest is Test {
+/// @notice BasicPoolPriceAdapter: the price from an Aerodrome basic volatile pool's time-averaged reserves, and the ≈ $0 rule
+///         on the window's average quote reserve only, so a quote reserve emptied inside one transaction (a large sale, an
+///         LP's own burn) doesn't zero the price (red-team PRICING-POOL-01, second pass, 2026-10-27). The buy floor still
+///         counts the reserve now.
+contract BasicPoolPriceAdapterTest is Test {
 	ValueInterpreter internal vi;
 	address internal impl;
 	MockERC20 internal usdc;
@@ -34,11 +39,9 @@ abstract contract BasicPoolPriceAdapterTest is Test {
 		vi.addPrimitive(address(usdc), address(new MockAggregator(8, 1e8)), 25 hours);
 		vi.addPrimitive(address(weth), address(wethFeed), 1 hours);
 		vm.stopPrank();
-		impl = _implementation();
+		impl = address(new BasicPoolPriceAdapter());
 	}
 
-	/// @dev The implementation every clone in this suite runs.
-	function _implementation() internal virtual returns (address);
 
 	// ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -222,5 +225,36 @@ abstract contract BasicPoolPriceAdapterTest is Test {
 
 		// 3 TKN at $2 = 6 USDC
 		assertEq(vi.calcCanonicalAssetValue(address(tkn), 3e18, address(usdc)), 6e6);
+	}
+
+	/// The current quote reserve emptied, the window's average unchanged: the price stays at the window.
+	function test_aDrainedReserveLeavesThePriceAtTheWindow() public {
+		ScriptedBasicPool pool = _usdcPool();
+		_script(pool, tkn, HALF_M_TKN, ONE_M_USDC, 2 hours); // $2 per TKN, $1M average
+		IPoolPriceAdapter adapter = _adapter(pool, tkn);
+
+		_setReserves(pool, tkn, 2 * HALF_M_TKN, 1);
+		assertEq(_answer(adapter), 2e18, 'still the window price');
+	}
+
+	/// The buy floor still sees the reserve now.
+	function test_theBuyFloorStillCountsTheReserveNow() public {
+		ScriptedBasicPool pool = _usdcPool();
+		_script(pool, tkn, HALF_M_TKN, ONE_M_USDC, 2 hours);
+		_setReserves(pool, tkn, 2 * HALF_M_TKN, 4_000e6);
+
+		assertEq(_adapter(pool, tkn).liquidityUsd(), 4_000e18);
+	}
+
+	/// The reserve under half the window's average is unsettled the block it happens, however quiet the pool (review 2026-11-01).
+	function test_aReserveUnderHalfIsUnsettled() public {
+		ScriptedBasicPool pool = _usdcPool();
+		_script(pool, tkn, HALF_M_TKN, ONE_M_USDC, 2 hours);
+		IPoolWatch adapter = IPoolWatch(address(_adapter(pool, tkn)));
+		assertFalse(adapter.poolUnsettled(), 'steady');
+		_setReserves(pool, tkn, HALF_M_TKN, ONE_M_USDC / 2);
+		assertFalse(adapter.poolUnsettled(), 'half is the line');
+		_setReserves(pool, tkn, HALF_M_TKN, ONE_M_USDC / 2 - 1);
+		assertTrue(adapter.poolUnsettled());
 	}
 }

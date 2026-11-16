@@ -5,20 +5,7 @@ import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {SafeERC20} from '@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol';
 import {IIntegrationAdapter} from '../interfaces/IIntegrationAdapter.sol';
 import {IFrostyClmVault} from '../interfaces/external/IFrostyClm.sol';
-
-/// @notice Slipstream SwapRouter multi-hop exact-in (verified source of 0x698C…A92F, SwapRouter.sol, 2026-10-13).
-///         Path: token (20 bytes) | tickSpacing int24 (3 bytes) | token | …
-interface ISlipstreamMultiHopRouter {
-	struct ExactInputParams {
-		bytes path;
-		address recipient;
-		uint256 deadline;
-		uint256 amountIn;
-		uint256 amountOutMinimum;
-	}
-
-	function exactInput(ExactInputParams calldata params) external payable returns (uint256 amountOut);
-}
+import {ISlipstreamSwapRouter} from '../interfaces/external/ISlipstreamSwapRouter.sol';
 
 /// @title ClmVaultAdapter
 /// @notice Deposits into, withdraws from and exits FrostyFi CLM vaults (funds-yield; plan 2, 2026-10-13), on any of the
@@ -30,7 +17,7 @@ interface ISlipstreamMultiHopRouter {
 ///      - 2 Exit:     (2, clmVault, shares, minOut, outToken, Route[] routes). Withdraws, then sells each pool token
 ///        other than `outToken` along its route: a multi-hop path through one of the three Slipstream routers, from
 ///        that token to `outToken`. One asset comes back, the shape the v6 keeper's liquidation sale needs
-///        (ComptrollerV6Lib._checkSale), with its 3% oracle cap on the whole exit. New pairs need a route, not code
+///        (ComptrollerLib._checkSale), with its 3% oracle cap on the whole exit. New pairs need a route, not code
 ///        (founder 2026-10-13).
 ///      Minimums are the Comptroller's to check (vault balance deltas); this adapter is never trusted for accounting, so
 ///      its swaps take no minimum of their own. It never holds tokens after a call.
@@ -149,8 +136,8 @@ contract ClmVaultAdapter is IIntegrationAdapter {
 		uint256 amountIn = IERC20(tokenIn).balanceOf(address(this));
 		if (amountIn == 0) return;
 		IERC20(tokenIn).forceApprove(route.router, amountIn);
-		ISlipstreamMultiHopRouter(route.router).exactInput(
-			ISlipstreamMultiHopRouter.ExactInputParams({
+		ISlipstreamSwapRouter(route.router).exactInput(
+			ISlipstreamSwapRouter.ExactInputParams({
 				path: route.path, recipient: address(this), deadline: block.timestamp, amountIn: amountIn, amountOutMinimum: 0
 			})
 		);
