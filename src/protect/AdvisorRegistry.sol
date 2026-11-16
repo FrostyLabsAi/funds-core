@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
-interface IAdvisableTrader {
-	function comptroller() external view returns (address);
-}
-
-interface IAdvisorComptroller {
-	function fundOwner() external view returns (address);
-}
+import {IFundAccount} from '../interfaces/IFundAccount.sol';
+import {IComptroller} from '../interfaces/IComptroller.sol';
 
 /// @title AdvisorRegistry
 /// @notice Per-trader preferences for Protect Mode advice: whether it runs, how often, and the max
@@ -74,9 +69,9 @@ contract AdvisorRegistry {
 	}
 
 	function _requireFundOwner(address trader) internal view {
-		(bool ok, bytes memory ret) = trader.staticcall(abi.encodeCall(IAdvisableTrader.comptroller, ()));
+		(bool ok, bytes memory ret) = trader.staticcall(abi.encodeCall(IFundAccount.comptroller, ()));
 		if (!ok || ret.length != 32) revert NotFundOwner();
 		address comptroller = abi.decode(ret, (address));
-		if (IAdvisorComptroller(comptroller).fundOwner() != msg.sender) revert NotFundOwner();
+		if (IComptroller(comptroller).fundOwner() != msg.sender) revert NotFundOwner();
 	}
 }

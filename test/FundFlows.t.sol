@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
-import {V6Host} from './utils/V6Host.sol';
+import {FundHost} from './utils/FundHost.sol';
 import {Test} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
-import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
-import {ComptrollerV6 as Comptroller} from '../src/core/ComptrollerV6.sol';
+import {SharesVaultDeployer} from '../src/core/SharesVaultDeployer.sol';
+import {Comptroller} from '../src/core/Comptroller.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {Shares} from '../src/fund/Shares.sol';
 import {Vault} from '../src/fund/Vault.sol';
 import {MathHelpers} from '../src/libraries/MathHelpers.sol';
 import {MockERC20, MockAggregator} from './utils/Mocks.sol';
+import {IShares} from '../src/interfaces/IShares.sol';
+import {IVault} from '../src/interfaces/IVault.sol';
 
 contract FundFlowsTest is Test {
 	uint256 internal constant RATE_SCALE = 1e27;
@@ -37,7 +39,7 @@ contract FundFlowsTest is Test {
 		vm.prank(admin);
 		interpreter.addPrimitive(address(usdc), address(usdcFeed), 7 days);
 
-		factory = new FundFactory(interpreter, V6Host.deployer(), new SharesVaultDeployer());
+		factory = new FundFactory(interpreter, FundHost.deployer(), new SharesVaultDeployer());
 
 		usdc.mint(alice, 1_000_000e6);
 		usdc.mint(bob, 1_000_000e6);
@@ -227,7 +229,7 @@ contract FundFlowsTest is Test {
 		_depositFor(comptroller, alice, 1000e6);
 
 		// Fund loses 20%: vault 1000 → 800
-		Vault vault = comptroller.vault();
+		IVault vault = comptroller.vault();
 		vm.prank(address(comptroller));
 		vault.withdraw(address(usdc), makeAddr('sink'), 200e6);
 
@@ -274,7 +276,7 @@ contract FundFlowsTest is Test {
 		Comptroller comptroller = _createFund(0, 0);
 		_depositFor(comptroller, alice, 1000e6);
 
-		Shares fundShares = comptroller.shares();
+		IShares fundShares = comptroller.shares();
 
 		vm.startPrank(alice);
 		vm.expectRevert(abi.encodeWithSelector(Comptroller.SharesActionTimelocked.selector, alice));

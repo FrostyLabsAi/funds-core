@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
-import {V6Host} from './utils/V6Host.sol';
+import {FundHost} from './utils/FundHost.sol';
 import {Test} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
-import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
-import {ComptrollerV6 as Comptroller} from '../src/core/ComptrollerV6.sol';
+import {SharesVaultDeployer} from '../src/core/SharesVaultDeployer.sol';
+import {Comptroller} from '../src/core/Comptroller.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {IPolicy} from '../src/interfaces/IPolicy.sol';
 import {IUniswapV3SwapRouter} from '../src/interfaces/external/IUniswapV3SwapRouter.sol';
@@ -47,10 +47,10 @@ contract IntegrationTest is Test {
 		interpreter.addPrimitive(address(nvdax), address(nvdaxFeed), 7 days);
 		vm.stopPrank();
 
-		factory = new FundFactory(interpreter, V6Host.deployer(), new SharesVaultDeployer()); // this test = factory owner
+		factory = new FundFactory(interpreter, FundHost.deployer(), new SharesVaultDeployer()); // this test = factory owner
 		router = new MockSwapRouter();
-		uniAdapter = new UniswapV3SwapAdapter(IUniswapV3SwapRouter(address(router)));
-		aeroAdapter = new AerodromeSlipstreamSwapAdapter(ISlipstreamSwapRouter(address(router)));
+		uniAdapter = new UniswapV3SwapAdapter(IUniswapV3SwapRouter(address(router)), address(0xFEE), 0, address(this));
+		aeroAdapter = new AerodromeSlipstreamSwapAdapter(ISlipstreamSwapRouter(address(router)), address(0xFEE), 0, address(this));
 		factory.registerAdapter(address(uniAdapter));
 		factory.registerAdapter(address(aeroAdapter));
 
@@ -108,7 +108,7 @@ contract IntegrationTest is Test {
 
 	function test_swapViaSlipstreamAdapter() public {
 		router.setNextAmountOut(10e18);
-		bytes memory data = abi.encode(address(usdc), address(nvdax), int24(100), uint256(1800e6), uint256(9.9e18));
+		bytes memory data = abi.encode(address(usdc), address(nvdax), int24(100), uint256(1800e6), uint256(9.9e18), uint256(0));
 
 		vm.prank(manager);
 		comptroller.callOnIntegration(address(aeroAdapter), data);
@@ -120,7 +120,7 @@ contract IntegrationTest is Test {
 	// ─── Safety gates ────────────────────────────────────────────────────────────
 
 	function test_unregisteredAdapter_reverts() public {
-		UniswapV3SwapAdapter rogue = new UniswapV3SwapAdapter(IUniswapV3SwapRouter(address(router)));
+		UniswapV3SwapAdapter rogue = new UniswapV3SwapAdapter(IUniswapV3SwapRouter(address(router)), address(0xFEE), 0, address(this));
 		vm.prank(manager);
 		vm.expectRevert(abi.encodeWithSelector(Comptroller.AdapterNotRegistered.selector, address(rogue)));
 		comptroller.callOnIntegration(address(rogue), _uniSwapData(1800e6, 0));

@@ -26,6 +26,11 @@ contract MockVeranta is
 	uint256 public constant maxTradesPerPair = 40; // live Veranta value (verified 2026-09-23)
 	uint256 public pairsCount = 10;
 
+	/// @dev Lazer feed ids aren't modelled here (the price store suites have their own).
+	function getLazerFeedId(uint256) external pure returns (uint256) {
+		return 0;
+	}
+
 	IERC20 public immutable usdc;
 
 	PendingOrder[] internal _pending;

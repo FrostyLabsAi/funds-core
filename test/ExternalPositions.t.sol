@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
-import {V6Host} from './utils/V6Host.sol';
+import {FundHost} from './utils/FundHost.sol';
 import {Test} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
-import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
-import {ComptrollerV6 as Comptroller} from '../src/core/ComptrollerV6.sol';
+import {SharesVaultDeployer} from '../src/core/SharesVaultDeployer.sol';
+import {Comptroller} from '../src/core/Comptroller.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {IPolicy} from '../src/interfaces/IPolicy.sol';
 import {AllowedExternalPositionTypesPolicy} from '../src/policies/AllowedExternalPositionTypesPolicy.sol';
@@ -15,8 +15,8 @@ import {MockERC20, MockAggregator, MockExternalPosition, MockExternalPositionFac
 /// @notice The GENERIC external-position machinery: type-registry gating, guardian
 ///         deregistration, fund-owner auth, and the allowed-types policy. Venue-agnostic
 ///         on purpose — these rode on HyperliquidPerpPosition until the HL path was
-///         removed (2026-09-18); per-venue behaviour lives in VerantaPerp.t.sol,
-///         UniV3LP.t.sol, SlipstreamLP.t.sol and LimitOrder.t.sol.
+///         removed (2026-09-18); per-venue behaviour lives in
+///         VerantaPerpPosition.t.sol.
 contract ExternalPositionsTest is Test {
 	uint256 internal constant TYPE_ID = 1;
 
@@ -38,7 +38,7 @@ contract ExternalPositionsTest is Test {
 		vm.prank(admin);
 		interpreter.addPrimitive(address(usdc), address(usdcFeed), 7 days);
 
-		factory = new FundFactory(interpreter, V6Host.deployer(), new SharesVaultDeployer()); // this test = factory owner
+		factory = new FundFactory(interpreter, FundHost.deployer(), new SharesVaultDeployer()); // this test = factory owner
 		positionFactory = new MockExternalPositionFactory();
 		factory.registerPositionType(TYPE_ID, address(positionFactory));
 

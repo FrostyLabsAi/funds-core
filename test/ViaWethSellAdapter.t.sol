@@ -72,6 +72,7 @@ contract ViaWethSellAdapterTest is Test {
 	MockSlipstreamSingleRouter internal s1 = new MockSlipstreamSingleRouter();
 	MockSlipstreamSingleRouter internal s2 = new MockSlipstreamSingleRouter();
 	MockSlipstreamSingleRouter internal s3 = new MockSlipstreamSingleRouter();
+	MockSlipstreamSingleRouter internal aeroCl = new MockSlipstreamSingleRouter(); // Aero's SwapRouter: Slipstream's shape
 	MockAerodromeRouter internal aero = new MockAerodromeRouter();
 	address internal constant AERO_FACTORY = address(0xFAC7);
 	address internal treasury = makeAddr('treasury');
@@ -86,7 +87,7 @@ contract ViaWethSellAdapterTest is Test {
 
 	function _adapter(address uni_, address s1_, address aero_, uint16 feeBps) internal returns (ViaWethSellAdapter) {
 		return new ViaWethSellAdapter(
-			address(weth), uni_, s1_, address(s2), address(s3), aero_, AERO_FACTORY, treasury, feeBps, owner
+			address(weth), uni_, s1_, address(s2), address(s3), aero_, AERO_FACTORY, address(aeroCl), treasury, feeBps, owner
 		);
 	}
 
@@ -189,10 +190,7 @@ contract ViaWethSellAdapterTest is Test {
 		adapter.executeAction(
 			fundVault, _sale(_hop(ViaWethSellAdapter.Venue.Slipstream1, 1), _hop(ViaWethSellAdapter.Venue.UniswapV3, -500))
 		);
-		vm.expectRevert(); // a venue past the enum doesn't decode
-		adapter.executeAction(
-			fundVault, abi.encode(address(cbeth), uint256(4e18), uint256(0), address(usdc), uint8(5), int24(1), uint8(0), int24(500))
-		);
+		// a venue past the enum: ViaWethSellAdapterAeroTest.test_aVenuePastAeroDoesntDecode
 		assertEq(cbeth.balanceOf(address(adapter)), 4e18, 'nothing moved');
 	}
 
@@ -214,15 +212,15 @@ contract ViaWethSellAdapterTest is Test {
 	function test_constructor_rejectsZero() public {
 		vm.expectRevert(ProtocolFeeAdapter.ZeroAddress.selector);
 		new ViaWethSellAdapter(
-			address(weth), address(uni), address(s1), address(s2), address(s3), address(aero), address(0), treasury, 5, owner
+			address(weth), address(uni), address(s1), address(s2), address(s3), address(aero), address(0), address(aeroCl), treasury, 5, owner
 		);
 		vm.expectRevert(ProtocolFeeAdapter.ZeroAddress.selector);
 		new ViaWethSellAdapter(
-			address(weth), address(uni), address(s1), address(s2), address(s3), address(aero), AERO_FACTORY, address(0), 5, owner
+			address(weth), address(uni), address(s1), address(s2), address(s3), address(aero), AERO_FACTORY, address(aeroCl), address(0), 5, owner
 		);
 		vm.expectRevert(abi.encodeWithSelector(ProtocolFeeAdapter.FeeAboveCap.selector, uint16(11)));
 		new ViaWethSellAdapter(
-			address(weth), address(uni), address(s1), address(s2), address(s3), address(aero), AERO_FACTORY, treasury, 11, owner
+			address(weth), address(uni), address(s1), address(s2), address(s3), address(aero), AERO_FACTORY, address(aeroCl), treasury, 11, owner
 		);
 	}
 }

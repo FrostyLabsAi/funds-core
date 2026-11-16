@@ -14,7 +14,7 @@ import {SlipstreamSell} from './SlipstreamSell.sol';
 /// @dev integrationData = abi.encode(uint8 2, clmVault, shares, minOut, outToken, Route[] routes): withdraws, then sells
 ///      each pool token other than `outToken` along its route, a multi-hop path through one of the three Slipstream
 ///      routers, from that token to `outToken`. One asset comes back, the shape the v6 keeper's liquidation sale needs
-///      (ComptrollerV6Lib._checkSale), with its 3% oracle cap on the whole exit. Minimums are the Comptroller's to check;
+///      (ComptrollerLib._checkSale), with its 3% oracle cap on the whole exit. Minimums are the Comptroller's to check;
 ///      the swaps take none of their own. It never holds tokens after a call.
 contract ClmVaultExitAdapter is IIntegrationAdapter {
 	using SafeERC20 for IERC20;

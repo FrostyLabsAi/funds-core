@@ -2,7 +2,7 @@
 pragma solidity 0.8.24;
 
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
-import {Comptroller} from '../core/Comptroller.sol';
+import {IComptroller} from './IComptroller.sol';
 import {IValueInterpreter} from './IValueInterpreter.sol';
 
 /// @title IComptrollerDeployer
@@ -12,10 +12,10 @@ interface IComptrollerDeployer {
 		address fundOwner,
 		IERC20 denominationAsset,
 		IValueInterpreter valueInterpreter,
-		Comptroller.FeeConfig calldata feeConfig,
+		IComptroller.FeeConfig calldata feeConfig,
 		uint256 sharesActionTimelock,
 		uint256 minRequestDuration,
 		uint256 executionWindow,
 		bool allowRiskyAssets
-	) external returns (Comptroller comptroller);
+	) external returns (IComptroller comptroller);
 }

@@ -2,7 +2,7 @@
 pragma solidity 0.8.24;
 
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
-import {ISlipstreamMultiHopRouter} from '../../src/adapters/ClmVaultAdapter.sol';
+import {ISlipstreamSwapRouter} from '../../src/interfaces/external/ISlipstreamSwapRouter.sol';
 import {MockERC20} from './Mocks.sol';
 
 /// @dev A Slipstream router stand-in for the exit adapters: takes the path's first token and pays the last at `rate` (out
@@ -22,7 +22,7 @@ contract MockSlipstreamRouter {
 		midLeftover = amount;
 	}
 
-	function exactInput(ISlipstreamMultiHopRouter.ExactInputParams calldata p) external payable returns (uint256 out) {
+	function exactInput(ISlipstreamSwapRouter.ExactInputParams calldata p) external payable returns (uint256 out) {
 		uint256 taken = (p.amountIn * fillBps) / 10_000;
 		IERC20(_tokenAt(p.path, 0)).transferFrom(msg.sender, address(this), taken);
 		out = (taken * rate) / 1e18;

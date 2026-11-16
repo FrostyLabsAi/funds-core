@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
-import {V6Host} from './utils/V6Host.sol';
+import {FundHost} from './utils/FundHost.sol';
 import {Test} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
-import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
-import {ComptrollerV6 as Comptroller} from '../src/core/ComptrollerV6.sol';
+import {SharesVaultDeployer} from '../src/core/SharesVaultDeployer.sol';
+import {Comptroller} from '../src/core/Comptroller.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {ERC4626PriceFeed} from '../src/pricing/ERC4626PriceFeed.sol';
 import {ERC4626Adapter} from '../src/adapters/ERC4626Adapter.sol';
@@ -38,7 +38,7 @@ contract ERC4626IntegrationTest is Test {
 		interpreter.addDerivative(address(yieldVault), address(feed4626));
 		vm.stopPrank();
 
-		factory = new FundFactory(interpreter, V6Host.deployer(), new SharesVaultDeployer());
+		factory = new FundFactory(interpreter, FundHost.deployer(), new SharesVaultDeployer());
 		adapter = new ERC4626Adapter();
 		factory.registerAdapter(address(adapter));
 

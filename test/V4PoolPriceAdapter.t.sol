@@ -8,6 +8,7 @@ import {IValueInterpreter} from '../src/interfaces/IValueInterpreter.sol';
 import {IPoolPriceAdapter} from '../src/interfaces/IPoolPriceAdapter.sol';
 import {IPoolWatch} from '../src/interfaces/IPoolWatch.sol';
 import {ConcentratedPoolPriceAdapter} from '../src/pricing/ConcentratedPoolPriceAdapter.sol';
+import {IV4PoolPriceAdapter} from '../src/interfaces/IV4PoolPriceAdapter.sol';
 import {V4PoolPriceAdapter} from '../src/pricing/V4PoolPriceAdapter.sol';
 import {V4PriceSampler} from '../src/pricing/V4PriceSampler.sol';
 import {IV4StateView} from '../src/interfaces/external/IUniswapV4.sol';
@@ -78,7 +79,7 @@ contract V4PoolPriceAdapterTest is Test {
 				assetDecimals: 18,
 				quoteDecimals: quote.decimals()
 			}),
-			V4PoolPriceAdapter.V4Extra({sampler: sampler, stateView: IV4StateView(address(stateView)), poolId: POOL})
+			IV4PoolPriceAdapter.V4Extra({sampler: sampler, stateView: IV4StateView(address(stateView)), poolId: POOL})
 		);
 		return IPoolPriceAdapter(Clones.cloneWithImmutableArgs(address(impl), args));
 	}
@@ -95,7 +96,7 @@ contract V4PoolPriceAdapterTest is Test {
 
 	// ─── tests ───────────────────────────────────────────────────────────────────
 
-	/// Same tick and liquidity as a v3 pool priced by today's feed: same price, same liquidity.
+	/// Same tick and liquidity as a v3 pool priced by the concentrated feed: same price, the same liquidity to 1e-14.
 	function test_matchesTheConcentratedFeedAtTheSameTickAndLiquidity() public {
 		ScriptedCLPool v3 = new ScriptedCLPool(address(usdc), address(asset), address(this), 3000, 60);
 		bool assetIsToken0 = v3.token0() == address(asset);
@@ -121,7 +122,9 @@ contract V4PoolPriceAdapterTest is Test {
 		_sampleEvery10Min(6);
 		IPoolPriceAdapter v4Feed = _adapter(usdc, assetIsToken0);
 		assertEq(_price(v4Feed), _price(v3Feed), 'price');
-		assertEq(v4Feed.liquidityUsd(), v3Feed.liquidityUsd(), 'liquidity');
+		// the concentrated feed reads its window's liquidity as a harmonic mean of secondsPerLiquidity, which rounds in
+		// the 16th digit; the v4 feed reads the sampled liquidity directly
+		assertApproxEqRel(v4Feed.liquidityUsd(), v3Feed.liquidityUsd(), 1e4, 'liquidity');
 		assertGt(_price(v4Feed), 1);
 	}
 
@@ -246,7 +249,7 @@ contract V4PoolPriceAdapterTest is Test {
 
 	function test_v4Extra_isTheCloneArgs() public {
 		V4PoolPriceAdapter feed = V4PoolPriceAdapter(address(_adapter(usdc, false)));
-		V4PoolPriceAdapter.V4Extra memory e = feed.v4Extra();
+		IV4PoolPriceAdapter.V4Extra memory e = feed.v4Extra();
 		assertEq(address(e.sampler), address(sampler));
 		assertEq(e.poolId, POOL);
 		assertEq(feed.config().asset, address(asset));

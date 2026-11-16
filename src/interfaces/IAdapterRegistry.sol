@@ -5,8 +5,3 @@ pragma solidity 0.8.24;
 interface IAdapterRegistry {
 	function isAdapterRegistered(address adapter) external view returns (bool);
 }
-
-/// @notice The Comptroller's view of the FundFactory's protocol AUM-fee config, read at every settlement.
-interface IProtocolFeeConfig {
-	function getProtocolFeeConfig() external view returns (uint256 feeBps, address recipient);
-}

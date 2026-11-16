@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
-/// @notice Aerodrome Slipstream NonfungiblePositionManager (subset used by SlipstreamLPPosition).
+/// @notice Aerodrome Slipstream NonfungiblePositionManager (the subset ClmVaultPriceFeed reads).
 /// @dev Verified against aerodrome-finance/slipstream periphery: Uniswap v3's NFT manager
 ///      with pools keyed by `int24 tickSpacing` instead of `uint24 fee`.
 interface ISlipstreamNonfungiblePositionManager {
@@ -85,13 +85,4 @@ interface ISlipstreamNonfungiblePositionManager {
 
 	/// @notice The Slipstream CLFactory this manager mints into
 	function factory() external view returns (address);
-}
-
-/// @notice Slipstream CLFactory + CLPool views used to authenticate a pool's gauge.
-interface ISlipstreamPoolLookup {
-	function getPool(address tokenA, address tokenB, int24 tickSpacing) external view returns (address);
-}
-
-interface ISlipstreamPoolGauge {
-	function gauge() external view returns (address);
 }

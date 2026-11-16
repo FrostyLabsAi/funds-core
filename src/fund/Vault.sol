@@ -3,11 +3,12 @@ pragma solidity 0.8.24;
 
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {SafeERC20} from '@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol';
+import {IVault} from '../interfaces/IVault.sol';
 
 /// @title Vault
 /// @notice Dumb custody: holds the fund's ERC20 assets and releases them only at the Comptroller's call.
 /// @dev Asset tracking lives in the Comptroller, not here.
-contract Vault {
+contract Vault is IVault {
 	using SafeERC20 for IERC20;
 
 	address public immutable factory;

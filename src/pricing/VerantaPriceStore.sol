@@ -1,47 +1,45 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
-/// @notice Pyth Lazer's on-chain verifier (Base 0xACeA761c27A909d4D3895128EBe6370FDE2dF481):
-///         checks the packet's signature against Pyth's trusted signers and returns the payload.
-interface IPythLazerVerifier {
-	function verifyUpdate(bytes calldata update) external payable returns (bytes memory payload, address signer);
-
-	function verification_fee() external view returns (uint256);
-}
-
-/// @notice Veranta's PairStorage (Base 0x5db3772136e5557EFE028Db05EE95C84D76faEC4): the Lazer feed
-///         each Veranta pair is priced from — the mapping Veranta's own PriceAggregator uses.
-interface IVerantaLazerPairs {
-	function getLazerFeedId(uint256 pairIndex) external view returns (uint256);
-}
+import {IPythLazerVerifier} from '../interfaces/external/IPythLazerVerifier.sol';
+import {IVerantaPairStorage} from '../interfaces/external/IVeranta.sol';
+import {IVerantaPriceStore} from '../interfaces/IVerantaPriceStore.sol';
 
 /// @title VerantaPriceStore
-/// @notice Every Veranta perp valued at the price Veranta itself settles it at. Veranta prices
-///         every pair from Pyth Lazer: its keeper's routine `updateFundingAccumulators` batches
-///         put one Pyth-signed packet per active pair into public calldata (~every 5 minutes).
-///         Anyone may relay those packets here; each one is re-verified by Pyth's own Lazer
-///         verifier and matched to its pair through Veranta's own pair→feed mapping, so a relayer
-///         can choose WHEN to relay but never WHAT price is stored. Newer-only per pair.
-///         The packet format accepted is exactly Veranta's (PriceAggregator._parsePythLazerPrice):
-///         price, confidence, exponent and the feed's own update timestamp — nothing else.
-/// @dev Read through one VerantaPriceAdapter per pair (Chainlink AggregatorV3 shape) registered
-///      as a VI primitive on a PriceMarker, then `setPairAsset(pair, marker)`.
-contract VerantaPriceStore {
-	/// @notice Veranta PairInfos' funding-accumulator update — the calldata `relayFunding` takes.
-	bytes4 public constant FUNDING_SELECTOR = bytes4(keccak256('updateFundingAccumulators(uint256[],bytes[][],uint8[])'));
-
-	uint8 internal constant PYTH_LAZER = 1; // Veranta PriceSourcing.PYTH_LAZER
+/// @notice Veranta's Pyth-signed prices for SPOT stock tokens (Coinbase B20), weekends included (founder 2026-10-25,
+///         option b). Veranta's equity feeds stop when the market closes (Fri 20:00 ET), but every packet Pyth signs
+///         keeps a fresh header time: on Sun 2026-10-25 23:55 UTC MU's packet was signed then and still carried
+///         Friday 23:59:59 UTC as its last trade. Keeping only the feed's own update time would make a closed market
+///         read as a days-old price, so this store keeps both, per pair:
+///         - `timestampUs`: when Pyth last signed this price as current (the packet header), "confirmed";
+///         - `feedUs`: when the stock last traded (the feed's own update time).
+///         An adapter then asks for a recent confirmation (no price picking, security review 2026-09-22 H-3) and a
+///         trade no older than a long weekend (a halted or delisted stock stops pricing).
+///         A packet must also be FRESH when relayed (MAX_RELAY_AGE, review 2026-10-25): a v6 fund holding these stocks
+///         pays instant USDC exits at the stored price, so a relayer able to pick any packet from the adapter's whole
+///         lifetime could redeem at, say, Friday's close a few minutes into Monday's open. Veranta itself refuses
+///         packets over 30 s old.
+///         Ownerless: anyone relays, Pyth's verifier checks every signature and Veranta's own pair→feed
+///         mapping picks the feed, so a relayer chooses WHEN a price is confirmed, never WHAT it is.
+/// @dev On demand only (founder 2026-10-05): no `relayFunding`, packets come from Veranta's feed app.
+///      Storage slot 0 is `latestOf` (the terminal injects prices into it for free NAV reads): one word per pair,
+///      price bits 0-63, exponent 64-79, timestampUs 80-143, feedUs 144-207.
+contract VerantaPriceStore is IVerantaPriceStore {
 	uint32 internal constant PAYLOAD_MAGIC = 2479346549; // Pyth Lazer payload header
 	// Pyth Lazer PriceFeedProperty ids
 	uint8 internal constant PROP_PRICE = 0;
 	uint8 internal constant PROP_EXPONENT = 4;
 	uint8 internal constant PROP_CONFIDENCE = 5;
 	uint8 internal constant PROP_FEED_UPDATE_TIMESTAMP = 12;
+	/// @notice A packet signed more than this long before the block is refused: a relayer picks WHEN, from the last
+	///         minute only.
+	uint256 public constant MAX_RELAY_AGE = 60;
 
 	struct Latest {
 		int64 price;
 		int16 exponent;
-		uint64 timestampUs; // the feed's own update time, microseconds
+		uint64 timestampUs; // when Pyth signed it as current (packet header), microseconds
+		uint64 feedUs; // the feed's own update time (last trade), microseconds
 	}
 
 	/// @dev One feed's properties while the payload is walked (memory, not stack)
@@ -56,15 +54,13 @@ contract VerantaPriceStore {
 	}
 
 	IPythLazerVerifier public immutable lazer;
-	IVerantaLazerPairs public immutable pairs;
+	IVerantaPairStorage public immutable pairs;
 
 	mapping(uint256 pairIndex => Latest) private latestOf;
 
-	event PriceStored(uint256 indexed pairIndex, int64 price, int16 exponent, uint64 timestampUs);
+	event PriceStored(uint256 indexed pairIndex, int64 price, int16 exponent, uint64 timestampUs, uint64 feedUs);
 
 	error ZeroAddress();
-	error NotFundingCalldata();
-	error LengthMismatch();
 	error BadPayloadMagic();
 	error PayloadTooShort();
 	error FeedNotFound(uint256 pairIndex, uint32 lazerFeedId);
@@ -74,63 +70,53 @@ contract VerantaPriceStore {
 	error NonPositivePrice(uint256 pairIndex);
 	error FeedUpdateAfterHeader(uint64 feedTimestampUs, uint64 headerTimestampUs);
 	error FeedFromFuture(uint64 timestampUs);
-	error NothingNewer();
+	error PacketTooOld(uint64 headerTimestampUs);
 
-	constructor(IPythLazerVerifier lazer_, IVerantaLazerPairs pairs_) {
+	constructor(IPythLazerVerifier lazer_, IVerantaPairStorage pairs_) {
 		if (address(lazer_) == address(0) || address(pairs_) == address(0)) revert ZeroAddress();
 		lazer = lazer_;
 		pairs = pairs_;
 	}
 
-	/// @notice Relay a whole Veranta funding batch: the raw `updateFundingAccumulators` calldata of
-	///         any of Veranta's transactions. Each Lazer packet is verified and stored on its own;
-	///         one that fails (tampered, stale, unmapped) is skipped, never the batch.
-	///         Send `verification_fee()` × packets as value (1 wei each on Base today).
-	///         Reverts when no pair got a newer price, so a keeper's pre-send simulation turns a
-	///         repeat of an already-relayed batch into a free no-op.
-	/// @return stored how many pairs got a newer price
-	function relayFunding(bytes calldata fundingCalldata) external payable returns (uint256 stored) {
-		if (fundingCalldata.length < 4 || bytes4(fundingCalldata[:4]) != FUNDING_SELECTOR) revert NotFundingCalldata();
-		(uint256[] memory pairIndexes, bytes[][] memory updates, uint8[] memory sourcing) =
-			abi.decode(fundingCalldata[4:], (uint256[], bytes[][], uint8[]));
-		if (pairIndexes.length != updates.length || pairIndexes.length != sourcing.length) revert LengthMismatch();
-
-		uint256 fee = lazer.verification_fee();
-		for (uint256 i; i < pairIndexes.length; ++i) {
-			if (sourcing[i] != PYTH_LAZER || updates[i].length == 0) continue;
-			try this.submit{value: fee}(pairIndexes[i], updates[i][0]) returns (bool ok) {
-				if (ok) ++stored;
-			} catch {}
-		}
-		if (stored == 0) revert NothingNewer();
-	}
-
-	/// @notice Verify one Pyth Lazer packet for `pairIndex` and store its price if newer.
-	/// @return stored false when the packet is valid but no newer than the stored price
+	/// @notice Verify one Pyth Lazer packet for `pairIndex`, signed within the last MAX_RELAY_AGE seconds, and store
+	///         it when Pyth signed it later than the stored one, without ever going back to an older trade.
+	/// @return stored false when the packet is valid but signed no later than the stored one, or carries an older
+	///         trade than it (an out-of-order relay)
 	function submit(uint256 pairIndex, bytes calldata update) external payable returns (bool stored) {
 		(bytes memory payload,) = lazer.verifyUpdate{value: lazer.verification_fee()}(update);
-		Feed memory feed = _parse(payload, pairIndex, uint32(pairs.getLazerFeedId(pairIndex)));
-		if (feed.timestampUs / 1e6 > block.timestamp) revert FeedFromFuture(feed.timestampUs);
-		if (feed.timestampUs <= latestOf[pairIndex].timestampUs) return false;
+		(Feed memory feed, uint64 headerUs) = _parse(payload, pairIndex, uint32(pairs.getLazerFeedId(pairIndex)));
+		if (headerUs / 1e6 > block.timestamp) revert FeedFromFuture(headerUs);
+		if (headerUs / 1e6 + MAX_RELAY_AGE < block.timestamp) revert PacketTooOld(headerUs);
+		Latest memory current = latestOf[pairIndex];
+		if (headerUs <= current.timestampUs || feed.timestampUs < current.feedUs) return false;
 
-		latestOf[pairIndex] = Latest(feed.price, feed.exponent, feed.timestampUs);
-		emit PriceStored(pairIndex, feed.price, feed.exponent, feed.timestampUs);
+		latestOf[pairIndex] = Latest(feed.price, feed.exponent, headerUs, feed.timestampUs);
+		emit PriceStored(pairIndex, feed.price, feed.exponent, headerUs, feed.timestampUs);
 		return true;
 	}
 
-	/// @notice The newest stored price for `pairIndex` (timestampUs 0 = never stored).
+	/// @notice The newest stored price for `pairIndex` and when Pyth last confirmed it (timestampUs 0 = never stored).
 	function latest(uint256 pairIndex) external view returns (int64 price, int16 exponent, uint64 timestampUs) {
 		Latest memory l = latestOf[pairIndex];
 		return (l.price, l.exponent, l.timestampUs);
 	}
 
-	// ─── Lazer payload ───────────────────────────────────────────────────────────
+	/// @notice When the stored price last changed on its own market (the feed's update time, microseconds).
+	function feedUpdatedUs(uint256 pairIndex) external view returns (uint64) {
+		return latestOf[pairIndex].feedUs;
+	}
+
+	// ─── Lazer payload (VerantaPriceStore's parser, unchanged, also returning the header time) ───────────────────
 	// header: magic u32 · timestamp u64 (µs) · channel u8 · feedsLen u8
 	// feed:   id u32 · numProperties u8 · properties (id u8 + value), all big-endian
 
-	function _parse(bytes memory payload, uint256 pairIndex, uint32 feedId) internal pure returns (Feed memory feed) {
+	function _parse(bytes memory payload, uint256 pairIndex, uint32 feedId)
+		internal
+		pure
+		returns (Feed memory feed, uint64 headerTimestampUs)
+	{
 		if (_read(payload, 0, 4) != PAYLOAD_MAGIC) revert BadPayloadMagic();
-		uint64 headerTimestampUs = uint64(_read(payload, 4, 8));
+		headerTimestampUs = uint64(_read(payload, 4, 8));
 		uint256 feedsLen = _read(payload, 13, 1);
 		uint256 pos = 14;
 		bool found;

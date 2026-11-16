@@ -3,18 +3,14 @@ pragma solidity 0.8.24;
 
 import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
 import {AggregatorV3Interface} from '../interfaces/AggregatorV3Interface.sol';
-import {VerantaPriceStoreV2} from './VerantaPriceStoreV2.sol';
-
-/// @notice A Coinbase B20 stock token's share-to-token ratio (1e18 = one share), which moves with reinvested dividends,
-///         fees and corporate actions.
-interface IB20Multiplier {
-	function multiplier() external view returns (uint256);
-}
+import {IVerantaPriceFeed} from '../interfaces/IVerantaPriceFeed.sol';
+import {IVerantaPriceStore} from '../interfaces/IVerantaPriceStore.sol';
+import {IB20Multiplier} from '../interfaces/external/IB20Multiplier.sol';
 
 /// @title B20VerantaPriceAdapter
 /// @notice One Coinbase stock token priced as a Chainlink AggregatorV3 feed (8 decimals) for a stock with no Chainlink
 ///         feed (founder 2026-10-25: MUc, PLTRc, NFLXc, AMDc, AVGOc, MRVLc, LLYc): Veranta's Pyth-signed share price
-///         from a VerantaPriceStoreV2 × the token's own `multiplier()` — never the share 1:1 (hard rule 3; the
+///         from the VerantaPriceStore × the token's own `multiplier()` — never the share 1:1 (hard rule 3; the
 ///         founder accepted pricing from the share and the token's ratio instead of a per-token feed). Checked on
 ///         2026-10-25: Veranta's NVDA × NVDAc's multiplier was within 9 bps of Chainlink's "Coinbase NVDA" feed.
 /// @dev Two ages, both against block.timestamp:
@@ -25,10 +21,10 @@ interface IB20Multiplier {
 ///      `store()`, `pairIndex()` and `maxPushAge()` are what funds-keeper and the terminal probe to push this price on
 ///      demand (VerantaPriceAdapter's surface). The constructor never calls the token: B20 tokens are a Base
 ///      precompile Foundry can't run, so deploy scripts must not touch them.
-contract B20VerantaPriceAdapter is AggregatorV3Interface {
+contract B20VerantaPriceAdapter is IVerantaPriceFeed {
 	uint8 internal constant DECIMALS = 8;
 
-	VerantaPriceStoreV2 public immutable store;
+	IVerantaPriceStore public immutable store;
 	uint256 public immutable pairIndex;
 	address public immutable token;
 	uint32 public immutable maxPushAge;
@@ -43,7 +39,7 @@ contract B20VerantaPriceAdapter is AggregatorV3Interface {
 	error BadMultiplier();
 
 	constructor(
-		VerantaPriceStoreV2 store_,
+		IVerantaPriceStore store_,
 		uint256 pairIndex_,
 		address token_,
 		uint32 maxPushAge_,

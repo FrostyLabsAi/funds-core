@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
-import {V6Host} from './utils/V6Host.sol';
+import {FundHost} from './utils/FundHost.sol';
 import {Test} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
-import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
-import {ComptrollerV6 as Comptroller} from '../src/core/ComptrollerV6.sol';
+import {SharesVaultDeployer} from '../src/core/SharesVaultDeployer.sol';
+import {Comptroller} from '../src/core/Comptroller.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {Shares} from '../src/fund/Shares.sol';
 import {IPolicy} from '../src/interfaces/IPolicy.sol';
@@ -16,6 +16,7 @@ import {MinMaxDepositPolicy} from '../src/policies/MinMaxDepositPolicy.sol';
 import {MaxPositionsPolicy} from '../src/policies/MaxPositionsPolicy.sol';
 import {UnrestrictedMandatePolicy} from '../src/policies/UnrestrictedMandatePolicy.sol';
 import {MockERC20, MockAggregator} from './utils/Mocks.sol';
+import {IShares} from '../src/interfaces/IShares.sol';
 
 /// @notice Policies are set once: every test registers its ruleset at creation via
 ///         createFund(config, policies) — there is no post-launch path.
@@ -38,7 +39,7 @@ contract PoliciesTest is Test {
 		vm.prank(admin);
 		interpreter.addPrimitive(address(usdc), address(usdcFeed), 7 days);
 
-		factory = new FundFactory(interpreter, V6Host.deployer(), new SharesVaultDeployer());
+		factory = new FundFactory(interpreter, FundHost.deployer(), new SharesVaultDeployer());
 		usdc.mint(alice, 100_000e6);
 		usdc.mint(carol, 100_000e6);
 	}
@@ -176,7 +177,7 @@ contract PoliciesTest is Test {
 		skip(30 minutes);
 		comptroller.executeDepositRequest(alice);
 
-		Shares shares = comptroller.shares();
+		IShares shares = comptroller.shares();
 
 		// Secondary transfer to listed bob: allowed
 		vm.prank(alice);

@@ -5,23 +5,11 @@ import {IERC20Metadata} from '@openzeppelin/contracts/token/ERC20/extensions/IER
 import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
 import {IDerivativePriceFeed} from '../interfaces/IDerivativePriceFeed.sol';
 import {IValueInterpreter} from '../interfaces/IValueInterpreter.sol';
+import {IPoolPriceRegistrar} from '../interfaces/IPoolPriceRegistrar.sol';
 import {ISlipstreamNonfungiblePositionManager} from '../interfaces/external/ISlipstreamNonfungiblePositionManager.sol';
 import {IFrostyClmVault, IFrostyClmStrategy} from '../interfaces/external/IFrostyClm.sol';
 import {TickMath} from '../libraries/TickMath.sol';
 import {LiquidityAmounts} from '../libraries/LiquidityAmounts.sol';
-
-/// @notice ValueInterpreter.getAssetInfo (not in IValueInterpreter): a non-zero aggregator means a priced primitive.
-interface IViAssetInfo {
-	function getAssetInfo(address asset)
-		external
-		view
-		returns (address aggregator, uint32 heartbeat, uint8 assetDecimals, uint8 rateDecimals);
-}
-
-/// @notice PoolPriceRegistrarV2.poolPricedAdapter: non-zero when `asset` is pool-priced there or in today's registrar.
-interface IPoolPricedLookup {
-	function poolPricedAdapter(address asset) external view returns (address);
-}
 
 /// @title ClmVaultPriceFeed
 /// @notice Derivative feed for FrostyFi CLM vault shares (funds-yield; plan 2, 2026-10-13). A share amount resolves to
@@ -45,8 +33,8 @@ contract ClmVaultPriceFeed is IDerivativePriceFeed {
 	/// @notice FrostyFi's strategy factory. Only its vaults are priced: anyone can deploy the same bytecode with their
 	///         own factory and fee settings.
 	address public immutable strategyFactory;
-	/// @notice Registrar V2, which answers for both registrars whether a token is pool-priced.
-	IPoolPricedLookup public immutable registrar;
+	/// @notice The pool-price registrar, which answers whether a token is pool-priced.
+	IPoolPriceRegistrar public immutable registrar;
 
 	error ZeroAddress();
 
@@ -56,7 +44,7 @@ contract ClmVaultPriceFeed is IDerivativePriceFeed {
 		}
 		valueInterpreter = valueInterpreter_;
 		strategyFactory = strategyFactory_;
-		registrar = IPoolPricedLookup(registrar_);
+		registrar = IPoolPriceRegistrar(registrar_);
 	}
 
 	/// @inheritdoc IDerivativePriceFeed
@@ -90,7 +78,7 @@ contract ClmVaultPriceFeed is IDerivativePriceFeed {
 
 	/// @dev A priced primitive that isn't pool-priced: a Chainlink-style feed (or Veranta/Redstone/Pyth store).
 	function _oracleFed(address token) private view returns (bool) {
-		(address aggregator,,,) = IViAssetInfo(address(valueInterpreter)).getAssetInfo(token);
+		(address aggregator,,,) = valueInterpreter.getAssetInfo(token);
 		return aggregator != address(0) && registrar.poolPricedAdapter(token) == address(0);
 	}
 
@@ -150,7 +138,7 @@ contract ClmVaultPriceFeed is IDerivativePriceFeed {
 		return abi.decode(ret, (address));
 	}
 
-	/// @dev Oracle USD rates → the sqrtPrice the pool should have (same math as CompounderPriceFeed).
+	/// @dev Oracle USD rates → the sqrtPrice the pool should have.
 	function _fairSqrtPriceX96(uint256 rate0, uint256 rate1, uint256 scale0, uint256 scale1) private pure returns (uint160) {
 		uint256 ratioX96 = Math.mulDiv(Math.mulDiv(rate0, Q96, rate1), scale1, scale0);
 

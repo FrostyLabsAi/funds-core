@@ -3,52 +3,42 @@ pragma solidity 0.8.24;
 
 import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
 import {PoolPriceAdapterBase} from './PoolPriceAdapterBase.sol';
-
-/// @notice The Aerodrome basic (v2-style) pool views the adapter reads.
-interface IAerodromeBasicPool {
-	function observationLength() external view returns (uint256);
-
-	function observations(uint256 index)
-		external
-		view
-		returns (uint256 timestamp, uint256 reserve0Cumulative, uint256 reserve1Cumulative);
-
-	function lastObservation()
-		external
-		view
-		returns (uint256 timestamp, uint256 reserve0Cumulative, uint256 reserve1Cumulative);
-
-	/// @notice Cumulative RESERVES (not prices, despite the name) at `block.timestamp`.
-	function currentCumulativePrices()
-		external
-		view
-		returns (uint256 reserve0Cumulative, uint256 reserve1Cumulative, uint256 blockTimestamp);
-
-	function getReserves() external view returns (uint256 reserve0, uint256 reserve1, uint256 blockTimestampLast);
-}
+import {IAerodromeBasicPool} from '../interfaces/external/IAerodromeBasicPool.sol';
 
 /// @title BasicPoolPriceAdapter
-/// @notice Prices one asset from its Aerodrome basic VOLATILE (x·y=k) pool: the pool's
-///         time-averaged reserves since its newest observation at least 30 minutes old (the pool
-///         records one at most every 30 minutes; a pool younger than that uses all it has), times
-///         the ValueInterpreter's USD price of the pool's other token. One minimal clone per asset
-///         (PoolPriceRegistrar); its Config is the clone's immutable args.
-/// @dev Only time moves the cumulatives, so a swap in the reading block can't move the average.
-///      Liquidity is the lower of the current quote reserve and its window average, both from
-///      `getReserves()` — never `balanceOf`, since `skim()` hands donations back to anyone.
-///      Ported from AerodromeBasicTwapAdapter without its spot-deviation revert.
+/// @notice A token's price from an Aerodrome basic VOLATILE pool's time-averaged reserves. The ≈ $0 rule reads only the
+///         window's average quote reserve, never the current one, which a large sale or an LP's own burn can empty inside one transaction (red-team PRICING-POOL-01,
+///         second pass, 2026-10-27).
+/// @dev - Windowed: the average quote reserve since the newest observation at least 30 minutes old. Only time moves the
+///        cumulatives, so nothing in the reading block moves it.
+///      - Current: `getReserves()`'s quote reserve (never `balanceOf`: `skim()` hands donations back to anyone); it counts
+///        only in `liquidityUsd()` (the buy floor).
 contract BasicPoolPriceAdapter is PoolPriceAdapterBase {
-	function _read(Config memory c, uint256 quoteUsd18) internal view override returns (uint256, uint256) {
-		IAerodromeBasicPool pool = IAerodromeBasicPool(c.pool);
-		(uint256 avgAsset, uint256 avgQuote) = _averageReserves(pool, c.assetIsToken0);
-		(uint256 r0, uint256 r1,) = pool.getReserves();
-		uint256 reserveQuote = c.assetIsToken0 ? r1 : r0;
-
-		uint256 liquidity = Math.mulDiv(Math.min(reserveQuote, avgQuote), quoteUsd18, 10 ** c.quoteDecimals);
+	function _read(Config memory c, uint256 quoteUsd18)
+		internal
+		view
+		override
+		returns (uint256 windowed, uint256 current, uint256 price)
+	{
+		(uint256 avgAsset, uint256 avgQuote) = _averageReserves(IAerodromeBasicPool(c.pool), c.assetIsToken0);
+		uint256 unit = 10 ** c.quoteDecimals;
+		windowed = Math.mulDiv(avgQuote, quoteUsd18, unit);
+		current = Math.mulDiv(_reserveQuote(c), quoteUsd18, unit);
 		// floor(avgQuote · 10^ad · quoteUsd18 / (avgAsset · 10^qd)), rounded once (mulDiv is 512-bit)
-		uint256 price =
-			avgAsset == 0 ? 0 : Math.mulDiv(avgQuote, 10 ** c.assetDecimals * quoteUsd18, avgAsset) / 10 ** c.quoteDecimals;
-		return (liquidity, price);
+		price = avgAsset == 0 ? 0 : Math.mulDiv(avgQuote, 10 ** c.assetDecimals * quoteUsd18, avgAsset) / unit;
+	}
+
+	/// @dev The quote reserve now against the window's average (review 2026-11-01). This ends the lag of the ≈ $0 rule, which
+	///      takes up to 9.7 h to show a rug in a quiet pool nobody calls `sync()` on. Added reserves do lift it within a block,
+	///      so a manager's own contract with a flash loan can pass it for one call: real capital, unlike a concentrated pool.
+	function _poolUnsettled(Config memory c) internal view override returns (bool) {
+		(, uint256 avgQuote) = _averageReserves(IAerodromeBasicPool(c.pool), c.assetIsToken0);
+		return _reserveQuote(c) * 2 < avgQuote;
+	}
+
+	function _reserveQuote(Config memory c) private view returns (uint256) {
+		(uint256 r0, uint256 r1,) = IAerodromeBasicPool(c.pool).getReserves();
+		return c.assetIsToken0 ? r1 : r0;
 	}
 
 	/// @dev Average reserves (raw units) from the newest observation at least WINDOW old — the last,

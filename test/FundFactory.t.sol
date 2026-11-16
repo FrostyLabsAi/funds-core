@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
-import {V6Host} from './utils/V6Host.sol';
+import {FundHost} from './utils/FundHost.sol';
 import {Test} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
-import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
-import {ComptrollerV6 as Comptroller} from '../src/core/ComptrollerV6.sol';
+import {SharesVaultDeployer} from '../src/core/SharesVaultDeployer.sol';
+import {Comptroller} from '../src/core/Comptroller.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {Shares} from '../src/fund/Shares.sol';
 import {Vault} from '../src/fund/Vault.sol';
@@ -14,6 +14,8 @@ import {MockERC20, MockAggregator} from './utils/Mocks.sol';
 import {IPolicy} from '../src/interfaces/IPolicy.sol';
 import {MaxConcentrationPolicy} from '../src/policies/MaxConcentrationPolicy.sol';
 import {MinMaxDepositPolicy} from '../src/policies/MinMaxDepositPolicy.sol';
+import {IShares} from '../src/interfaces/IShares.sol';
+import {IVault} from '../src/interfaces/IVault.sol';
 
 contract FundFactoryTest is Test {
 	FundFactory internal factory;
@@ -32,7 +34,7 @@ contract FundFactoryTest is Test {
 		vm.prank(admin);
 		interpreter.addPrimitive(address(usdc), address(usdcFeed), 1 days);
 
-		factory = new FundFactory(interpreter, V6Host.deployer(), new SharesVaultDeployer());
+		factory = new FundFactory(interpreter, FundHost.deployer(), new SharesVaultDeployer());
 		usdc.mint(alice, 10_000e6);
 	}
 
@@ -91,8 +93,8 @@ contract FundFactoryTest is Test {
 
 	function test_initialize_onlyFactory_once() public {
 		Comptroller comptroller = _createFund();
-		Shares shares = comptroller.shares();
-		Vault vault = comptroller.vault();
+		IShares shares = comptroller.shares();
+		IVault vault = comptroller.vault();
 
 		vm.expectRevert(Comptroller.OnlyFactory.selector);
 		comptroller.initialize(shares, vault);
@@ -104,7 +106,7 @@ contract FundFactoryTest is Test {
 
 	function test_sharesMintBurn_onlyComptroller() public {
 		Comptroller comptroller = _createFund();
-		Shares shares = comptroller.shares();
+		IShares shares = comptroller.shares();
 
 		vm.expectRevert(Shares.OnlyComptroller.selector);
 		shares.mint(alice, 1e18);
@@ -119,7 +121,7 @@ contract FundFactoryTest is Test {
 
 	function test_vaultWithdraw_onlyComptroller() public {
 		Comptroller comptroller = _createFund();
-		Vault vault = comptroller.vault();
+		IVault vault = comptroller.vault();
 		usdc.mint(address(vault), 100e6);
 
 		vm.expectRevert(Vault.OnlyComptroller.selector);

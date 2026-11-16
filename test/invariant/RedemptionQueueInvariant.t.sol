@@ -3,19 +3,20 @@ pragma solidity 0.8.24;
 
 import {Test} from 'forge-std/Test.sol';
 import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
-import {ComptrollerV6} from '../../src/core/ComptrollerV6.sol';
-import {RedemptionQueueV2} from '../../src/redemption/RedemptionQueueV2.sol';
+import {Comptroller} from '../../src/core/Comptroller.sol';
+import {RedemptionQueue} from '../../src/redemption/RedemptionQueue.sol';
 import {Shares} from '../../src/fund/Shares.sol';
 import {MockERC20, MockAggregator} from '../utils/Mocks.sol';
 import {MockUnwindPosition} from '../utils/MockUnwindPosition.sol';
-import {RedemptionFixtureV6} from '../utils/RedemptionFixtureV6.sol';
+import {RedemptionFixture} from '../utils/RedemptionFixture.sol';
+import {IShares} from '../../src/interfaces/IShares.sol';
 
 /// @dev Drives one fund v6: investors request, cancel, the manager
 ///      raises cash, anyone settles, time passes. Records what every settlement paid against the
 ///      share of NAV it was owed.
 contract RedemptionQueueHandler is Test {
-	ComptrollerV6 internal fund;
-	RedemptionQueueV2 internal queue;
+	Comptroller internal fund;
+	RedemptionQueue internal queue;
 	MockUnwindPosition internal position;
 	MockERC20 internal usdc;
 	MockAggregator internal usdcFeed;
@@ -28,8 +29,8 @@ contract RedemptionQueueHandler is Test {
 	uint256 public settlements;
 
 	constructor(
-		ComptrollerV6 fund_,
-		RedemptionQueueV2 queue_,
+		Comptroller fund_,
+		RedemptionQueue queue_,
 		MockUnwindPosition position_,
 		MockERC20 usdc_,
 		MockAggregator usdcFeed_,
@@ -55,7 +56,7 @@ contract RedemptionQueueHandler is Test {
 		uint256 bps = fractionBps % 2 == 0 ? 10_000 : bound(fractionBps, 1, 10_000);
 		uint256 shares = Math.mulDiv(free, bps, 10_000);
 		if (shares == 0) return;
-		Shares fundShares = fund.shares();
+		IShares fundShares = fund.shares();
 		vm.startPrank(investor);
 		fundShares.approve(address(queue), shares);
 		queue.requestRedeem(address(fund), shares);
@@ -95,7 +96,7 @@ contract RedemptionQueueHandler is Test {
 		uint256[] memory before = new uint256[](length);
 		bool[] memory wasOpen = new bool[](length);
 		for (uint256 id = head; id < length; ++id) {
-			RedemptionQueueV2.Request memory r = queue.requestAt(address(fund), id);
+			RedemptionQueue.Request memory r = queue.requestAt(address(fund), id);
 			wasOpen[id] = r.open;
 			before[id] = usdc.balanceOf(r.investor);
 		}
@@ -107,7 +108,7 @@ contract RedemptionQueueHandler is Test {
 		}
 		bool olderStillOpen;
 		for (uint256 id = head; id < length; ++id) {
-			RedemptionQueueV2.Request memory r = queue.requestAt(address(fund), id);
+			RedemptionQueue.Request memory r = queue.requestAt(address(fund), id);
 			if (!wasOpen[id]) continue;
 			if (r.open) {
 				olderStillOpen = true;
@@ -125,9 +126,9 @@ contract RedemptionQueueHandler is Test {
 /// @notice Settlement invariants (spec 2026-10-06 §10).
 /// forge-config: default.invariant.runs = 64
 /// forge-config: default.invariant.depth = 40
-contract RedemptionQueueInvariantTest is RedemptionFixtureV6 {
+contract RedemptionQueueInvariantTest is RedemptionFixture {
 	RedemptionQueueHandler internal handler;
-	ComptrollerV6 internal fund;
+	Comptroller internal fund;
 
 	function setUp() public override {
 		super.setUp();
@@ -157,7 +158,7 @@ contract RedemptionQueueInvariantTest is RedemptionFixtureV6 {
 		(uint256 head, uint256 length) = queue.queueBounds(address(fund));
 		uint256 open;
 		for (uint256 id = head; id < length; ++id) {
-			RedemptionQueueV2.Request memory r = queue.requestAt(address(fund), id);
+			RedemptionQueue.Request memory r = queue.requestAt(address(fund), id);
 			if (r.open) open += r.shares;
 		}
 		assertEq(fund.shares().balanceOf(address(queue)), open);

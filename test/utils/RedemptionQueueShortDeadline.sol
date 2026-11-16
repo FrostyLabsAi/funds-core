@@ -3,8 +3,8 @@ pragma solidity 0.8.24;
 
 import {RedemptionQueue} from '../../src/redemption/RedemptionQueue.sol';
 
-/// @dev Test only: the queue with a 1-second deadline, so a fork test can run the fallback within
-///      the seconds a real signed Veranta price stays usable for a fill. Production keeps 4 days.
+/// @dev Test only: RedemptionQueue with a 1-second deadline, so a fork test can liquidate within the seconds a real
+///      signed Veranta price (or a Chainlink round) stays usable. Production keeps 4 days.
 contract RedemptionQueueShortDeadline is RedemptionQueue {
 	constructor(address owner_) RedemptionQueue(owner_) {}
 

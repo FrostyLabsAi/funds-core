@@ -5,14 +5,18 @@ import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
 import {Ownable} from '@openzeppelin/contracts/access/Ownable.sol';
 import {Ownable2Step} from '@openzeppelin/contracts/access/Ownable2Step.sol';
-import {Comptroller} from './Comptroller.sol';
-import {Shares} from '../fund/Shares.sol';
-import {Vault} from '../fund/Vault.sol';
+import {IComptroller} from '../interfaces/IComptroller.sol';
+import {IShares} from '../interfaces/IShares.sol';
+import {IVault} from '../interfaces/IVault.sol';
+import {IAdapterRegistry} from '../interfaces/IAdapterRegistry.sol';
+import {IProtocolFeeConfig} from '../interfaces/IProtocolFeeConfig.sol';
+import {IPositionTypeRegistry} from '../interfaces/IPositionTypeRegistry.sol';
+import {IFundRegistry} from '../interfaces/IFundRegistry.sol';
 import {IValueInterpreter} from '../interfaces/IValueInterpreter.sol';
 import {IPolicy} from '../interfaces/IPolicy.sol';
 import {UnrestrictedMandatePolicy} from '../policies/UnrestrictedMandatePolicy.sol';
 import {IProtocolFeeReserve} from '../interfaces/IProtocolFeeReserve.sol';
-import {SharesVaultDeployer} from './FundComponentDeployers.sol';
+import {ISharesVaultDeployer} from '../interfaces/ISharesVaultDeployer.sol';
 import {IComptrollerDeployer} from '../interfaces/IComptrollerDeployer.sol';
 
 /// @title FundFactory
@@ -21,7 +25,7 @@ import {IComptrollerDeployer} from '../interfaces/IComptrollerDeployer.sol';
 ///      at a fixed build and each fund owner opts in by reconfiguring (behind the exit window).
 ///      The `guardian` can pause any fund's deposits instantly; only the owner unpauses. Guardians
 ///      never touch redemptions, custody or configuration.
-contract FundFactory is Ownable2Step {
+contract FundFactory is IAdapterRegistry, IProtocolFeeConfig, IPositionTypeRegistry, IFundRegistry, Ownable2Step {
 	struct FundConfig {
 		string name;
 		string symbol;
@@ -72,7 +76,7 @@ contract FundFactory is Ownable2Step {
 	IValueInterpreter public immutable valueInterpreter;
 	/// @dev Settable so a fixed Comptroller build can ship; affects only funds and requests created after.
 	IComptrollerDeployer public comptrollerDeployer;
-	SharesVaultDeployer public immutable sharesVaultDeployer;
+	ISharesVaultDeployer public immutable sharesVaultDeployer;
 	/// @notice The "may hold anything" mandate, attached when a fund is created without one.
 	address public immutable unrestrictedMandate;
 	address public guardian;
@@ -153,7 +157,7 @@ contract FundFactory is Ownable2Step {
 	constructor(
 		IValueInterpreter valueInterpreter_,
 		IComptrollerDeployer comptrollerDeployer_,
-		SharesVaultDeployer sharesVaultDeployer_
+		ISharesVaultDeployer sharesVaultDeployer_
 	) Ownable(msg.sender) {
 		if (
 			address(valueInterpreter_) == address(0) || address(comptrollerDeployer_) == address(0)
@@ -223,20 +227,20 @@ contract FundFactory is Ownable2Step {
 		if (sharesAmount == 0) revert ZeroBuyBack();
 
 		// settles all fees (incl. protocol) and returns the settled gross share price
-		uint256 sharePrice = Comptroller(comptroller).settleFees();
+		uint256 sharePrice = IComptroller(comptroller).settleFees();
 		uint256 shareValue = Math.mulDiv(sharesAmount, sharePrice, SHARES_UNIT);
 
 		address recipient = protocolFeeRecipient;
 		address burnAsset = IProtocolFeeReserve(recipient).burnAsset();
 		uint256 burnAssetValue = valueInterpreter.calcCanonicalAssetValue(
-			address(Comptroller(comptroller).denominationAsset()), shareValue, burnAsset
+			address(IComptroller(comptroller).denominationAsset()), shareValue, burnAsset
 		);
 
 		uint256 amountToBurn = IProtocolFeeReserve(recipient).buyBackShares(sharesAmount, burnAssetValue);
 		// the reserve prices a discount: never burn more than the shares' market value
 		if (amountToBurn == 0 || amountToBurn > burnAssetValue) revert ZeroBuyBack();
 
-		Comptroller(comptroller).executeProtocolFeeBuyBack(recipient, burnAsset, sharesAmount, amountToBurn);
+		IComptroller(comptroller).executeProtocolFeeBuyBack(recipient, burnAsset, sharesAmount, amountToBurn);
 	}
 
 	// ─── Comptroller fix path ────────────────────────────────────────────────────
@@ -290,14 +294,14 @@ contract FundFactory is Ownable2Step {
 	function pauseFundDeposits(address comptroller) external {
 		if (msg.sender != guardian) revert OnlyGuardian();
 		if (funds[comptroller].comptroller == address(0)) revert UnknownFund(comptroller);
-		Comptroller(comptroller).setGuardianDepositsPaused(true);
+		IComptroller(comptroller).setGuardianDepositsPaused(true);
 		emit FundDepositsPausedByGuardian(comptroller);
 	}
 
 	/// @notice Only the owner re-enables deposits.
 	function unpauseFundDeposits(address comptroller) external onlyOwner {
 		if (funds[comptroller].comptroller == address(0)) revert UnknownFund(comptroller);
-		Comptroller(comptroller).setGuardianDepositsPaused(false);
+		IComptroller(comptroller).setGuardianDepositsPaused(false);
 		emit FundDepositsUnpausedByOwner(comptroller);
 	}
 
@@ -322,21 +326,21 @@ contract FundFactory is Ownable2Step {
 		for (uint256 i; i < policies.length; ++i) {
 			if (policies[i].policy == address(0)) revert ZeroAddress();
 			if (policies[i].hook == IPolicy.PolicyHook.PostCallOnIntegration) hasMandate = true;
-			Comptroller(comptrollerAddress).addPolicy(policies[i].hook, policies[i].policy);
+			IComptroller(comptrollerAddress).addPolicy(policies[i].hook, policies[i].policy);
 		}
 		if (!hasMandate) {
-			Comptroller(comptrollerAddress).addPolicy(
+			IComptroller(comptrollerAddress).addPolicy(
 				IPolicy.PolicyHook.PostCallOnIntegration, unrestrictedMandate
 			);
 		}
-		_attachMandatoryPolicies(Comptroller(comptrollerAddress));
+		_attachMandatoryPolicies(IComptroller(comptrollerAddress));
 	}
 
 	function createFund(FundConfig calldata config) external returns (address comptrollerAddress) {
 		comptrollerAddress = _createFund(config);
 		// no ruleset: the fund still carries its mandate on-chain
-		Comptroller(comptrollerAddress).addPolicy(IPolicy.PolicyHook.PostCallOnIntegration, unrestrictedMandate);
-		_attachMandatoryPolicies(Comptroller(comptrollerAddress));
+		IComptroller(comptrollerAddress).addPolicy(IPolicy.PolicyHook.PostCallOnIntegration, unrestrictedMandate);
+		_attachMandatoryPolicies(IComptroller(comptrollerAddress));
 	}
 
 	/// @notice Replace the protocol's mandatory-policy list (new funds + reconfigurations).
@@ -355,7 +359,7 @@ contract FundFactory is Ownable2Step {
 
 	/// @dev Attach every mandatory policy the fund does not already carry on that hook (a
 	///      manager may have included one in their own ruleset; no double runs).
-	function _attachMandatoryPolicies(Comptroller comptroller) private {
+	function _attachMandatoryPolicies(IComptroller comptroller) private {
 		for (uint256 i; i < mandatoryPolicies.length; ++i) {
 			PolicyReg memory reg = mandatoryPolicies[i];
 			// a mandatory policy with an approved fix is satisfied by either; a fund with
@@ -380,8 +384,8 @@ contract FundFactory is Ownable2Step {
 		if (isFundNameTaken[nameHash]) revert FundNameTaken(config.name);
 		isFundNameTaken[nameHash] = true;
 
-		Comptroller comptroller = _deployComptroller(config);
-		(Shares shares, Vault vault) = sharesVaultDeployer.deploy(config.name, config.symbol, address(comptroller));
+		IComptroller comptroller = _deployComptroller(config);
+		(IShares shares, IVault vault) = sharesVaultDeployer.deploy(config.name, config.symbol, address(comptroller));
 		comptroller.initialize(shares, vault);
 
 		comptrollerAddress = address(comptroller);
@@ -400,14 +404,14 @@ contract FundFactory is Ownable2Step {
 	}
 
 	/// @dev Deploys a Comptroller and enforces its bytecode caps against the config.
-	function _deployComptroller(FundConfig calldata config) private returns (Comptroller comptroller) {
+	function _deployComptroller(FundConfig calldata config) private returns (IComptroller comptroller) {
 		uint256 mgmtRate = config.mgmtScaledPerSecondRate == 0 ? RATE_SCALE : config.mgmtScaledPerSecondRate;
 
 		comptroller = comptrollerDeployer.deploy(
 			config.fundOwner,
 			config.denominationAsset,
 			valueInterpreter,
-			Comptroller.FeeConfig({mgmtScaledPerSecondRate: uint128(mgmtRate), perfFeeBps: config.perfFeeBps}),
+			IComptroller.FeeConfig({mgmtScaledPerSecondRate: uint128(mgmtRate), perfFeeBps: config.perfFeeBps}),
 			config.sharesActionTimelock,
 			config.minRequestDuration,
 			config.executionWindow,
@@ -457,7 +461,7 @@ contract FundFactory is Ownable2Step {
 		if (info.comptroller == address(0)) revert UnknownFund(oldComptroller);
 		if (msg.sender != info.fundOwner) revert OnlyFundOwner();
 		if (config.fundOwner != info.fundOwner) revert FundOwnerMismatch();
-		if (address(config.denominationAsset) != address(Comptroller(oldComptroller).denominationAsset())) {
+		if (address(config.denominationAsset) != address(IComptroller(oldComptroller).denominationAsset())) {
 			revert DenominationAssetMismatch();
 		}
 		if (reconfigurationRequests[oldComptroller].newComptroller != address(0)) {
@@ -465,22 +469,22 @@ contract FundFactory is Ownable2Step {
 		}
 		// A shut-down fund can't reconfigure. A guardian-paused one can (the bug-fix path),
 		// and the pause carries over to the new Comptroller.
-		if (Comptroller(oldComptroller).shutDown()) revert FundSuspended();
+		if (IComptroller(oldComptroller).shutDown()) revert FundSuspended();
 
 		newComptroller = address(_deployComptroller(config));
 		// recent depositors are locked for sharesActionTimelock, so the window is at least that long
 		uint256 window = RECONFIGURATION_TIMELOCK;
-		uint256 holderTimelock = Comptroller(oldComptroller).sharesActionTimelock();
+		uint256 holderTimelock = IComptroller(oldComptroller).sharesActionTimelock();
 		if (holderTimelock > window) window = holderTimelock;
 		uint64 executableAt = uint64(block.timestamp + window);
 		reconfigurationRequests[oldComptroller] =
 			ReconfigurationRequest({newComptroller: newComptroller, executableAt: executableAt});
-		_recordPolicySwaps(Comptroller(oldComptroller), policiesToReplace);
+		_recordPolicySwaps(IComptroller(oldComptroller), policiesToReplace);
 
 		emit ReconfigurationRequested(oldComptroller, newComptroller, executableAt);
 	}
 
-	function _recordPolicySwaps(Comptroller old, address[] memory policiesToReplace) private {
+	function _recordPolicySwaps(IComptroller old, address[] memory policiesToReplace) private {
 		PolicySwap[] storage swaps = requestedPolicySwaps[address(old)];
 		for (uint256 i; i < policiesToReplace.length; ++i) {
 			address from = policiesToReplace[i];
@@ -495,7 +499,7 @@ contract FundFactory is Ownable2Step {
 		}
 	}
 
-	function _hasPolicy(Comptroller comptroller, address policy) private view returns (bool) {
+	function _hasPolicy(IComptroller comptroller, address policy) private view returns (bool) {
 		for (uint8 h; h <= uint8(IPolicy.PolicyHook.RemoveExternalPosition); ++h) {
 			address[] memory hookPolicies = comptroller.getPolicies(IPolicy.PolicyHook(h));
 			for (uint256 i; i < hookPolicies.length; ++i) {
@@ -525,7 +529,7 @@ contract FundFactory is Ownable2Step {
 		if (request.newComptroller == address(0)) revert NoReconfigurationRequest();
 		if (block.timestamp < request.executableAt) revert ReconfigurationTimelocked(request.executableAt);
 
-		Comptroller old = Comptroller(oldComptroller);
+		IComptroller old = IComptroller(oldComptroller);
 		// a shutdown during the window binds; a guardian pause carries over below
 		if (old.shutDown()) revert FundSuspended();
 		bool guardianPaused = old.guardianDepositsPaused();
@@ -535,18 +539,18 @@ contract FundFactory is Ownable2Step {
 		// settle fees at the handover (old rates apply up to now; needs valid pricing)
 		old.settleFees();
 
-		Shares shares = old.shares();
-		Vault vault = old.vault();
+		IShares shares = old.shares();
+		IVault vault = old.vault();
 		shares.migrateComptroller(request.newComptroller);
 		vault.migrateComptroller(request.newComptroller);
-		Comptroller(request.newComptroller).initializeForMigration(shares, vault, old);
+		IComptroller(request.newComptroller).initializeForMigration(shares, vault, old);
 
 		// every policy carries over (bar an approved fix the owner requested); mandatory
 		// policies the fund predates are added
-		_carryPolicies(old, Comptroller(request.newComptroller));
-		_attachMandatoryPolicies(Comptroller(request.newComptroller));
+		_carryPolicies(old, IComptroller(request.newComptroller));
+		_attachMandatoryPolicies(IComptroller(request.newComptroller));
 		// the pause survives the swap: only the owner re-enables deposits
-		if (guardianPaused) Comptroller(request.newComptroller).setGuardianDepositsPaused(true);
+		if (guardianPaused) IComptroller(request.newComptroller).setGuardianDepositsPaused(true);
 
 		// the old Comptroller never takes deposits again (escrow cancellation still works)
 		old.setGuardianDepositsPaused(true);
@@ -567,7 +571,7 @@ contract FundFactory is Ownable2Step {
 
 	/// @dev Each swap must still be approved for exactly the recorded replacement; a revocation or
 	///      change mid-window blocks execution (cancel and re-request).
-	function _carryPolicies(Comptroller old, Comptroller fresh) private {
+	function _carryPolicies(IComptroller old, IComptroller fresh) private {
 		PolicySwap[] memory swaps = requestedPolicySwaps[address(old)];
 		for (uint256 s; s < swaps.length; ++s) {
 			if (policyReplacements[swaps[s].from] != swaps[s].to) revert PolicyReplacementChanged(swaps[s].from);

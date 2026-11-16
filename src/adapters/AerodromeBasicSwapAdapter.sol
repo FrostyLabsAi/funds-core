@@ -4,23 +4,27 @@ pragma solidity 0.8.24;
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {SafeERC20} from '@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol';
 import {IIntegrationAdapter} from '../interfaces/IIntegrationAdapter.sol';
+import {ProtocolFeeAdapter} from './ProtocolFeeAdapter.sol';
 import {IAerodromeRouter} from '../interfaces/external/IAerodromeRouter.sol';
 
 /// @title AerodromeBasicSwapAdapter
-/// @notice Single-hop exactIn swaps on Aerodrome basic VOLATILE pools (vAMM, x·y=k).
+/// @notice Single-hop exactIn swaps on Aerodrome basic VOLATILE pools (vAMM, x·y=k), with the protocol fee
+///         (ProtocolFeeAdapter) on what arrived.
 /// @dev integrationData = abi.encode(tokenIn, tokenOut, amountIn, minAmountOut).
-///      Stable (sAMM) pools are never routed, matching the TWAP listing registry. Swaps the adapter's
+///      Stable (sAMM) pools are never routed. Swaps the adapter's
 ///      whole tokenIn balance (what actually arrived, so a taxed transfer in is spent as received)
-///      through the router's fee-on-transfer path. Stateless and holds no funds between calls;
+///      through the router's fee-on-transfer path. Holds no funds between calls (the fee goes straight to the Treasury);
 ///      output goes directly to the vault.
-contract AerodromeBasicSwapAdapter is IIntegrationAdapter {
+contract AerodromeBasicSwapAdapter is IIntegrationAdapter, ProtocolFeeAdapter {
 	using SafeERC20 for IERC20;
 
 	IAerodromeRouter public immutable router;
 	/// @notice The PoolFactory whose volatile pools are routed (the router's defaultFactory).
 	address public immutable poolFactory;
 
-	constructor(IAerodromeRouter router_, address poolFactory_) {
+	constructor(IAerodromeRouter router_, address poolFactory_, address treasury_, uint16 feeBps_, address owner_)
+		ProtocolFeeAdapter(treasury_, feeBps_, owner_)
+	{
 		router = router_;
 		poolFactory = poolFactory_;
 	}
@@ -54,7 +58,7 @@ contract AerodromeBasicSwapAdapter is IIntegrationAdapter {
 		(address tokenIn, address tokenOut,, uint256 minAmountOut) =
 			abi.decode(integrationData, (address, address, uint256, uint256));
 
-		uint256 balance = IERC20(tokenIn).balanceOf(address(this));
+		uint256 balance = _takeFee(tokenIn, IERC20(tokenIn).balanceOf(address(this)));
 		IAerodromeRouter.Route[] memory routes = new IAerodromeRouter.Route[](1);
 		routes[0] = IAerodromeRouter.Route({from: tokenIn, to: tokenOut, stable: false, factory: poolFactory});
 

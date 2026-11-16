@@ -1,24 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
-import {V6Host} from './utils/V6Host.sol';
+import {FundHost} from './utils/FundHost.sol';
 import {Test} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {Ownable2Step} from '@openzeppelin/contracts/access/Ownable2Step.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
-import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
-import {ComptrollerV6 as Comptroller} from '../src/core/ComptrollerV6.sol';
+import {SharesVaultDeployer} from '../src/core/SharesVaultDeployer.sol';
+import {Comptroller} from '../src/core/Comptroller.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {IPolicy} from '../src/interfaces/IPolicy.sol';
 import {IUniswapV3SwapRouter} from '../src/interfaces/external/IUniswapV3SwapRouter.sol';
 import {UniswapV3SwapAdapter} from '../src/adapters/UniswapV3SwapAdapter.sol';
 import {PoolPriceRegistrar} from '../src/pricing/PoolPriceRegistrar.sol';
-import {PoolPriceRegistrarWindowed} from '../src/pricing/PoolPriceRegistrarWindowed.sol';
+import {RegistrarFixture} from './utils/RegistrarFixture.sol';
 import {MinPoolLiquidityPolicy} from '../src/policies/MinPoolLiquidityPolicy.sol';
-import {MockERC20, MockAggregator, MockSwapRouter, MockUniV3PositionManager} from './utils/Mocks.sol';
-import {LimitOrderPosition, LimitOrderPositionFactory} from '../src/positions/LimitOrderPosition.sol';
-import {UniswapV3LPPositionFactory} from '../src/positions/UniswapV3LPPosition.sol';
-import {IUniswapV3NonfungiblePositionManager} from '../src/interfaces/external/IUniswapV3NonfungiblePositionManager.sol';
+import {MockERC20, MockAggregator, MockSwapRouter} from './utils/Mocks.sol';
 import {
 	ScriptedCLPool,
 	MockUniswapV3Factory,
@@ -42,8 +39,6 @@ contract MinPoolLiquidityPolicyTest is Test {
 	ScriptedCLPool internal pool;
 	Comptroller internal fund;
 
-	uint256 internal constant LIMIT_ORDER_TYPE = 2;
-	uint256 internal constant LP_TYPE = 3;
 
 	address internal manager = makeAddr('manager');
 	address internal alice = makeAddr('alice');
@@ -60,20 +55,9 @@ contract MinPoolLiquidityPolicyTest is Test {
 		MockUniswapV3Factory uniswap = new MockUniswapV3Factory();
 		address[] memory quotes = new address[](1);
 		quotes[0] = address(usdc);
-		registrar = PoolPriceRegistrar(address(new PoolPriceRegistrarWindowed(
-			PoolPriceRegistrarWindowed.Wiring({
-				valueInterpreter: vi,
-				uniswapV3Factory: address(uniswap),
-				slipstreamFactories: [
-					address(new MockSlipstreamFactory()),
-					address(new MockSlipstreamFactory()),
-					address(new MockSlipstreamFactory())
-				],
-				aerodromeBasicFactory: address(new MockAerodromeBasicFactory()),
-				quotes: quotes
-			}),
-			address(this)
-		)));
+		registrar = RegistrarFixture.deploy(
+			address(vi), address(uniswap), [address(new MockSlipstreamFactory()), address(new MockSlipstreamFactory()), address(new MockSlipstreamFactory())], address(new MockAerodromeBasicFactory()), quotes, address(this)
+		);
 		vi.transferOwnership(address(registrar));
 		registrar.execute(abi.encodeCall(Ownable2Step.acceptOwnership, ()));
 
@@ -85,9 +69,9 @@ contract MinPoolLiquidityPolicyTest is Test {
 		registrar.register(address(tkn), address(pool));
 
 		policy = new MinPoolLiquidityPolicy(registrar);
-		factory = new FundFactory(vi, V6Host.deployer(), new SharesVaultDeployer());
+		factory = new FundFactory(vi, FundHost.deployer(), new SharesVaultDeployer());
 		router = new MockSwapRouter();
-		uniAdapter = new UniswapV3SwapAdapter(IUniswapV3SwapRouter(address(router)));
+		uniAdapter = new UniswapV3SwapAdapter(IUniswapV3SwapRouter(address(router)), address(0xFEE), 0, address(this));
 		factory.registerAdapter(address(uniAdapter));
 		IPolicy.PolicyHook[] memory hooks = policy.implementedHooks();
 		FundFactory.PolicyReg[] memory mandatory = new FundFactory.PolicyReg[](hooks.length);
@@ -95,11 +79,6 @@ contract MinPoolLiquidityPolicyTest is Test {
 			mandatory[i] = FundFactory.PolicyReg({hook: hooks[i], policy: address(policy)});
 		}
 		factory.setMandatoryPolicies(mandatory);
-		factory.registerPositionType(LIMIT_ORDER_TYPE, address(new LimitOrderPositionFactory()));
-		factory.registerPositionType(
-			LP_TYPE,
-			address(new UniswapV3LPPositionFactory(IUniswapV3NonfungiblePositionManager(address(new MockUniV3PositionManager()))))
-		);
 
 		fund = _fund();
 	}
@@ -182,69 +161,20 @@ contract MinPoolLiquidityPolicyTest is Test {
 		assertEq(_held(weth), 1e18);
 	}
 
-	// ─── long-tail tokens stay out of positions ──────────────────────────────────
+	// ─── hooks ───────────────────────────────────────────────────────────────────
 
-	function _limitOrderPosition() internal returns (LimitOrderPosition position) {
-		vm.prank(manager);
-		position = LimitOrderPosition(fund.createExternalPosition(LIMIT_ORDER_TYPE, ''));
+	/// The policy runs on trades only (2026-11-15: its LP and limit-order checks went with those position types).
+	function test_implementsOnlyThePostTradeHook() public view {
+		IPolicy.PolicyHook[] memory hooks = policy.implementedHooks();
+		assertEq(hooks.length, 1);
+		assertEq(uint8(hooks[0]), uint8(IPolicy.PolicyHook.PostCallOnIntegration));
 	}
 
-	function _placeOrder(LimitOrderPosition position, address sell, address buy, uint256 sellAmt, uint256 minBuy)
-		internal
-	{
-		address[] memory transferAssets = new address[](1);
-		transferAssets[0] = sell;
-		uint256[] memory transferAmounts = new uint256[](1);
-		transferAmounts[0] = sellAmt;
-		bytes memory place = abi.encode(
-			uint8(LimitOrderPosition.Action.PlaceOrder),
-			abi.encode(sell, buy, uint128(sellAmt), uint128(minBuy), uint64(block.timestamp + 1 days))
+	function test_refusesToRunOnAPositionHook() public {
+		vm.expectRevert(
+			abi.encodeWithSelector(MinPoolLiquidityPolicy.UnsupportedHook.selector, IPolicy.PolicyHook.CreateExternalPosition)
 		);
-		vm.prank(manager);
-		fund.callOnExternalPosition(address(position), transferAssets, transferAmounts, new address[](0), place);
-	}
-
-	function test_aFundCannotOpenAnLpPositionOnAPoolPricedToken() public {
-		vm.prank(manager);
-		vm.expectRevert(abi.encodeWithSelector(MinPoolLiquidityPolicy.PoolPricedTokenInPosition.selector, address(tkn)));
-		fund.createExternalPosition(LP_TYPE, abi.encode(address(tkn), address(usdc), uint24(3000)));
-	}
-
-	function test_aFundOpensAnLpPositionOnTokensPricedOtherwise() public {
-		vm.prank(manager);
-		fund.createExternalPosition(LP_TYPE, abi.encode(address(weth), address(usdc), uint24(3000)));
-
-		assertEq(fund.getExternalPositions().length, 1);
-	}
-
-	function test_aLimitOrderBuyingAPoolPricedTokenIsRefused() public {
-		LimitOrderPosition position = _limitOrderPosition();
-
-		vm.expectRevert(abi.encodeWithSelector(MinPoolLiquidityPolicy.PoolPricedTokenInPosition.selector, address(tkn)));
-		this.placeOrderAsManager(position, address(usdc), address(tkn), 1_000e6, 1_000e6);
-	}
-
-	function test_aLimitOrderSellingAPoolPricedTokenIsRefused() public {
-		_swap(address(usdc), address(tkn), 1_000e6, 1_000e6);
-		LimitOrderPosition position = _limitOrderPosition();
-
-		vm.expectRevert(abi.encodeWithSelector(MinPoolLiquidityPolicy.PoolPricedTokenInPosition.selector, address(tkn)));
-		this.placeOrderAsManager(position, address(tkn), address(usdc), 1_000e6, 1_000e6);
-	}
-
-	function test_aLimitOrderBetweenTokensPricedOtherwiseIsAllowed() public {
-		LimitOrderPosition position = _limitOrderPosition();
-
-		_placeOrder(position, address(usdc), address(weth), 2_000e6, 1e18);
-
-		assertEq(usdc.balanceOf(address(position)), 2_000e6);
-	}
-
-	/// @dev Lets expectRevert land on the fund call itself, not the order encoding before it.
-	function placeOrderAsManager(LimitOrderPosition position, address sell, address buy, uint256 sellAmt, uint256 minBuy)
-		external
-	{
-		_placeOrder(position, sell, buy, sellAmt, minBuy);
+		policy.validate(IPolicy.PolicyHook.CreateExternalPosition, abi.encode(uint256(6), address(1)));
 	}
 
 	function test_refusesToRunOnAnyOtherHook() public {

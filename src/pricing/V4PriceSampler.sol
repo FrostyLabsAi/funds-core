@@ -4,6 +4,7 @@ pragma solidity 0.8.24;
 import {Ownable} from '@openzeppelin/contracts/access/Ownable.sol';
 import {Ownable2Step} from '@openzeppelin/contracts/access/Ownable2Step.sol';
 import {IV4StateView} from '../interfaces/external/IUniswapV4.sol';
+import {IV4PriceSampler} from '../interfaces/IV4PriceSampler.sol';
 
 /// @title V4PriceSampler
 /// @notice Price history for Uniswap v4 pools, which keep none of their own (no `observe`): an approved keeper
@@ -12,17 +13,10 @@ import {IV4StateView} from '../interfaces/external/IUniswapV4.sol';
 ///         founder 2026-10-08: on-chain sampling every 10 minutes, keeper-only).
 /// @dev Sampling is keeper-only: if anyone could sample, an attacker could fill a pool's history with readings
 ///      taken while they hold the price up. The keeper only chooses when; the values come from the pool.
-contract V4PriceSampler is Ownable2Step {
+contract V4PriceSampler is IV4PriceSampler, Ownable2Step {
 	uint256 public constant SLOTS = 12;
 	/// @notice A pool sampled more recently than this is skipped, so a keeper bug can't flood its history.
 	uint256 public constant MIN_INTERVAL = 9 minutes;
-
-	/// @dev One storage slot: 32 + 24 + 128 bits.
-	struct Sample {
-		uint32 time;
-		int24 tick;
-		uint128 liquidity;
-	}
 
 	IV4StateView public immutable stateView;
 

@@ -5,29 +5,30 @@ import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {Ownable2Step} from '@openzeppelin/contracts/access/Ownable2Step.sol';
 import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
 import {FundFactory} from '../../src/core/FundFactory.sol';
-import {ComptrollerBlueprintDeployer, SharesVaultDeployer} from '../../src/core/FundComponentDeployers.sol';
-import {ComptrollerV6} from '../../src/core/ComptrollerV6.sol';
+import {ComptrollerBlueprintDeployer} from '../../src/core/ComptrollerBlueprintDeployer.sol';
+import {SharesVaultDeployer} from '../../src/core/SharesVaultDeployer.sol';
+import {Comptroller} from '../../src/core/Comptroller.sol';
 import {ValueInterpreter} from '../../src/core/ValueInterpreter.sol';
-import {Shares} from '../../src/fund/Shares.sol';
+import {IShares} from '../../src/interfaces/IShares.sol';
 import {IPolicy} from '../../src/interfaces/IPolicy.sol';
 import {IUniswapV3SwapRouter} from '../../src/interfaces/external/IUniswapV3SwapRouter.sol';
 import {UniswapV3SwapAdapter} from '../../src/adapters/UniswapV3SwapAdapter.sol';
 import {PoolPriceRegistrar} from '../../src/pricing/PoolPriceRegistrar.sol';
-import {PoolPriceRegistrarWindowed} from '../../src/pricing/PoolPriceRegistrarWindowed.sol';
+import {RegistrarFixture} from '../utils/RegistrarFixture.sol';
 import {MinPoolLiquidityPolicy} from '../../src/policies/MinPoolLiquidityPolicy.sol';
 import {CumulativeSlippageTolerancePolicy} from '../../src/policies/CumulativeSlippageTolerancePolicy.sol';
-import {RedemptionQueueV2} from '../../src/redemption/RedemptionQueueV2.sol';
+import {RedemptionQueue} from '../../src/redemption/RedemptionQueue.sol';
 import {MockERC20, MockAggregator, MockSwapRouter} from '../utils/Mocks.sol';
-import {MockPerpAccountFactory} from '../utils/MockRedemptionQueueV6.sol';
+import {MockPerpAccountFactory} from '../utils/MockRedemptionQueue.sol';
 import {MockUnwindPosition, MockUnwindPositionFactory} from '../utils/MockUnwindPosition.sol';
 import {ScriptedCLPool, MockUniswapV3Factory, MockSlipstreamFactory, MockAerodromeBasicFactory} from '../utils/PoolPriceMocks.sol';
 
 /// @notice Theft rules for fund v6 (founder 2026-11-04: "the worst possible thing that could happen is an attacker finding an
-///         exploit in the contracts and draining funds"). The real ComptrollerV6, RedemptionQueueV2, Vault, Shares, ValueInterpreter,
+///         exploit in the contracts and draining funds"). The real Comptroller, RedemptionQueue, Vault, Shares, ValueInterpreter,
 ///         windowed registrar and mandatory policies, on mock tokens, feeds, a scripted pool and a router that pays what it's told.
 ///         Run on a copy of the repo, one target at a time, because it rewrites crytic-export and fills medusa-corpus:
 ///         medusa fuzz --config medusa.json --target-contracts OutsiderTheft (or ManagerTheft, FloorTheft, WaitRules)
-///         Medusa can't parse a library function with a dotted type in its ABI (IPolicy.PolicyHook, in ComptrollerV3Lib). So first,
+///         Medusa can't parse a library function with a dotted type in its ABI (IPolicy.PolicyHook, in ComptrollerLib). So first,
 ///         once: run crytic-compile with medusa.json's two args and --export-format solc, drop every ABI entry with an input or output type
 ///         containing a dot from crytic-export/combined_solc.json, keep the file outside the copy, and put a crytic-compile first on PATH
 ///         that only copies it back into crytic-export.
@@ -51,15 +52,15 @@ abstract contract TheftWorld {
 	uint256 internal constant MAX_DEPOSIT = 2_000_000e6;
 
 	ValueInterpreter internal vi;
-	PoolPriceRegistrarWindowed internal registrar;
+	PoolPriceRegistrar internal registrar;
 	FundFactory internal factory;
-	RedemptionQueueV2 internal queue;
+	RedemptionQueue internal queue;
 	CumulativeSlippageTolerancePolicy internal slippage;
 	MockSwapRouter internal router;
 	UniswapV3SwapAdapter internal adapter;
 	ScriptedCLPool internal pool;
-	ComptrollerV6 internal fund;
-	Shares internal shares;
+	Comptroller internal fund;
+	IShares internal shares;
 	address internal vault;
 
 	MockERC20 internal usdc;
@@ -114,19 +115,8 @@ abstract contract TheftWorld {
 		MockUniswapV3Factory uniswap = new MockUniswapV3Factory();
 		address[] memory quotes = new address[](1);
 		quotes[0] = address(usdc);
-		registrar = new PoolPriceRegistrarWindowed(
-			PoolPriceRegistrarWindowed.Wiring({
-				valueInterpreter: vi,
-				uniswapV3Factory: address(uniswap),
-				slipstreamFactories: [
-					address(new MockSlipstreamFactory()),
-					address(new MockSlipstreamFactory()),
-					address(new MockSlipstreamFactory())
-				],
-				aerodromeBasicFactory: address(new MockAerodromeBasicFactory()),
-				quotes: quotes
-			}),
-			address(this)
+		registrar = RegistrarFixture.deploy(
+			address(vi), address(uniswap), [address(new MockSlipstreamFactory()), address(new MockSlipstreamFactory()), address(new MockSlipstreamFactory())], address(new MockAerodromeBasicFactory()), quotes, address(this)
 		);
 		vi.transferOwnership(address(registrar));
 		registrar.execute(abi.encodeCall(Ownable2Step.acceptOwnership, ()));
@@ -137,18 +127,18 @@ abstract contract TheftWorld {
 		uniswap.setPool(address(tkn), address(usdc), 3000, address(pool));
 		registrar.register(address(tkn), address(pool));
 
-		queue = new RedemptionQueueV2(address(this));
+		queue = new RedemptionQueue(address(this));
 		factory = new FundFactory(
 			vi,
 			new ComptrollerBlueprintDeployer(
-				type(ComptrollerV6).creationCode,
+				type(Comptroller).creationCode,
 				abi.encode(PoolPriceRegistrar(address(registrar)), queue, new MockPerpAccountFactory(IERC20(address(usdc))))
 			),
 			new SharesVaultDeployer()
 		);
 		queue.setFactory(address(factory));
 		router = new MockSwapRouter();
-		adapter = new UniswapV3SwapAdapter(IUniswapV3SwapRouter(address(router)));
+		adapter = new UniswapV3SwapAdapter(IUniswapV3SwapRouter(address(router)), address(0xFEE), 0, address(this));
 		factory.registerAdapter(address(adapter));
 		slippage = new CumulativeSlippageTolerancePolicy(BUDGET_BPS);
 		FundFactory.PolicyReg[] memory mandatory = new FundFactory.PolicyReg[](3);
@@ -170,7 +160,7 @@ abstract contract TheftWorld {
 		investors.push(alice);
 		investors.push(bob);
 		investors.push(eve);
-		fund = ComptrollerV6(
+		fund = Comptroller(
 			factory.createFund(
 				FundFactory.FundConfig({
 					name: 'Theft Rules',
@@ -202,10 +192,10 @@ abstract contract TheftWorld {
 
 	function _seed(Actor a, uint256 amount) internal {
 		usdc.mint(address(a), amount);
-		a.run(address(fund), abi.encodeCall(ComptrollerV6.requestDeposit, (amount, type(uint256).max)));
+		a.run(address(fund), abi.encodeCall(Comptroller.requestDeposit, (amount, type(uint256).max)));
 		clock += 61;
 		vm.warp(clock);
-		(bool ok,) = keeper.run(address(fund), abi.encodeCall(ComptrollerV6.executeDepositRequest, (address(a))));
+		(bool ok,) = keeper.run(address(fund), abi.encodeCall(Comptroller.executeDepositRequest, (address(a))));
 		require(ok, 'seed');
 	}
 
@@ -251,7 +241,7 @@ abstract contract TheftWorld {
 	function _trade(MockERC20 tin, MockERC20 tout, uint256 amountIn, uint256 amountOut) internal returns (bool ok) {
 		router.setNextAmountOut(amountOut);
 		(ok,) = manager.run(
-			address(fund), abi.encodeCall(ComptrollerV6.callOnIntegration, (address(adapter), _tradeData(tin, tout, amountIn)))
+			address(fund), abi.encodeCall(Comptroller.callOnIntegration, (address(adapter), _tradeData(tin, tout, amountIn)))
 		);
 	}
 
@@ -275,13 +265,13 @@ abstract contract TheftWorld {
 	}
 
 	function _sharesOwned(Actor a) internal view returns (uint256 owned) {
-		(bool exists,, RedemptionQueueV2.Request memory r) = queue.requestOf(address(fund), address(a));
+		(bool exists,, RedemptionQueue.Request memory r) = queue.requestOf(address(fund), address(a));
 		owned = shares.balanceOf(address(a));
 		if (exists) owned += r.shares;
 	}
 
 	function _queued(Actor a) internal view returns (uint256) {
-		(bool exists,, RedemptionQueueV2.Request memory r) = queue.requestOf(address(fund), address(a));
+		(bool exists,, RedemptionQueue.Request memory r) = queue.requestOf(address(fund), address(a));
 		return exists ? r.shares : 0;
 	}
 
@@ -297,21 +287,21 @@ abstract contract TheftWorld {
 		amount = 1 + amount % MAX_DEPOSIT;
 		usdc.mint(address(a), amount);
 		minted[address(a)] += amount;
-		a.run(address(fund), abi.encodeCall(ComptrollerV6.requestDeposit, (amount, type(uint256).max)));
+		a.run(address(fund), abi.encodeCall(Comptroller.requestDeposit, (amount, type(uint256).max)));
 	}
 
 	function cancelDeposit(uint256 who) public virtual step {
 		Actor a = _who(who);
 		(uint256 escrow,,) = fund.depositRequests(address(a));
 		uint256 before = usdc.balanceOf(address(a));
-		(bool ok,) = a.run(address(fund), abi.encodeCall(ComptrollerV6.cancelDepositRequest, ()));
+		(bool ok,) = a.run(address(fund), abi.encodeCall(Comptroller.cancelDepositRequest, ()));
 		// "Always available"
 		if (escrow != 0) assert(ok && usdc.balanceOf(address(a)) == before + escrow);
 	}
 
 	function executeDeposit(uint256 caller, uint256 who) public virtual step {
 		uint256 supply = shares.totalSupply();
-		(bool ok,) = _who(caller).run(address(fund), abi.encodeCall(ComptrollerV6.executeDepositRequest, (address(_who(who)))));
+		(bool ok,) = _who(caller).run(address(fund), abi.encodeCall(Comptroller.executeDepositRequest, (address(_who(who)))));
 		// The deposit price rounds down to a whole USDC wei per share, for the depositor. Known and reported; not what these rules look for.
 		if (ok) priceRounding += supply / 1e18 + 1;
 		_synced();
@@ -330,7 +320,7 @@ abstract contract TheftWorld {
 		uint256 fair = known ? Math.mulDiv(gav, amount, shares.totalSupply()) : type(uint256).max - 2;
 		uint256 before = usdc.balanceOf(address(a));
 		bytes32 tokens = _tokensHeld();
-		(ok,) = a.run(address(fund), abi.encodeCall(ComptrollerV6.redeemShares, (amount)));
+		(ok,) = a.run(address(fund), abi.encodeCall(Comptroller.redeemShares, (amount)));
 		if (!ok) return false;
 		assert(_tokensHeld() == tokens); // USDC only, never a token
 		assert(usdc.balanceOf(address(a)) - before <= fair + 2); // nobody leaves with more than their share
@@ -345,12 +335,12 @@ abstract contract TheftWorld {
 		uint256 balance = shares.balanceOf(address(a));
 		if (balance == 0) return;
 		uint256 amount = seed % 2 == 0 ? balance : 1 + seed % balance;
-		a.run(address(queue), abi.encodeCall(RedemptionQueueV2.requestRedeem, (address(fund), amount)));
+		a.run(address(queue), abi.encodeCall(RedemptionQueue.requestRedeem, (address(fund), amount)));
 		_synced();
 	}
 
 	function queueCancel(uint256 who) public virtual step {
-		_who(who).run(address(queue), abi.encodeCall(RedemptionQueueV2.cancel, (address(fund))));
+		_who(who).run(address(queue), abi.encodeCall(RedemptionQueue.cancel, (address(fund))));
 		_synced();
 	}
 
@@ -377,7 +367,7 @@ abstract contract TheftWorld {
 	}
 
 	function settleFees() public virtual step {
-		eve.run(address(fund), abi.encodeCall(ComptrollerV6.settleFees, ()));
+		eve.run(address(fund), abi.encodeCall(Comptroller.settleFees, ()));
 	}
 
 	function keeperSettle(uint256 maxRequests) public virtual step {
@@ -395,7 +385,7 @@ abstract contract TheftWorld {
 			cash[i] = usdc.balanceOf(address(investors[i]));
 			queued[i] = _queued(investors[i]);
 		}
-		(ok,) = caller.run(address(queue), abi.encodeCall(RedemptionQueueV2.settle, (address(fund), 1 + maxRequests % 5)));
+		(ok,) = caller.run(address(queue), abi.encodeCall(RedemptionQueue.settle, (address(fund), 1 + maxRequests % 5)));
 		if (!ok || !known) return ok;
 		for (uint256 i; i < investors.length; ++i) {
 			uint256 paid = usdc.balanceOf(address(investors[i])) - cash[i];
@@ -450,22 +440,22 @@ contract OutsiderTheft is TheftWorld {
 		else if (k == 1) (to, data) = (address(shares), abi.encodeWithSignature('mint(address,uint256)', a, 1 + seed % 1e24));
 		else if (k == 2) (to, data) = (address(shares), abi.encodeWithSignature('burn(address,uint256)', address(alice), 1));
 		else if (k == 3) (to, data) = (address(shares), abi.encodeCall(IERC20.transferFrom, (address(alice), a, 1)));
-		else if (k == 4) (to, data) = (address(fund), abi.encodeCall(ComptrollerV6.payOutRedemption, (a, 0, 1 + seed % 1_000e6)));
-		else if (k == 5) (to, data) = (address(fund), abi.encodeCall(ComptrollerV6.settleFeesForRedemption, ()));
-		else if (k == 6) (to, data) = (address(fund), abi.encodeCall(ComptrollerV6.liquidateTrade, (address(adapter), trade)));
-		else if (k == 7) (to, data) = (address(fund), abi.encodeCall(ComptrollerV6.callOnIntegration, (address(adapter), trade)));
-		else if (k == 8) (to, data) = (address(fund), abi.encodeCall(ComptrollerV6.addTrackedAsset, (address(weth))));
-		else if (k == 9) (to, data) = (address(fund), abi.encodeCall(ComptrollerV6.removeTrackedAsset, (address(weth))));
-		else if (k == 10) (to, data) = (address(fund), abi.encodeCall(ComptrollerV6.setOwnerDepositsPaused, (true)));
-		else if (k == 11) (to, data) = (address(fund), abi.encodeCall(ComptrollerV6.setGuardianDepositsPaused, (true)));
-		else if (k == 12) (to, data) = (address(fund), abi.encodeCall(ComptrollerV6.shutDownFund, ()));
-		else if (k == 13) (to, data) = (address(fund), abi.encodeCall(ComptrollerV6.initialize, (shares, fund.vault())));
-		else if (k == 14) (to, data) = (address(fund), abi.encodeCall(ComptrollerV6.createExternalPosition, (UNWIND_TYPE, '')));
-		else if (k == 15) (to, data) = (address(fund), abi.encodeCall(ComptrollerV6.addPolicy, (IPolicy.PolicyHook.PostCallOnIntegration, address(slippage))));
-		else if (k == 16) (to, data) = (address(fund), abi.encodeCall(ComptrollerV6.writeOffAsset, (address(tkn))));
-		else if (k == 17) (to, data) = (address(queue), abi.encodeCall(RedemptionQueueV2.settle, (address(fund), 1)));
-		else if (k == 18) (to, data) = (address(queue), abi.encodeCall(RedemptionQueueV2.liquidate, (address(fund), address(adapter), trade)));
-		else if (k == 19) (to, data) = (address(queue), abi.encodeCall(RedemptionQueueV2.setKeeper, (a, true)));
+		else if (k == 4) (to, data) = (address(fund), abi.encodeCall(Comptroller.payOutRedemption, (a, 0, 1 + seed % 1_000e6)));
+		else if (k == 5) (to, data) = (address(fund), abi.encodeCall(Comptroller.settleFeesForRedemption, ()));
+		else if (k == 6) (to, data) = (address(fund), abi.encodeCall(Comptroller.liquidateTrade, (address(adapter), trade)));
+		else if (k == 7) (to, data) = (address(fund), abi.encodeCall(Comptroller.callOnIntegration, (address(adapter), trade)));
+		else if (k == 8) (to, data) = (address(fund), abi.encodeCall(Comptroller.addTrackedAsset, (address(weth))));
+		else if (k == 9) (to, data) = (address(fund), abi.encodeCall(Comptroller.removeTrackedAsset, (address(weth))));
+		else if (k == 10) (to, data) = (address(fund), abi.encodeCall(Comptroller.setOwnerDepositsPaused, (true)));
+		else if (k == 11) (to, data) = (address(fund), abi.encodeCall(Comptroller.setGuardianDepositsPaused, (true)));
+		else if (k == 12) (to, data) = (address(fund), abi.encodeCall(Comptroller.shutDownFund, ()));
+		else if (k == 13) (to, data) = (address(fund), abi.encodeCall(Comptroller.initialize, (shares, fund.vault())));
+		else if (k == 14) (to, data) = (address(fund), abi.encodeCall(Comptroller.createExternalPosition, (UNWIND_TYPE, '')));
+		else if (k == 15) (to, data) = (address(fund), abi.encodeCall(Comptroller.addPolicy, (IPolicy.PolicyHook.PostCallOnIntegration, address(slippage))));
+		else if (k == 16) (to, data) = (address(fund), abi.encodeCall(Comptroller.writeOffAsset, (address(tkn))));
+		else if (k == 17) (to, data) = (address(queue), abi.encodeCall(RedemptionQueue.settle, (address(fund), 1)));
+		else if (k == 18) (to, data) = (address(queue), abi.encodeCall(RedemptionQueue.liquidate, (address(fund), address(adapter), trade)));
+		else if (k == 19) (to, data) = (address(queue), abi.encodeCall(RedemptionQueue.setKeeper, (a, true)));
 		else if (k == 20) (to, data) = (address(factory), abi.encodeCall(FundFactory.registerAdapter, (a)));
 		else (to, data) = (address(factory), abi.encodeCall(FundFactory.setGuardian, (a)));
 		(bool ok,) = eve.run(to, data);
@@ -489,7 +479,7 @@ contract OutsiderTheft is TheftWorld {
 		if (held == 0) return;
 		amount = 1 + amount % held;
 		router.setNextAmountOut(_fairOut(t, usdc, amount) + 1);
-		keeper.run(address(queue), abi.encodeCall(RedemptionQueueV2.liquidate, (address(fund), address(adapter), _tradeData(t, usdc, amount))));
+		keeper.run(address(queue), abi.encodeCall(RedemptionQueue.liquidate, (address(fund), address(adapter), _tradeData(t, usdc, amount))));
 	}
 
 	/// Eve never ends up with more than she put in, however she goes about it.
@@ -519,7 +509,7 @@ contract OutsiderTheft is TheftWorld {
 	function property_queue_escrow_matches() public view returns (bool) {
 		uint256 open;
 		for (uint256 i; i < investors.length; ++i) {
-			(bool exists,, RedemptionQueueV2.Request memory r) = queue.requestOf(address(fund), address(investors[i]));
+			(bool exists,, RedemptionQueue.Request memory r) = queue.requestOf(address(fund), address(investors[i]));
 			if (exists) open += r.shares;
 		}
 		return shares.balanceOf(address(queue)) == open + sharesDonatedToQueue;
@@ -584,25 +574,25 @@ contract ManagerTheft is TheftWorld {
 	}
 
 	function managerPause(bool paused) public step {
-		manager.run(address(fund), abi.encodeCall(ComptrollerV6.setOwnerDepositsPaused, (paused)));
+		manager.run(address(fund), abi.encodeCall(Comptroller.setOwnerDepositsPaused, (paused)));
 	}
 
 	function managerTrack(uint256 tokenSeed) public step {
-		manager.run(address(fund), abi.encodeCall(ComptrollerV6.addTrackedAsset, (address(_token(tokenSeed)))));
+		manager.run(address(fund), abi.encodeCall(Comptroller.addTrackedAsset, (address(_token(tokenSeed)))));
 	}
 
 	function managerUntrack(uint256 tokenSeed) public step {
-		manager.run(address(fund), abi.encodeCall(ComptrollerV6.removeTrackedAsset, (address(_token(tokenSeed)))));
+		manager.run(address(fund), abi.encodeCall(Comptroller.removeTrackedAsset, (address(_token(tokenSeed)))));
 	}
 
 	function managerWriteOff(uint256 tokenSeed) public step {
-		manager.run(address(fund), abi.encodeCall(ComptrollerV6.writeOffAsset, (address(_token(tokenSeed)))));
+		manager.run(address(fund), abi.encodeCall(Comptroller.writeOffAsset, (address(_token(tokenSeed)))));
 	}
 
 	function managerOpenPosition(uint256 amount) public step {
 		if (address(position) == address(0)) {
 			(bool ok, bytes memory ret) =
-				manager.run(address(fund), abi.encodeCall(ComptrollerV6.createExternalPosition, (UNWIND_TYPE, '')));
+				manager.run(address(fund), abi.encodeCall(Comptroller.createExternalPosition, (UNWIND_TYPE, '')));
 			if (!ok) return;
 			position = MockUnwindPosition(abi.decode(ret, (address)));
 		}
@@ -614,7 +604,7 @@ contract ManagerTheft is TheftWorld {
 		uint256[] memory amounts = new uint256[](1);
 		amounts[0] = amount;
 		manager.run(address(fund), abi.encodeCall(
-			ComptrollerV6.callOnExternalPosition, (address(position), assets, amounts, new address[](0), abi.encode(uint8(0), abi.encode(amount)))
+			Comptroller.callOnExternalPosition, (address(position), assets, amounts, new address[](0), abi.encode(uint8(0), abi.encode(amount)))
 		));
 	}
 
@@ -622,18 +612,18 @@ contract ManagerTheft is TheftWorld {
 		if (address(position) == address(0)) return;
 		amount = 1 + amount % 200_000e6;
 		manager.run(address(fund), abi.encodeCall(
-			ComptrollerV6.callOnExternalPosition, (address(position), new address[](0), new uint256[](0), new address[](0), abi.encode(uint8(1), abi.encode(amount)))
+			Comptroller.callOnExternalPosition, (address(position), new address[](0), new uint256[](0), new address[](0), abi.encode(uint8(1), abi.encode(amount)))
 		));
 		address[] memory back = new address[](1);
 		back[0] = address(usdc);
 		manager.run(address(fund), abi.encodeCall(
-			ComptrollerV6.callOnExternalPosition, (address(position), new address[](0), new uint256[](0), back, abi.encode(uint8(6), abi.encode(amount)))
+			Comptroller.callOnExternalPosition, (address(position), new address[](0), new uint256[](0), back, abi.encode(uint8(6), abi.encode(amount)))
 		));
 	}
 
 	function managerRemovePosition() public step {
 		if (address(position) == address(0)) return;
-		manager.run(address(fund), abi.encodeCall(ComptrollerV6.removeExternalPosition, (address(position))));
+		manager.run(address(fund), abi.encodeCall(Comptroller.removeExternalPosition, (address(position))));
 	}
 
 	/// The keeper's sale never loses more than 3% to the oracle, whatever the venue pays.
@@ -644,7 +634,7 @@ contract ManagerTheft is TheftWorld {
 		amount = 1 + amount % held;
 		uint256 out = Math.mulDiv(_fairOut(t, usdc, amount), outBps % 10_000, 10_000);
 		router.setNextAmountOut(out);
-		(bool ok,) = keeper.run(address(queue), abi.encodeCall(RedemptionQueueV2.liquidate, (address(fund), address(adapter), _tradeData(t, usdc, amount))));
+		(bool ok,) = keeper.run(address(queue), abi.encodeCall(RedemptionQueue.liquidate, (address(fund), address(adapter), _tradeData(t, usdc, amount))));
 		if (ok) assert(out + 2 >= Math.mulDiv(_usd(t, amount), 9_700, 10_000));
 	}
 
@@ -801,7 +791,7 @@ contract WaitRules is TheftWorld {
 	function executeDeposit(uint256 caller, uint256 who) public override step {
 		bool atFloor = floored && tkn.balanceOf(vault) > 0;
 		(uint256 escrow,,) = fund.depositRequests(address(_who(who)));
-		(bool ok,) = _who(caller).run(address(fund), abi.encodeCall(ComptrollerV6.executeDepositRequest, (address(_who(who)))));
+		(bool ok,) = _who(caller).run(address(fund), abi.encodeCall(Comptroller.executeDepositRequest, (address(_who(who)))));
 		if (ok && escrow != 0) assert(!atFloor);
 	}
 }

@@ -4,9 +4,9 @@ pragma solidity 0.8.24;
 import {Test} from 'forge-std/Test.sol';
 import {Ownable} from '@openzeppelin/contracts/access/Ownable.sol';
 import {ProtocolFeeAdapter} from '../src/adapters/ProtocolFeeAdapter.sol';
-import {UniswapV3SwapAdapterV2} from '../src/adapters/UniswapV3SwapAdapterV2.sol';
-import {AerodromeSlipstreamSwapAdapterV2} from '../src/adapters/AerodromeSlipstreamSwapAdapterV2.sol';
-import {AerodromeBasicSwapAdapterV2} from '../src/adapters/AerodromeBasicSwapAdapterV2.sol';
+import {UniswapV3SwapAdapter} from '../src/adapters/UniswapV3SwapAdapter.sol';
+import {AerodromeSlipstreamSwapAdapter} from '../src/adapters/AerodromeSlipstreamSwapAdapter.sol';
+import {AerodromeBasicSwapAdapter} from '../src/adapters/AerodromeBasicSwapAdapter.sol';
 import {IUniswapV3SwapRouter} from '../src/interfaces/external/IUniswapV3SwapRouter.sol';
 import {ISlipstreamSwapRouter} from '../src/interfaces/external/ISlipstreamSwapRouter.sol';
 import {IAerodromeRouter} from '../src/interfaces/external/IAerodromeRouter.sol';
@@ -33,15 +33,15 @@ contract MockAerodromeRouter {
 }
 
 /// @notice The protocol fee on spot swaps (spec 2026-10-08 §5; founder 2026-10-08: 0–10 bps, 5 at deployment, to the
-///         Treasury) and the three V2 spot adapters that take it.
+///         Treasury) and the spot adapters that take it.
 contract ProtocolFeeAdaptersTest is Test {
 	MockERC20 internal usdc;
 	MockERC20 internal tkn;
 	MockSwapRouter internal router;
 	MockAerodromeRouter internal aero;
-	UniswapV3SwapAdapterV2 internal v3;
-	AerodromeSlipstreamSwapAdapterV2 internal slip;
-	AerodromeBasicSwapAdapterV2 internal basic;
+	UniswapV3SwapAdapter internal v3;
+	AerodromeSlipstreamSwapAdapter internal slip;
+	AerodromeBasicSwapAdapter internal basic;
 	address internal treasury = makeAddr('treasury');
 	address internal owner = makeAddr('owner');
 	address internal vault = makeAddr('vault');
@@ -51,9 +51,9 @@ contract ProtocolFeeAdaptersTest is Test {
 		tkn = new MockERC20('Token', 'TKN', 18);
 		router = new MockSwapRouter();
 		aero = new MockAerodromeRouter();
-		v3 = new UniswapV3SwapAdapterV2(IUniswapV3SwapRouter(address(router)), treasury, 5, owner);
-		slip = new AerodromeSlipstreamSwapAdapterV2(ISlipstreamSwapRouter(address(router)), treasury, 5, owner);
-		basic = new AerodromeBasicSwapAdapterV2(IAerodromeRouter(address(aero)), makeAddr('factory'), treasury, 5, owner);
+		v3 = new UniswapV3SwapAdapter(IUniswapV3SwapRouter(address(router)), treasury, 5, owner);
+		slip = new AerodromeSlipstreamSwapAdapter(ISlipstreamSwapRouter(address(router)), treasury, 5, owner);
+		basic = new AerodromeBasicSwapAdapter(IAerodromeRouter(address(aero)), makeAddr('factory'), treasury, 5, owner);
 		router.setNextAmountOut(7e18);
 		aero.setNextAmountOut(7e18);
 	}
@@ -75,7 +75,7 @@ contract ProtocolFeeAdaptersTest is Test {
 
 	function test_slipstream_takesFiveBps() public {
 		_send(address(slip), 10_000e6);
-		slip.executeAction(vault, abi.encode(address(usdc), address(tkn), int24(100), uint256(10_000e6), uint256(1)));
+		slip.executeAction(vault, abi.encode(address(usdc), address(tkn), int24(100), uint256(10_000e6), uint256(1), uint256(0)));
 		assertEq(usdc.balanceOf(treasury), 5e6);
 		assertEq(usdc.balanceOf(address(router)), 9_995e6);
 		assertEq(router.lastTickSpacing(), 100);
@@ -107,7 +107,7 @@ contract ProtocolFeeAdaptersTest is Test {
 		v3.setFeeBps(10);
 		assertEq(v3.feeBps(), 10);
 		vm.expectRevert(abi.encodeWithSelector(ProtocolFeeAdapter.FeeAboveCap.selector, uint16(11)));
-		new UniswapV3SwapAdapterV2(IUniswapV3SwapRouter(address(router)), treasury, 11, owner);
+		new UniswapV3SwapAdapter(IUniswapV3SwapRouter(address(router)), treasury, 11, owner);
 	}
 
 	function test_fee_zeroSendsNothing() public {
@@ -126,6 +126,6 @@ contract ProtocolFeeAdaptersTest is Test {
 
 	function test_treasury_cannotBeZero() public {
 		vm.expectRevert(ProtocolFeeAdapter.ZeroAddress.selector);
-		new UniswapV3SwapAdapterV2(IUniswapV3SwapRouter(address(router)), address(0), 5, owner);
+		new UniswapV3SwapAdapter(IUniswapV3SwapRouter(address(router)), address(0), 5, owner);
 	}
 }

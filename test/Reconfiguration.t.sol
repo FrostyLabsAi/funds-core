@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.24;
 
-import {V6Host} from './utils/V6Host.sol';
+import {FundHost} from './utils/FundHost.sol';
 import {Test} from 'forge-std/Test.sol';
 import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {FundFactory} from '../src/core/FundFactory.sol';
-import {ComptrollerDeployer, SharesVaultDeployer} from '../src/core/FundComponentDeployers.sol';
-import {ComptrollerV6 as Comptroller} from '../src/core/ComptrollerV6.sol';
+import {SharesVaultDeployer} from '../src/core/SharesVaultDeployer.sol';
+import {Comptroller} from '../src/core/Comptroller.sol';
 import {ValueInterpreter} from '../src/core/ValueInterpreter.sol';
 import {Shares} from '../src/fund/Shares.sol';
 import {Vault} from '../src/fund/Vault.sol';
 import {IPolicy} from '../src/interfaces/IPolicy.sol';
 import {MockERC20, MockAggregator} from './utils/Mocks.sol';
+import {IShares} from '../src/interfaces/IShares.sol';
+import {IVault} from '../src/interfaces/IVault.sol';
 
 contract ReconfigurationTest is Test {
 	FundFactory internal factory;
@@ -32,7 +34,7 @@ contract ReconfigurationTest is Test {
 		vm.prank(admin);
 		interpreter.addPrimitive(address(usdc), address(usdcFeed), 7 days);
 
-		factory = new FundFactory(interpreter, V6Host.deployer(), new SharesVaultDeployer());
+		factory = new FundFactory(interpreter, FundHost.deployer(), new SharesVaultDeployer());
 		oldComptroller = Comptroller(factory.createFund(_config(0)));
 
 		// Seed with a depositor and some PnL so the HWM is meaningful
@@ -76,8 +78,8 @@ contract ReconfigurationTest is Test {
 		oldComptroller.settleFees(); // perf fee 0 on old, but HWM stays at default (no perf fee configured → hwm unchanged)
 		uint256 oldHwm = oldComptroller.highWaterMark();
 
-		Shares shares = oldComptroller.shares();
-		Vault vault = oldComptroller.vault();
+		IShares shares = oldComptroller.shares();
+		IVault vault = oldComptroller.vault();
 
 		Comptroller newComptroller = _requestAndExecute(1500);
 

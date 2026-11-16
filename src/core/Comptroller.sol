@@ -7,38 +7,47 @@ import {SafeERC20} from '@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {ReentrancyGuard} from '@openzeppelin/contracts/utils/ReentrancyGuard.sol';
 import {EnumerableSet} from '@openzeppelin/contracts/utils/structs/EnumerableSet.sol';
 import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
-import {Shares} from '../fund/Shares.sol';
-import {Vault} from '../fund/Vault.sol';
+import {IShares} from '../interfaces/IShares.sol';
+import {IVault} from '../interfaces/IVault.sol';
 import {IValueInterpreter} from '../interfaces/IValueInterpreter.sol';
 import {IExternalPosition} from '../interfaces/IExternalPosition.sol';
 import {IPolicy} from '../interfaces/IPolicy.sol';
 import {IIntegrationAdapter} from '../interfaces/IIntegrationAdapter.sol';
-import {IAdapterRegistry, IProtocolFeeConfig} from '../interfaces/IAdapterRegistry.sol';
+import {IAdapterRegistry} from '../interfaces/IAdapterRegistry.sol';
+import {IProtocolFeeConfig} from '../interfaces/IProtocolFeeConfig.sol';
 import {IPositionTypeRegistry} from '../interfaces/IPositionTypeRegistry.sol';
 import {IExternalPositionTypeFactory} from '../interfaces/IExternalPositionTypeFactory.sol';
 import {MathHelpers} from '../libraries/MathHelpers.sol';
+import {IPoolPriceRegistrar} from '../interfaces/IPoolPriceRegistrar.sol';
+import {FundValuation} from './FundValuation.sol';
+import {IRedemptionQueue} from '../interfaces/IRedemptionQueue.sol';
+import {IPriorComptroller} from '../interfaces/IPriorComptroller.sol';
+import {IComptroller} from '../interfaces/IComptroller.sol';
+import {ComptrollerLib} from './ComptrollerLib.sol';
 
 /// @title Comptroller
-/// @notice Per-fund logic: deposits, redemptions, GAV/share price, fees, policies, tracked
-///         assets and external positions.
+/// @notice Per-fund logic with a USDC-only exit (founder 2026-10-11, PLAN_CASH_ONLY_EXIT_2026-10-11.md): an investor
+///         enters with USDC and leaves with USDC. Deposits, redemptions, GAV/share price, fees, policies, tracked assets
+///         and external positions.
 /// @dev Deposits are async: request (escrow) → wait ≥ minRequestDuration → anyone executes at
 ///      the current share price, so deposit→withdraw is never atomic.
-///      Redemptions: for the denomination asset (includes external positions), or in kind
-///      (tracked assets pro rata, forfeits external positions, needs no prices).
+///      Redemptions pay the denomination asset only, never tokens in kind:
+///      - at once (redeemShares) for a fund holding no position, no long-tail (pool-priced) token and no token whose
+///        price can't be read now, so nobody picks the moment a 30-minute pool price is wrong (D1);
+///      - otherwise through the RedemptionQueue: the manager raises the USDC, the manager or the queue's keeper settles
+///        at that moment's NAV. Past the 4-day deadline the manager's fees stop, the manager can't spend the vault's
+///        USDC, and the keeper may liquidate (sell to USDC, close perps, cancel orders; ComptrollerLib).
+///      A token whose balance can't be read counts as $0 until it reads again (D2, FundValuation).
 ///      Fees settle before every share-supply change: management (compounding) and performance
 ///      (continuous HWM) to fundOwner; the protocol AUM fee to the factory's recipient.
-contract Comptroller is ReentrancyGuard {
+contract Comptroller is IComptroller, ReentrancyGuard {
 	using SafeERC20 for IERC20;
 	using EnumerableSet for EnumerableSet.AddressSet;
 
 	struct DepositRequest {
 		uint256 assets; // denomination-asset amount escrowed
 		uint64 requestedAt;
-	}
-
-	struct FeeConfig {
-		uint128 mgmtScaledPerSecondRate; // 1e27-scaled per-second rate; 1e27 = 0%
-		uint16 perfFeeBps; // % of wealth created above HWM
+		uint256 maxSharePrice; // the depositor's limit, denomination units per SHARES_UNIT
 	}
 
 	uint256 public constant SHARES_UNIT = 1e18;
@@ -58,7 +67,9 @@ contract Comptroller is ReentrancyGuard {
 	// reclaims). Short windows remove the "wait and pick your moment" free option.
 	uint256 public constant MIN_EXECUTION_WINDOW = 15 minutes;
 	uint256 public constant MAX_EXECUTION_WINDOW = 7 days;
-	uint256 public constant MAX_TRACKED_ASSETS = 20;
+	// Every valuation walks the list: 30 keeps it well inside Base's per-transaction gas cap (about 43 long-tail tokens fit,
+	// measured 2026-11-04), and sold tokens leave it (FundValuation.followTrade). Founder 2026-11-05.
+	uint256 public constant MAX_TRACKED_ASSETS = 30;
 	uint256 public constant MAX_EXTERNAL_POSITIONS = 10;
 	/// @dev Donation-inflation defense: the bootstrap deposit mints this many shares to an
 	///      unredeemable sink, so supply can never be dusted below it. 1e18 = one whole
@@ -78,10 +89,16 @@ contract Comptroller is ReentrancyGuard {
 	///         Changing it requires a reconfiguration.
 	bool public immutable allowRiskyAssets;
 	uint256 public immutable defaultSharePrice; // 10^denominationAsset.decimals()
+	IPoolPriceRegistrar public immutable registrar;
+	/// @notice The queue every redemption the instant exit refuses goes through.
+	IRedemptionQueue public immutable redemptionQueue;
+	/// @notice The VerantaPerpConfig every fund perp account names as perpConfig(): a CloseTrade of 0 on such an account
+	///         is refused.
+	address public immutable perpConfig;
 	FeeConfig public feeConfig;
 
-	Shares public shares;
-	Vault public vault;
+	IShares public shares;
+	IVault public vault;
 
 	mapping(address depositor => DepositRequest) public depositRequests;
 	mapping(address holder => uint256) public lastDepositTimestamp;
@@ -92,19 +109,21 @@ contract Comptroller is ReentrancyGuard {
 	bool public ownerDepositsPaused; // toggle, fundOwner: subscriptions closed
 	bool public guardianDepositsPaused; // set via factory: guardian pauses instantly, only factory owner unpauses
 
-	EnumerableSet.AddressSet private trackedAssets;
-	EnumerableSet.AddressSet private externalPositions;
+	EnumerableSet.AddressSet internal trackedAssets;
+	EnumerableSet.AddressSet internal externalPositions;
 
 	uint256 public highWaterMark; // gross share price (denomination units per SHARES_UNIT)
 	uint256 public lastMgmtFeeSettled;
 	uint256 public lastProtocolFeeSettled;
+	mapping(address asset => uint256) public costBasis;
 
 	event FundInitialized(address shares, address vault);
-	event DepositRequested(address indexed depositor, uint256 assets);
+	event DepositRequested(address indexed depositor, uint256 assets, uint256 maxSharePrice);
 	event DepositRequestCancelled(address indexed depositor, uint256 assetsReturned);
 	event DepositExecuted(address indexed depositor, address indexed executor, uint256 assets, uint256 sharesMinted);
-	event SharesRedeemedForDenominationAsset(address indexed redeemer, uint256 sharesAmount, uint256 assetsPaid);
-	event SharesRedeemedInKind(address indexed redeemer, uint256 sharesAmount, address[] assets, uint256[] amounts);
+	event SharesRedeemed(
+		address indexed redeemer, uint256 sharesAmount, uint256 cashPaid, address[] inKindAssets, uint256[] inKindAmounts
+	);
 	event ManagementFeeSettled(uint256 sharesMinted);
 	event PerformanceFeeSettled(uint256 sharesMinted, uint256 newHighWaterMark);
 	event ProtocolFeeSettled(address indexed recipient, uint256 sharesMinted);
@@ -131,6 +150,7 @@ contract Comptroller is ReentrancyGuard {
 		address[] assetsToReceive
 	);
 	event PolicyAdded(IPolicy.PolicyHook indexed hook, address indexed policy);
+	event RedemptionPaidOut(address indexed to, uint256 sharesBurned);
 
 	error OnlyFactory();
 	error OnlyFundOwner();
@@ -158,11 +178,22 @@ contract Comptroller is ReentrancyGuard {
 	error ZeroAddressConfig();
 	error RiskyAssetsNotAllowed(address asset);
 	error BootstrapDepositTooSmall();
+	error PoolPriceUnsettled();
 	error ZeroGavWithSupply();
 	error HookNotImplemented(IPolicy.PolicyHook hook, address policy);
+	error SharePriceAboveMax(uint256 sharePrice, uint256 maxSharePrice);
+	error OnlyRedemptionQueue();
+	error UseRedemptionQueue();
+	error UsdcSpentWhileOverdue();
+	error OpenRedemptions();
 
 	modifier onlyFundOwner() {
 		if (msg.sender != fundOwner) revert OnlyFundOwner();
+		_;
+	}
+
+	modifier onlyRedemptionQueue() {
+		if (msg.sender != address(redemptionQueue)) revert OnlyRedemptionQueue();
 		_;
 	}
 
@@ -180,11 +211,15 @@ contract Comptroller is ReentrancyGuard {
 		uint256 sharesActionTimelock_,
 		uint256 minRequestDuration_,
 		uint256 executionWindow_,
-		bool allowRiskyAssets_
+		bool allowRiskyAssets_,
+		IPoolPriceRegistrar registrar_,
+		IRedemptionQueue redemptionQueue_,
+		address perpConfig_
 	) {
 		if (
 			factory_ == address(0) || fundOwner_ == address(0) || address(denominationAsset_) == address(0)
-				|| address(valueInterpreter_) == address(0)
+				|| address(valueInterpreter_) == address(0) || address(redemptionQueue_) == address(0)
+				|| perpConfig_ == address(0)
 		) {
 			revert ZeroAddressConfig();
 		}
@@ -198,10 +233,13 @@ contract Comptroller is ReentrancyGuard {
 		executionWindow = executionWindow_;
 		allowRiskyAssets = allowRiskyAssets_;
 		defaultSharePrice = 10 ** IERC20Metadata(address(denominationAsset_)).decimals();
+		registrar = registrar_;
+		redemptionQueue = redemptionQueue_;
+		perpConfig = perpConfig_;
 	}
 
 	/// @dev Called once by the FundFactory, atomically with fund creation.
-	function initialize(Shares shares_, Vault vault_) external {
+	function initialize(IShares shares_, IVault vault_) external {
 		if (msg.sender != factory) revert OnlyFactory();
 		if (address(shares) != address(0)) revert AlreadyInitialized();
 
@@ -218,9 +256,10 @@ contract Comptroller is ReentrancyGuard {
 	/// @dev Reconfiguration: adopt an existing fund's Shares + Vault, carrying over the HWM (a
 	///      manager can never reset it) and the tracked assets. The factory re-attaches policies;
 	///      external positions must be wound down first (their comptroller is immutable).
-	function initializeForMigration(Shares shares_, Vault vault_, Comptroller oldComptroller) external {
+	function initializeForMigration(IShares shares_, IVault vault_, IPriorComptroller oldComptroller) external {
 		if (msg.sender != factory) revert OnlyFactory();
 		if (address(shares) != address(0)) revert AlreadyInitialized();
+		_requireNoOpenRedemptions(address(oldComptroller));
 
 		shares = shares_;
 		vault = vault_;
@@ -230,26 +269,24 @@ contract Comptroller is ReentrancyGuard {
 		lastProtocolFeeSettled = block.timestamp;
 
 		trackedAssets.add(address(denominationAsset));
-		address[] memory priorTracked = oldComptroller.getTrackedAssets();
-		for (uint256 i; i < priorTracked.length; ++i) {
-			trackedAssets.add(priorTracked[i]);
-		}
+		ComptrollerLib.copyTracked(trackedAssets, oldComptroller.getTrackedAssets());
 
 		emit FundInitialized(address(shares_), address(vault_));
 	}
 
 	// ─── Deposits: request / cancel / execute ───────────────────────────────────
 
-	function requestDeposit(uint256 assets) external nonReentrant whenDepositsAllowed {
+	function requestDeposit(uint256 assets, uint256 maxSharePrice) external nonReentrant whenDepositsAllowed {
 		if (assets == 0) revert ZeroAmount();
 		if (depositRequests[msg.sender].requestedAt != 0) revert RequestExists();
 
-		depositRequests[msg.sender] = DepositRequest({assets: assets, requestedAt: uint64(block.timestamp)});
+		depositRequests[msg.sender] =
+			DepositRequest({assets: assets, requestedAt: uint64(block.timestamp), maxSharePrice: maxSharePrice});
 		denominationAsset.safeTransferFrom(msg.sender, address(this), assets);
 
 		_runPolicies(IPolicy.PolicyHook.PostDepositRequest, abi.encode(msg.sender, assets));
 
-		emit DepositRequested(msg.sender, assets);
+		emit DepositRequested(msg.sender, assets, maxSharePrice);
 	}
 
 	/// @notice Always available: reclaim escrow for an open (or expired) request.
@@ -273,9 +310,11 @@ contract Comptroller is ReentrancyGuard {
 
 		delete depositRequests[depositor];
 
-		uint256 sharePrice = _settleFeesAndGetSharePrice();
+		(uint256 sharePrice, uint256 feeGav) = _settleFeesAndGetSharePrice(true);
+		if (sharePrice > request.maxSharePrice) revert SharePriceAboveMax(sharePrice, request.maxSharePrice);
 		uint256 sharesToMint = Math.mulDiv(request.assets, SHARES_UNIT, sharePrice);
 		if (sharesToMint == 0) revert ZeroAmount();
+		uint256 supplyBefore = shares.totalSupply();
 
 		// First deposit seeds MIN_BOOTSTRAP_SHARES to the unredeemable sink (paid by the depositor).
 		if (shares.totalSupply() == 0) {
@@ -287,6 +326,7 @@ contract Comptroller is ReentrancyGuard {
 		denominationAsset.safeTransfer(address(vault), request.assets);
 		shares.mint(depositor, sharesToMint);
 		lastDepositTimestamp[depositor] = block.timestamp;
+		_followFeePrice(feeGav, supplyBefore, request.assets);
 
 		_runPolicies(IPolicy.PolicyHook.PostBuyShares, abi.encode(depositor, request.assets, sharesToMint));
 
@@ -295,89 +335,99 @@ contract Comptroller is ReentrancyGuard {
 
 	// ─── Redemptions ─────────────────────────────────────────────────────────────
 
-	/// @notice Burn shares for the denomination asset at the current share price (includes
-	///         external positions). The vault must hold enough of the denomination asset.
-	function redeemSharesForDenominationAsset(uint256 sharesAmount) external nonReentrant {
+	/// @notice Burn shares for the redeemer's share of the fund, all of it in the denomination asset, from the vault.
+	///         Only for a fund holding no position, no long-tail (pool-priced) token and no token whose price can't be
+	///         read now (founder 2026-10-11, D1: the redeemer picks this moment, so no 30-minute pool price may set
+	///         it); every other redemption goes through the queue. Reverts when the vault's USDC can't cover it.
+	function redeemShares(uint256 sharesAmount) external nonReentrant {
+		if (externalPositions.length() != 0) revert UseRedemptionQueue();
 		_checkTimelockAndBalance(msg.sender, sharesAmount);
+		FundValuation.Valuation memory v = _settleFeesTolerant();
+		for (uint256 i; i < v.inKind.length; ++i) {
+			if (v.inKind[i]) revert UseRedemptionQueue();
+		}
 
-		uint256 sharePrice = _settleFeesAndGetSharePrice();
-		uint256 assetsOwed = Math.mulDiv(sharesAmount, sharePrice, SHARES_UNIT);
-		if (assetsOwed == 0) revert ZeroAmount();
-
-		_runPolicies(IPolicy.PolicyHook.RedeemSharesForSpecificAssets, abi.encode(msg.sender, sharesAmount, assetsOwed));
+		uint256 cashOwed = Math.mulDiv(v.gav, sharesAmount, shares.totalSupply());
+		_runPolicies(IPolicy.PolicyHook.RedeemSharesForSpecificAssets, abi.encode(msg.sender, sharesAmount, cashOwed));
 
 		shares.burn(msg.sender, sharesAmount);
-		vault.withdraw(address(denominationAsset), msg.sender, assetsOwed);
+		if (cashOwed > 0) vault.withdraw(address(denominationAsset), msg.sender, cashOwed);
 
-		emit SharesRedeemedForDenominationAsset(msg.sender, sharesAmount, assetsOwed);
+		emit SharesRedeemed(msg.sender, sharesAmount, cashOwed, new address[](0), new uint256[](0));
 	}
 
-	/// @notice Guaranteed exit: a pro-rata slice of every tracked asset. Needs no prices and runs
-	///         no policies; skips the performance fee and forfeits external-position value.
-	function redeemSharesInKind(uint256 sharesAmount) external nonReentrant {
-		_redeemSharesInKind(sharesAmount, new address[](0));
+	/// @notice The queue pays a settled request: it burns the escrowed shares and pays `amount` of the denomination
+	///         asset from the vault (the RedemptionQueue computed it at the settlement's NAV).
+	function payOutRedemption(address to, uint256 sharesToBurn, uint256 amount) external onlyRedemptionQueue nonReentrant {
+		shares.burn(address(redemptionQueue), sharesToBurn);
+		if (amount > 0) vault.withdraw(address(denominationAsset), to, amount);
+		emit RedemptionPaidOut(to, sharesToBurn);
 	}
 
-	/// @notice In-kind exit that forfeits `assetsToSkip` (e.g. a paused token), so one broken
-	///         asset can't block the exit. Skipped value stays with the remaining holders.
-	function redeemSharesInKindWithSkips(uint256 sharesAmount, address[] calldata assetsToSkip)
+	/// @notice The queue's settlement values the fund once: fees settle (the performance fee waits while a price can't
+	///         be read) and the queue pays from the GAV of the same pass, only when `complete`.
+	function settleFeesForRedemption() external onlyRedemptionQueue nonReentrant returns (uint256 gav, bool complete) {
+		FundValuation.Valuation memory v = _settleFeesTolerant();
+		// with a pool unsettled the manager could be settling short on their own LP's pulls, or exiting a rug of their own at the
+		// old price, so the queue waits for its deadline, and a real rug's exits go on from there (review 2026-11-01)
+		return (v.gav, v.complete && (!v.unsettled || _overdue()));
+	}
+
+	/// @notice Liquidation, through the queue's keeper once a redemption is overdue: sell tracked tokens into the
+	///         denomination asset, a long-tail token through its pool's quote (ComptrollerLib.liquidateTrade).
+	function liquidateTrade(address adapter, bytes calldata integrationData) external onlyRedemptionQueue nonReentrant {
+		if (!IAdapterRegistry(factory).isAdapterRegistered(adapter)) revert AdapterNotRegistered(adapter);
+		ComptrollerLib.liquidateTrade(trackedAssets, _tracking(), costBasis, _context(), adapter, integrationData);
+	}
+
+	/// @notice Liquidation, through the queue's keeper once a redemption is overdue: close or pull back what a position
+	///         holds (ComptrollerLib.liquidatePosition).
+	function liquidatePosition(address position, address[] calldata assetsToReceive, bytes[] calldata actions)
 		external
+		onlyRedemptionQueue
 		nonReentrant
 	{
-		_redeemSharesInKind(sharesAmount, assetsToSkip);
-	}
-
-	function _redeemSharesInKind(uint256 sharesAmount, address[] memory assetsToSkip) private {
-		_checkTimelockAndBalance(msg.sender, sharesAmount);
-
-		_settleManagementFee();
-		_settleProtocolFee(); // no pricing dependency; redeemers must not escape the dilution
-
-		uint256 totalSupply = shares.totalSupply();
-		uint256 assetCount = trackedAssets.length();
-		address[] memory assets = new address[](assetCount);
-		uint256[] memory amounts = new uint256[](assetCount);
-
-		for (uint256 i; i < assetCount; ++i) {
-			address asset = trackedAssets.at(i);
-			assets[i] = asset;
-			bool skip;
-			for (uint256 j; j < assetsToSkip.length; ++j) {
-				if (assetsToSkip[j] == asset) {
-					skip = true;
-					break;
-				}
-			}
-			amounts[i] = skip ? 0 : Math.mulDiv(IERC20(asset).balanceOf(address(vault)), sharesAmount, totalSupply);
-		}
-
-		shares.burn(msg.sender, sharesAmount);
-
-		for (uint256 i; i < assetCount; ++i) {
-			if (amounts[i] > 0) {
-				vault.withdraw(assets[i], msg.sender, amounts[i]);
-			}
-		}
-
-		emit SharesRedeemedInKind(msg.sender, sharesAmount, assets, amounts);
+		if (!externalPositions.contains(position)) revert NotActiveExternalPosition(position);
+		ComptrollerLib.liquidatePosition(
+			trackedAssets, _tracking(), _context(), perpConfig, IExternalPosition(position), assetsToReceive, actions
+		);
 	}
 
 	// ─── Valuation ───────────────────────────────────────────────────────────────
 
 	/// @notice GAV in denomination units: tracked vault balances + external positions (managed −
 	///         debt, floored at zero each). Deposit escrow is not fund value.
-	function calcGav() public returns (uint256 gav) {
-		uint256 assetCount = trackedAssets.length();
-		for (uint256 i; i < assetCount; ++i) {
-			address asset = trackedAssets.at(i);
-			uint256 balance = IERC20(asset).balanceOf(address(vault));
-			if (balance == 0) continue;
-			gav += valueInterpreter.calcCanonicalAssetValue(asset, balance, address(denominationAsset));
-		}
+	function calcGav() public returns (uint256) {
+		return _value(false).gav;
+	}
 
-		uint256 positionCount = externalPositions.length();
-		for (uint256 i; i < positionCount; ++i) {
-			gav += _calcExternalPositionValue(IExternalPosition(externalPositions.at(i)));
+	/// @dev FundValuation.value over this fund's holdings (see there).
+	function _value(bool tolerant) private returns (FundValuation.Valuation memory) {
+		return FundValuation.value(trackedAssets, externalPositions, costBasis, _context(), tolerant);
+	}
+
+	function _calcExternalPositionValue(IExternalPosition position) private returns (uint256) {
+		return FundValuation.positionValue(position, _context());
+	}
+
+	function _context() private view returns (FundValuation.Context memory) {
+		return FundValuation.Context(valueInterpreter, registrar, address(vault), address(denominationAsset));
+	}
+
+
+	/// @dev A deposit buys in at the full share price, so where unrealized long-tail gains sit
+	///      above cost it lifts the fee price without creating wealth; the high-water mark moves by
+	///      the same amount so newcomers' money never reads as performance.
+	function _followFeePrice(uint256 feeGav, uint256 supplyBefore, uint256 assetsIn) private {
+		if (supplyBefore == 0) return;
+		uint256 before = Math.mulDiv(feeGav, SHARES_UNIT, supplyBefore);
+		uint256 afterDeposit = Math.mulDiv(feeGav + assetsIn, SHARES_UNIT, shares.totalSupply());
+		// above the mark, the fee is waiting on a closed market: the mark takes the new money at cost, so the gain to charge
+		// stays the holders' alone (founder 2026-11-03)
+		if (before > highWaterMark) {
+			highWaterMark = Math.mulDiv(Math.mulDiv(highWaterMark, supplyBefore, SHARES_UNIT) + assetsIn, SHARES_UNIT, shares.totalSupply());
+		} else if (afterDeposit > before) {
+			highWaterMark += afterDeposit - before;
 		}
 	}
 
@@ -391,13 +441,8 @@ contract Comptroller is ReentrancyGuard {
 
 	/// @notice All tracked assets with their current vault balances.
 	function getFundHoldings() external view returns (address[] memory assets, uint256[] memory balances) {
-		uint256 assetCount = trackedAssets.length();
-		assets = new address[](assetCount);
-		balances = new uint256[](assetCount);
-		for (uint256 i; i < assetCount; ++i) {
-			assets[i] = trackedAssets.at(i);
-			balances[i] = IERC20(assets[i]).balanceOf(address(vault));
-		}
+		assets = trackedAssets.values();
+		balances = ComptrollerLib.vaultBalances(address(vault), assets);
 	}
 
 	/// @notice Gross share price in denomination units per SHARES_UNIT of shares.
@@ -407,35 +452,16 @@ contract Comptroller is ReentrancyGuard {
 		return Math.mulDiv(calcGav(), SHARES_UNIT, totalSupply);
 	}
 
-	function _calcExternalPositionValue(IExternalPosition position) private returns (uint256) {
-		(address[] memory managedAssets, uint256[] memory managedAmounts) = position.getManagedAssets();
-		(address[] memory debtAssets, uint256[] memory debtAmounts) = position.getDebtAssets();
-
-		uint256 managed;
-		for (uint256 i; i < managedAssets.length; ++i) {
-			if (managedAmounts[i] == 0) continue;
-			managed +=
-				valueInterpreter.calcCanonicalAssetValue(managedAssets[i], managedAmounts[i], address(denominationAsset));
-		}
-
-		uint256 debt;
-		for (uint256 i; i < debtAssets.length; ++i) {
-			if (debtAmounts[i] == 0) continue;
-			debt += valueInterpreter.calcCanonicalAssetValue(debtAssets[i], debtAmounts[i], address(denominationAsset));
-		}
-
-		// Liability of a position is limited to the position itself.
-		return managed > debt ? managed - debt : 0;
-	}
-
 	// ─── Trading: callOnIntegration ──────────────────────────────────────────────
 
 	/// @notice Trade fund assets through a factory-registered adapter.
 	/// @dev Incoming amounts are measured as vault balance deltas (never adapter claims), incoming
 	///      assets are auto-tracked, and PostCallOnIntegration policies run on the result.
-	///      Not gated by pause/shutdown: a winding-down fund must still unwind.
+	///      Not gated by pause/shutdown: a winding-down fund must still unwind. While a redemption is overdue the
+	///      vault's USDC can't drop (founder 2026-10-11): the manager may sell into it, never spend it.
 	function callOnIntegration(address adapter, bytes calldata integrationData) external onlyFundOwner nonReentrant {
 		if (!IAdapterRegistry(factory).isAdapterRegistered(adapter)) revert AdapterNotRegistered(adapter);
+		uint256 usdcFloor = _usdcFloor();
 
 		(
 			address[] memory spendAssets,
@@ -444,26 +470,19 @@ contract Comptroller is ReentrancyGuard {
 			uint256[] memory minIncomingAmounts
 		) = IIntegrationAdapter(adapter).parseAssetsForAction(integrationData);
 
-		uint256[] memory balancesBefore = new uint256[](incomingAssets.length);
-		for (uint256 i; i < incomingAssets.length; ++i) {
-			balancesBefore[i] = IERC20(incomingAssets[i]).balanceOf(address(vault));
-		}
+		uint256[] memory balancesBefore = ComptrollerLib.vaultBalances(address(vault), incomingAssets);
+		uint256[] memory spendBefore = ComptrollerLib.vaultBalances(address(vault), spendAssets);
 
-		for (uint256 i; i < spendAssets.length; ++i) {
-			vault.withdraw(spendAssets[i], adapter, spendAmounts[i]);
-		}
+		ComptrollerLib.withdrawAll(vault, adapter, spendAssets, spendAmounts);
 
 		IIntegrationAdapter(adapter).executeAction(address(vault), integrationData);
 
-		uint256[] memory incomingAmounts = new uint256[](incomingAssets.length);
-		for (uint256 i; i < incomingAssets.length; ++i) {
-			uint256 received = IERC20(incomingAssets[i]).balanceOf(address(vault)) - balancesBefore[i];
-			if (received < minIncomingAmounts[i]) {
-				revert MinIncomingAmountNotMet(incomingAssets[i], received, minIncomingAmounts[i]);
-			}
-			incomingAmounts[i] = received;
-			_trackAsset(incomingAssets[i]);
-		}
+		uint256[] memory incomingAmounts = ComptrollerLib.receivedAmounts(
+			trackedAssets, _tracking(), address(vault), incomingAssets, balancesBefore, minIncomingAmounts
+		);
+		// from here spendAmounts is what left the vault: a deposit's refund is no loss to the policies (review 2026-11-01, Medium 4)
+		spendAmounts = FundValuation.followTrade(trackedAssets, costBasis, _context(), spendAssets, spendBefore, incomingAssets, incomingAmounts);
+		_keepUsdc(usdcFloor);
 
 		_runPolicies(
 			IPolicy.PolicyHook.PostCallOnIntegration,
@@ -500,37 +519,55 @@ contract Comptroller is ReentrancyGuard {
 
 	/// @notice Settle accrued fees without a deposit/redeem. Callable by anyone; needs valid prices.
 	function settleFees() external nonReentrant returns (uint256 grossSharePrice) {
-		grossSharePrice = _settleFeesAndGetSharePrice();
+		(grossSharePrice,) = _settleFeesAndGetSharePrice(false);
 		emit FeesSettled(msg.sender, grossSharePrice);
+	}
+
+	/// @dev Fees as a redemption settles them: the performance fee waits while a price can't be read
+	///      (the valuation marks that holding in kind and incomplete instead of reverting).
+	function _settleFeesTolerant() private returns (FundValuation.Valuation memory v) {
+		_settleManagementFee();
+		v = _value(true);
+		if (v.complete) _performanceFee(v.feeGav, v.gav, shares.totalSupply(), true);
+		_settleProtocolFee();
 	}
 
 	/// @dev Settles management, performance, then protocol fee; returns the gross share price.
 	///      Zero GAV with supply outstanding reverts (pricing at the default would expropriate
-	///      holders); the in-kind exit stays open.
-	function _settleFeesAndGetSharePrice() private returns (uint256 sharePrice) {
+	///      holders).
+	function _settleFeesAndGetSharePrice(bool deposit) private returns (uint256 sharePrice, uint256 feeGav) {
 		_settleManagementFee();
 
 		uint256 totalSupply = shares.totalSupply();
 		if (totalSupply == 0) {
 			_settleProtocolFee(); // advances the clock; mints nothing at zero supply
-			return defaultSharePrice;
+			return (defaultSharePrice, 0);
 		}
 
-		uint256 gav = calcGav();
-		if (gav == 0) revert ZeroGavWithSupply();
+		FundValuation.Valuation memory v = _value(false);
+		if (v.gav == 0) revert ZeroGavWithSupply();
+		// a closed market never stops a deposit: it buys at the last price (founder 2026-11-03). Accepted: someone who saw the
+		// weekend's move keeps it, from the holders (red-team PF-02's deposit side); a manager can pause deposits for that.
+		// an LP's own pulls would sell the depositor the token's share for nothing (review 2026-11-01)
+		if (deposit && v.unsettled) revert PoolPriceUnsettled();
 
-		_settlePerformanceFee(gav, totalSupply);
+		// the performance fee waits for a real price; settling the rest must not, or a cancel loses its fee stop (Low 6).
+		// A deposit buys at the price after a waiting fee, so new money pays none of it. Charging it here instead let a dust
+		// deposit take a fee on a live gain over a stock that had really fallen (review 2026-11-03)
+		uint256 feeWaiting = v.complete || deposit ? _performanceFee(v.feeGav, v.gav, totalSupply, v.complete) : 0;
 		// After the manager's fees, before pricing the action.
 		_settleProtocolFee();
-		return Math.mulDiv(gav, SHARES_UNIT, shares.totalSupply());
+		return (Math.mulDiv(v.gav - feeWaiting, SHARES_UNIT, shares.totalSupply()), v.feeGav);
 	}
 
 	/// @dev sharesDue = (rpow(scaledPerSecondRate, dt, 1e27) - 1e27) * totalSupply / 1e27
-	function _settleManagementFee() private {
+	function _settleManagementFee() internal {
 		uint256 rate = feeConfig.mgmtScaledPerSecondRate;
 		uint256 elapsed = block.timestamp - lastMgmtFeeSettled;
 		lastMgmtFeeSettled = block.timestamp;
 		if (rate <= RATE_SCALE || elapsed == 0) return;
+		// fee stop: while a redemption is overdue the time is forfeited (founder 2026-10-06)
+		if (_overdue()) return;
 
 		uint256 totalSupply = shares.totalSupply();
 		if (totalSupply == 0) return;
@@ -542,34 +579,45 @@ contract Comptroller is ReentrancyGuard {
 		emit ManagementFeeSettled(sharesDue);
 	}
 
-	/// @dev Continuous accrual, no crystallization: g = GAV/TS; W = max(g - hwm, 0)*TS;
-	///      F = W*rate; feeShares = F*TS/(GAV - F); hwm' = GAV/TS' when paid.
-	function _settlePerformanceFee(uint256 gav, uint256 totalSupply) private {
+	/// @dev Continuous accrual, no crystallization, on the FEE GAV (long-tail tokens at the lower
+	///      of value and cost): g = feeGAV/TS; W = max(g - hwm, 0)*TS; F = W*rate; hwm' = feeGAV/TS' when paid.
+	///      feeShares = F*TS/(fullGAV - F): a share claims the full GAV, so shares sized on the fee GAV paid the manager
+	///      F*gav/feeGav, past the rate and the bytecode cap (red-team V6FEES-02, 2026-10-27).
+	/// @dev With `charge`, settles the performance fee. Without it, changes nothing and returns what the fee would take: none
+	///      under the fee stop, which charges nothing.
+	function _performanceFee(uint256 feeGav, uint256 gav, uint256 totalSupply, bool charge) private returns (uint256 feeValue) {
 		uint256 rate = feeConfig.perfFeeBps;
-		if (rate == 0) return;
+		if (rate == 0) return 0;
 
-		uint256 grossSharePrice = Math.mulDiv(gav, SHARES_UNIT, totalSupply);
+		uint256 grossSharePrice = Math.mulDiv(feeGav, SHARES_UNIT, totalSupply);
 		uint256 hwm = highWaterMark;
-		if (grossSharePrice <= hwm) return;
+		if (grossSharePrice <= hwm) return 0;
+		// fee stop: gains made while a redemption is overdue are never charged (founder 2026-10-06)
+		if (_overdue()) {
+			if (charge) highWaterMark = grossSharePrice;
+			return 0;
+		}
 
 		uint256 wealthCreated = Math.mulDiv(grossSharePrice - hwm, totalSupply, SHARES_UNIT);
-		uint256 feeValue = (wealthCreated * rate) / BPS;
-		if (feeValue == 0 || feeValue >= gav) return;
+		feeValue = (wealthCreated * rate) / BPS;
+		if (!charge) return feeValue;
+		if (feeValue == 0 || feeValue >= gav) return 0;
 
 		uint256 feeShares = Math.mulDiv(feeValue, totalSupply, gav - feeValue);
-		if (feeShares == 0) return;
+		if (feeShares == 0) return 0;
 
 		shares.mint(fundOwner, feeShares);
-		uint256 newHwm = Math.mulDiv(gav, SHARES_UNIT, shares.totalSupply());
+		uint256 newHwm = Math.mulDiv(feeGav, SHARES_UNIT, shares.totalSupply());
 		highWaterMark = newHwm;
 
 		emit PerformanceFeeSettled(feeShares, newHwm);
+		return 0;
 	}
 
 	/// @dev Protocol AUM fee: factory-set bps/yr of share supply, minted to the factory's
 	///      recipient (rate read live, capped at 1%/yr by the factory). The clock advances only
 	///      when this fund settles, so a fee turned on later charges since the last settlement.
-	function _settleProtocolFee() private {
+	function _settleProtocolFee() internal {
 		uint256 elapsed = block.timestamp - lastProtocolFeeSettled;
 		if (elapsed == 0) return;
 		lastProtocolFeeSettled = block.timestamp;
@@ -610,12 +658,18 @@ contract Comptroller is ReentrancyGuard {
 
 	/// @dev Shared by explicit tracking and callOnIntegration auto-tracking. Idempotent.
 	function _trackAsset(address asset) private {
-		if (trackedAssets.contains(asset)) return;
-		if (!valueInterpreter.isSupportedAsset(asset)) revert AssetNotSupported(asset);
-		if (valueInterpreter.isZeroPricedAsset(asset) && !allowRiskyAssets) revert RiskyAssetsNotAllowed(asset);
-		if (trackedAssets.length() >= MAX_TRACKED_ASSETS) revert TrackedAssetsLimitReached();
-		trackedAssets.add(asset);
-		emit TrackedAssetAdded(asset);
+		ComptrollerLib.trackAsset(trackedAssets, _tracking(), asset);
+	}
+
+	function _tracking() private view returns (ComptrollerLib.Tracking memory) {
+		return ComptrollerLib.Tracking(valueInterpreter, allowRiskyAssets, MAX_TRACKED_ASSETS);
+	}
+
+	/// @notice Write off a token whose pool reads 1 wei: it leaves the vault for good, so deposits and the queue stop waiting on it
+	///         (review 2026-11-01). Selling it is refused at that price (MinPoolLiquidityPolicy), so this is the manager's way
+	///         out of a dead token. It is burned rather than sent anywhere: faking the floor to write off a live one pays nobody.
+	function writeOffAsset(address asset) external onlyFundOwner nonReentrant {
+		ComptrollerLib.writeOff(trackedAssets, costBasis, _context(), asset);
 	}
 
 	/// @dev An asset with a non-zero vault balance is fund value and cannot be untracked.
@@ -648,7 +702,8 @@ contract Comptroller is ReentrancyGuard {
 	/// @notice Act on an active external position, optionally moving vault assets to it first.
 	/// @param assetsToReceive Assets expected back in the vault; auto-tracked.
 	/// @dev Policies get the measured value lost (position value + vault flows, before vs after),
-	///      never the stated arrays. Venue-side losses between calls are outside this check.
+	///      never the stated arrays. Venue-side losses between calls are outside this check. A perp CloseTrade of 0
+	///      is refused (ComptrollerLib.closesNothing); while a redemption is overdue the vault's USDC can't drop.
 	function callOnExternalPosition(
 		address position,
 		address[] calldata assetsToTransfer,
@@ -658,67 +713,50 @@ contract Comptroller is ReentrancyGuard {
 	) external onlyFundOwner nonReentrant {
 		if (!externalPositions.contains(position)) revert NotActiveExternalPosition(position);
 		if (assetsToTransfer.length != amountsToTransfer.length) revert ArrayLengthMismatch();
+		if (ComptrollerLib.closesNothing(perpConfig, position, actionData)) revert ComptrollerLib.CloseOfNothing();
+		uint256 usdcFloor = _usdcFloor();
 
 		// A risk-reducing action (e.g. closing a perp) with nothing leaving the vault skips
 		// pricing, so a stale oracle never stops a manager from cutting risk.
 		bool unpriced = assetsToTransfer.length == 0 && IExternalPosition(position).isRiskReducing(actionData);
 		uint256 beforeValue = unpriced
 			? 0
-			: _calcExternalPositionValue(IExternalPosition(position)) + _assetsValue(assetsToTransfer, amountsToTransfer);
-		uint256[] memory receiveBalancesBefore = _vaultBalances(assetsToReceive);
+			: _calcExternalPositionValue(IExternalPosition(position)) + FundValuation.assetsValue(assetsToTransfer, amountsToTransfer, _context());
+		uint256[] memory receiveBalancesBefore = ComptrollerLib.vaultBalances(address(vault), assetsToReceive);
 
-		for (uint256 i; i < assetsToTransfer.length; ++i) {
-			vault.withdraw(assetsToTransfer[i], position, amountsToTransfer[i]);
-		}
+		ComptrollerLib.withdrawAll(vault, position, assetsToTransfer, amountsToTransfer);
+		_trackHeld(position);
 
 		IExternalPosition(position).receiveCallFromFund(actionData);
 
-		uint256 afterValue = (unpriced ? 0 : _calcExternalPositionValue(IExternalPosition(position)))
-			+ _receivedValue(assetsToReceive, receiveBalancesBefore, !unpriced);
-		uint256 lossValue = beforeValue > afterValue ? beforeValue - afterValue : 0;
+		uint256 lossValue = _lossValue(position, unpriced, beforeValue, assetsToReceive, receiveBalancesBefore);
+		_keepUsdc(usdcFloor);
 
 		_runPolicies(IPolicy.PolicyHook.PostCallOnExternalPosition, abi.encode(position, lossValue));
 
 		emit CallOnExternalPositionExecuted(position, assetsToTransfer, amountsToTransfer, assetsToReceive);
 	}
 
-	function _assetsValue(address[] calldata assets, uint256[] calldata amounts) private returns (uint256 value) {
-		for (uint256 i; i < assets.length; ++i) {
-			if (amounts[i] > 0) {
-				value += valueInterpreter.calcCanonicalAssetValue(assets[i], amounts[i], address(denominationAsset));
-			}
-		}
+	/// @dev Whatever the position holds counts once it reaches the vault, listed or not (review 2026-10-11;
+	///      ComptrollerLib.trackHeld). A helper for stack depth.
+	function _trackHeld(address position) private {
+		ComptrollerLib.trackHeld(trackedAssets, _tracking(), IExternalPosition(position));
 	}
 
-	function _vaultBalances(address[] calldata assets) private view returns (uint256[] memory balances) {
-		balances = new uint256[](assets.length);
-		for (uint256 i; i < assets.length; ++i) {
-			balances[i] = IERC20(assets[i]).balanceOf(address(vault));
-		}
-	}
-
-	/// @dev Values what the vault actually received and auto-tracks it; duplicates are skipped
-	///      (counting a delta twice would hide losses).
-	function _receivedValue(address[] calldata assets, uint256[] memory balancesBefore, bool priced)
-		private
-		returns (uint256 value)
-	{
-		for (uint256 i; i < assets.length; ++i) {
-			_trackAsset(assets[i]);
-			if (!priced) continue;
-			bool duplicate;
-			for (uint256 j; j < i; ++j) {
-				if (assets[j] == assets[i]) {
-					duplicate = true;
-					break;
-				}
-			}
-			if (duplicate) continue;
-			uint256 received = IERC20(assets[i]).balanceOf(address(vault)) - balancesBefore[i];
-			if (received > 0) {
-				value += valueInterpreter.calcCanonicalAssetValue(assets[i], received, address(denominationAsset));
-			}
-		}
+	/// @dev callOnExternalPosition's measured loss: the position's value plus what reached the vault, before vs after
+	///      (a stack-depth split, 2026-10-11).
+	function _lossValue(
+		address position,
+		bool unpriced,
+		uint256 beforeValue,
+		address[] calldata assetsToReceive,
+		uint256[] memory receiveBalancesBefore
+	) private returns (uint256) {
+		uint256 afterValue = (unpriced ? 0 : _calcExternalPositionValue(IExternalPosition(position)))
+			+ ComptrollerLib.receivedValue(
+				trackedAssets, _tracking(), address(vault), address(denominationAsset), assetsToReceive, receiveBalancesBefore, !unpriced
+			);
+		return beforeValue > afterValue ? beforeValue - afterValue : 0;
 	}
 
 	/// @notice Deactivate an external position once its value is dust (≤ 1 denomination unit),
@@ -750,15 +788,7 @@ contract Comptroller is ReentrancyGuard {
 	function addPolicy(IPolicy.PolicyHook hook, address policy) external {
 		if (msg.sender != factory) revert OnlyFactory();
 		// A policy may only attach to hooks it implements (else it bricks or silently no-ops).
-		IPolicy.PolicyHook[] memory implemented = IPolicy(policy).implementedHooks();
-		bool matched;
-		for (uint256 i; i < implemented.length; ++i) {
-			if (implemented[i] == hook) {
-				matched = true;
-				break;
-			}
-		}
-		if (!matched) revert HookNotImplemented(hook, policy);
+		if (!ComptrollerLib.implementsHook(policy, hook)) revert HookNotImplemented(hook, policy);
 		policies[hook].push(policy);
 		emit PolicyAdded(hook, policy);
 	}
@@ -771,7 +801,10 @@ contract Comptroller is ReentrancyGuard {
 	function validateSharesTransfer(address from, address to, uint256 amount) external {
 		if (msg.sender != address(shares)) revert OnlyFundOwner();
 		if (block.timestamp < lastDepositTimestamp[from] + sharesActionTimelock) revert SharesActionTimelocked(from);
-		_runPolicies(IPolicy.PolicyHook.PreTransferShares, abi.encode(from, to, amount));
+		// a request or a cancel moves shares to or from the queue: an exit, not a transfer to a third party
+		if (from != address(redemptionQueue) && to != address(redemptionQueue)) {
+			_runPolicies(IPolicy.PolicyHook.PreTransferShares, abi.encode(from, to, amount));
+		}
 	}
 
 	function _runPolicies(IPolicy.PolicyHook hook, bytes memory validationData) private {
@@ -781,7 +814,31 @@ contract Comptroller is ReentrancyGuard {
 		}
 	}
 
-	function _checkTimelockAndBalance(address holder, uint256 sharesAmount) private view {
+	/// @dev A reconfiguration never orphans queued redemptions (final review 2026-10-11, C1): the old fund's queue book
+	///      stays with the old comptroller, which the factory unregisters, so its requests could no longer be settled,
+	///      liquidated for or made overdue. The move waits until none is open. A fund before the queue (v1, v2) has none.
+	function _requireNoOpenRedemptions(address oldComptroller) private view {
+		(bool ok, bytes memory ret) = oldComptroller.staticcall(abi.encodeWithSignature('redemptionQueue()'));
+		if (!ok || ret.length != 32) return;
+		(uint256 head, uint256 length) = IRedemptionQueue(abi.decode(ret, (address))).queueBounds(oldComptroller);
+		if (head < length) revert OpenRedemptions();
+	}
+
+	/// @dev The vault's USDC a manager's trade must leave: all of it while a redemption is overdue, else none.
+	function _overdue() private view returns (bool) {
+		return redemptionQueue.isOverdue(address(this));
+	}
+
+	function _usdcFloor() private view returns (uint256) {
+		if (!_overdue()) return 0;
+		return denominationAsset.balanceOf(address(vault));
+	}
+
+	function _keepUsdc(uint256 usdcFloor) private view {
+		if (denominationAsset.balanceOf(address(vault)) < usdcFloor) revert UsdcSpentWhileOverdue();
+	}
+
+	function _checkTimelockAndBalance(address holder, uint256 sharesAmount) internal view {
 		if (sharesAmount == 0) revert ZeroAmount();
 		if (shares.balanceOf(holder) < sharesAmount) revert InsufficientSharesBalance();
 		if (block.timestamp < lastDepositTimestamp[holder] + sharesActionTimelock) {

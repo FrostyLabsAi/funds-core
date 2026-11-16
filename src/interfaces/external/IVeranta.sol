@@ -145,9 +145,12 @@ interface IVerantaTradingStorage {
 		returns (IVerantaMulticall.AggregatedLimitOrder memory);
 }
 
-/// @notice Veranta PairStorage (Multicall.pairsStorage()) — the live pair count.
+/// @notice Veranta PairStorage (Multicall.pairsStorage(); Base 0x5db3772136e5557EFE028Db05EE95C84D76faEC4).
 interface IVerantaPairStorage {
 	function pairsCount() external view returns (uint256);
+
+	/// @notice The Pyth Lazer feed a pair is priced from: the mapping Veranta's own PriceAggregator uses.
+	function getLazerFeedId(uint256 pairIndex) external view returns (uint256);
 }
 
 /// @notice Veranta Referral (Base 0x1A110bBA13A1f16cCa4b79758BD39290f29De82D). Linking is
