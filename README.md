@@ -1,90 +1,217 @@
-# funds-core
+# FrostyFi funds-core
 
-Tokenized Hedge Funds — the FrostyFunds protocol contracts.
+Smart contracts for FrostyFi's onchain funds on Base.
 
-Melon v1's architecture rebuilt in Solidity 0.8.24 (Foundry + OpenZeppelin 5.x), with Enzyme v4's proven patterns grafted on. Reference sources live in the parent dir and are **read-only**: `../melon-v1/` (do not modify), `../spec/` (Enzyme v4 spec). Project-wide context: `../README.md` (the living doc).
+A fund is a vault that a manager trades and investors hold shares in. The manager can trade the fund's assets through approved integrations but can't withdraw them. Investors deposit USDC, receive shares priced from onchain price feeds, and redeem for USDC. Each fund's rules and fee limits are enforced by its contracts.
 
-## Layout
+The contracts are live on Base mainnet in public beta. The terminal is at [frostyfi.fund](https://frostyfi.fund).
+
+[![The FrostyFi terminal: the funds list, top yields and the markets a fund can trade](docs/images/terminal.jpeg)](https://frostyfi.fund)
+
+## Contents
+
+- [How a fund works](#how-a-fund-works)
+- [Architecture](#architecture)
+- [Design rules](#design-rules)
+- [Hard limits](#hard-limits)
+- [Roles](#roles)
+- [Repository layout](#repository-layout)
+- [Build and test](#build-and-test)
+- [Deployments](#deployments)
+- [Security](#security)
+- [License](#license)
+- [Acknowledgements](#acknowledgements)
+
+## How a fund works
+
+1. **Create.** Anyone calls `FundFactory.createFund` with a name, a symbol, the denomination asset (USDC), the fees, the deposit timings and a set of policies. The factory deploys three contracts for the fund: a `Comptroller`, a `Vault` and a `Shares` token. Policies are attached at creation; a manager can't remove or loosen them later.
+2. **Deposit.** An investor calls `requestDeposit`, which holds their USDC in escrow. After the fund's waiting time (at least one minute), anyone can call `executeDepositRequest`, which mints shares at the share price of that moment. The investor sets the highest share price they accept and can cancel a request that hasn't been executed. A deposit never mints shares in the transaction that requested it.
+3. **Trade.** The manager calls `callOnIntegration` with a registered adapter (a swap, a vault deposit) or `callOnExternalPosition` on a registered position type (a perp account). The Comptroller measures what left and entered the Vault, tracks new assets, and runs the fund's policies on the result. A trade that breaks a policy reverts.
+4. **Value.** The fund's gross asset value is the sum of its tracked assets and its external positions, each priced through the `ValueInterpreter`. The share price is that value divided by the share supply.
+5. **Fees.** The management fee compounds per second. The performance fee is charged on gains above a high-water mark. Both are paid by minting shares to the manager, and both settle before every change in share supply.
+6. **Redeem.** A fund with no external position, no pool-priced token and no token whose price can't be read at that moment redeems immediately through `redeemShares`. Any other fund redeems through the `RedemptionQueue`: the investor's shares wait in escrow, the manager raises the USDC, and the request settles at the share price of that moment, oldest first. Every redemption pays the full value of the shares, in USDC.
+
+A queued request has a four-day deadline. Past it the manager's fees stop, the manager can no longer spend the Vault's USDC, and the queue's keeper may sell the fund's holdings into USDC to pay the request. Each of those sales may lose at most 3% against the oracle price.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    Investor -->|deposit, redeem| Comptroller
+    Manager -->|trade| Comptroller
+    Investor -->|queued redemption| RedemptionQueue
+    RedemptionQueue --> Comptroller
+    FundFactory -->|deploys| Comptroller
+    Comptroller --> Vault
+    Comptroller --> Shares
+    Comptroller -->|prices| ValueInterpreter
+    Comptroller -->|checks| Policies
+    Comptroller -->|swaps, vault deposits| Adapters
+    Comptroller -->|perp accounts| Positions[External positions]
+    ValueInterpreter --> Feeds[Chainlink feeds, pool price adapters, Veranta price store]
+```
+
+**Per fund**
+
+| Contract | Role |
+|---|---|
+| `Comptroller` | The fund's logic: deposits, redemptions, valuation, fees, policies, tracked assets and external positions. |
+| `Vault` | Custody. Holds the fund's tokens and releases them only at the Comptroller's call. |
+| `Shares` | The fund's share token (ERC-20, 18 decimals). Only the Comptroller mints and burns. |
+
+**Shared**
+
+| Contract | Role |
+|---|---|
+| `FundFactory` | Deploys funds and keeps the fund registry, the adapter and position-type registries, and the policies every new fund must carry. |
+| `ValueInterpreter` | The only price source. Values any registered asset in any other through registered USD feeds. A price older than its asset's heartbeat reverts. |
+| `PoolPriceRegistrar` | Lets anyone price a token from its own DEX pool, with no listing step. Owns the `ValueInterpreter`. |
+| `RedemptionQueue` | Queued redemptions for every fund: escrow, settlement in order, the deadline and liquidation. |
+
+**Plug-ins**
+
+| Directory | Contents |
+|---|---|
+| `src/adapters` | Trading integrations: Uniswap v3 and v4, Aerodrome (basic and Slipstream pools), ERC-4626 vaults and FrostyFi's managed liquidity vaults. An adapter never holds funds between calls, and the Comptroller checks every trade by the Vault's balance changes, not by what the adapter reports. |
+| `src/policies` | Pass/fail checks run on fund actions: depositor and share-transfer allowlists, deposit size, allowed or blocked assets, concentration, position count, minimum pool liquidity, and a limit on the value lost to trades over time. |
+| `src/positions` | External positions. Currently one type: a fund's perp account on Veranta, valued into the fund as spot-equivalent legs at the same oracle prices as its spot holdings. |
+| `src/pricing` | Price feeds: pool price adapters (Uniswap v3 and v4, Aerodrome), the Veranta price store and its adapters, and derivative feeds for ERC-4626 and managed liquidity vault shares. |
+| `src/protect`, `src/profile` | Small registries with no funds and no permissions: hedge settings read by the keeper, and a fund's public links. |
+
+### Pricing
+
+The `ValueInterpreter` reads three kinds of feed:
+
+- **Chainlink feeds** for major tokens and tokenized stocks.
+- **Pool price adapters** for tokens with no feed. A token is priced from its own pool over a 30-minute window: on concentrated-liquidity pools the window is split into five slices and the median is used, so a price moves only once it has held. A pool needs $25,000 of liquidity to be registered and for a fund to buy its token. Under $5,000 of liquidity the token is valued at about zero.
+- **The Veranta price store** for perp markets and for tokenized stocks without a Chainlink feed. It stores Pyth-signed prices that anyone can relay; a price must have been confirmed recently to be read.
+
+Vault shares (ERC-4626 and managed liquidity vaults) are priced as derivatives: a share resolves to its underlying tokens, which are priced by the feeds above.
+
+## Design rules
+
+1. **Share prices come from oracle feeds only.** Nothing that values a fund reads a pool's current price or tick.
+2. **Deposits are asynchronous.** A request and its execution are separate transactions, so a deposit and a withdrawal can never happen atomically.
+3. **A tokenized stock is never priced 1:1 with its underlying share.** Each token has its own feed or its own conversion ratio.
+4. **Every asset is explicitly in or out of the fund's value.** There is no silent residue.
+5. **Risk parameters have limits in bytecode.** Neither a manager nor the protocol owner can set a value beyond them.
+6. **Exits are never blocked by a pause.** A pause, by the manager or by the guardian, stops deposits only. A manager can delay a queued redemption, but only until its deadline.
+
+## Hard limits
+
+These are constants in the deployed bytecode.
+
+| Limit | Value | Where |
+|---|---|---|
+| Performance fee | at most 30% | `Comptroller.MAX_PERF_FEE_BPS` |
+| Management fee | at most about 10% a year | `Comptroller.MAX_MGMT_SCALED_PER_SECOND_RATE` |
+| Protocol fee on assets | at most 1% a year | `FundFactory.MAX_PROTOCOL_FEE_BPS` |
+| Protocol fee on swaps | at most 0.10% | `ProtocolFeeAdapter.MAX_FEE_BPS` |
+| Deposit waiting time | 1 minute to 7 days | `Comptroller.MIN_REQUEST_DURATION_FLOOR`, `MAX_REQUEST_DURATION` |
+| Deposit execution window | 15 minutes to 7 days | `Comptroller.MIN_EXECUTION_WINDOW`, `MAX_EXECUTION_WINDOW` |
+| Wait after a deposit before its shares can be redeemed or transferred | at most 30 days | `Comptroller.MAX_SHARES_ACTION_TIMELOCK` |
+| Tracked assets per fund | 30 | `Comptroller.MAX_TRACKED_ASSETS` |
+| External positions per fund | 10 | `Comptroller.MAX_EXTERNAL_POSITIONS` |
+| Notice before a fund's settings change | 2 days | `FundFactory.RECONFIGURATION_TIMELOCK` |
+| Redemption deadline | 4 days | `RedemptionQueue.DEADLINE` |
+| Loss on a liquidation sale | at most 3% against the oracle | `ComptrollerLib.MAX_LIQUIDATION_LOSS_BPS` |
+| Pool liquidity to register or buy a token | $25,000 | `PoolPriceRegistrar.MIN_LIQUIDITY_USD` |
+| Pool liquidity under which a token is valued at about zero | $5,000 | `PoolPriceAdapterBase.MIN_VALUATION_LIQUIDITY_USD` |
+| Price heartbeat | at most 7 days | `ValueInterpreter.MAX_HEARTBEAT` |
+
+On Base mainnet every new fund also carries two protocol policies: the minimum pool liquidity rule above, and a limit of 5% of fund value lost to trades, refilling over 7 days.
+
+## Roles
+
+| Role | Can | Can't |
+|---|---|---|
+| Fund manager | Trade through registered adapters and position types within the fund's policies. Pause the fund's own deposits. Shut the fund down. Request new settings, which take effect after a 2-day notice. | Withdraw the fund's assets. Remove or loosen a policy. |
+| Investor | Deposit, redeem, cancel a pending request. | |
+| Protocol owner | Register adapters and position types. Set the protocol fees within their limits. Set the policies new funds must carry. List price feeds. Lift a guardian pause. | Take custody of a fund's assets. Change an existing fund's policies or fees. Pause redemptions. |
+| Guardian | Pause a fund's deposits at once. Deregister an adapter or position type at once. | Unpause. Touch redemptions, custody or a fund's settings. |
+| Queue keeper | Settle queued redemptions. Liquidate a fund whose redemption is past its deadline, within the loss limit. | Act on a fund that isn't overdue, other than settling. |
+| Anyone | Create a fund. Execute a matured deposit request. Register a token's price from its pool. Relay a signed Veranta price. | |
+
+There are no upgradeable proxies. A fix to the Comptroller ships as a new build that applies to new funds; an existing fund moves to it only if its manager requests it, after the 2-day notice.
+
+## Repository layout
 
 ```
 src/
-  core/
-    FundFactory.sol      fund deployment + registry        (← melon-v1 FundFactory / v4 FundDeployer)
-    Comptroller.sol      per-fund logic + config hub       (← v4 ComptrollerProxy; absorbs melon-v1
-                                                              Participation + Accounting duties)
-  fund/
-    Shares.sol           fund share token, comptroller-gated mint/burn   (← melon-v1 Shares)
-    Vault.sol            dumb custody, comptroller-gated withdraw       (← melon-v1 Vault, kept tiny)
-  interfaces/
-    IExternalPosition.sol  off-vault holdings (HyperCore hedge leg)     (← v4 external positions)
-    IPolicy.sol            pass/fail validation hooks                   (← melon-v1 policies + v4 hooks)
-    IFee.sol               share-dilution fees, continuous HWM          (← v4 fee formulas)
-    IValueInterpreter.sol  oracle-only pricing aggregation              (← v4 ValueInterpreter)
-test/
-  FundFactory.t.sol      factory wiring, auth gates, deposit request/cancel escrow
+  core/         FundFactory, Comptroller and its libraries, ValueInterpreter
+  fund/         Vault, Shares
+  redemption/   RedemptionQueue
+  adapters/     trading integrations
+  policies/     fund rules
+  positions/    external positions (Veranta perp account)
+  pricing/      pool price registrar and adapters, Veranta price store, derivative feeds
+  protect/      hedge settings registries
+  profile/      fund profile registry
+  interfaces/   interfaces, with third-party protocols under external/
+  libraries/    tick and liquidity math
+script/release/ deployment, listing and post-deployment checks for Base mainnet
+test/           unit tests, with fork/, invariant/, echidna/ and medusa/ suites
+deployments/    address records
 ```
 
-## Build
+## Build and test
+
+Requires [Foundry](https://getfoundry.sh). Solidity 0.8.24, EVM version Cancun, OpenZeppelin Contracts 5.x.
 
 ```bash
+git clone --recurse-submodules https://github.com/FrostyLabsAi/funds-core
+cd funds-core
 forge build
 forge test
 ```
 
-## Deploy (Base Sepolia — UNVERIFIED by design, never pass --verify)
+The fork suites in `test/fork` run against Base mainnet state and skip themselves when no RPC is set, so a passing `forge test` without one says nothing about them. To run them:
 
-`cp .env.example .env`, fill in `PRIVATE_KEY` (+ real-infra addresses are pre-filled, all
-verified from official docs: Uniswap SwapRouter02/NPM, CCTP **v1** TokenMessenger — v2 has a
-different signature, do not swap it in). Then:
+```bash
+BASE_MAINNET_RPC=<archive RPC URL> forge test --match-path 'test/fork/*'
+```
 
-1. `source .env && forge script script/DeployTestnet.s.sol --rpc-url base_sepolia --private-key $PRIVATE_KEY --broadcast`
-2. Copy logged addresses into `.env` (FACTORY/TUSDC/GPUX/EVRX)
-3. Real-router testing: `forge script script/CreateUniV3Pools.s.sol ...` (creates + seeds
-   tUSDC/GPUx + tUSDC/EVRx pools on real Uniswap Sepolia at the mock-feed prices)
-4. `forge script script/SeedFunds.s.sol ...` → wait ≥10 min → `script/SeedFunds.s.sol:SeedExecute`
-5. Post-deploy: `factory.setGuardian(...)`; rotate both position factories' attestors to the
-   keeper key. Real CCTP requires `REAL_USDC` (Circle faucet); Aerodrome has no testnet —
-   Slipstream adapter keeps the mock router until mainnet/fork tests.
+`BASE_FORK_BLOCK` pins the fork to a block. The managed liquidity vault suites read the build output of `funds-yield`, which must be checked out and built next to this repository (`../funds-yield`).
 
-## Hard rules (from the post-mortems and spec — see living doc for sources)
+To run everything and fail if any test failed or was skipped:
 
-1. Share pricing comes from oracle feeds via ValueInterpreter ONLY — never pool spot state / currentTick (Gamma, Jan 2024).
-2. Deposits are async (request → execute at the next NAV). Nothing mints shares atomically with a deposit (kills flash-loan loops and weekend NAV gaming). Redemptions of a fund holding external positions (perps, LPs) are async too: request → settle through the RedemptionQueue once the vault can pay (fund v3, 2026-10-06); a pure-spot fund redeems at once.
-3. Tokenized-stock wrappers are never priced 1:1 with their underlying — every wrapper gets its own feed; depeg is a modeled state.
-4. Every asset state (idle, in-range, out-of-range, in-flight, external) is explicitly in or out of GAV. No silent residue.
-5. Risk parameters get bytecode-level hard caps (frosty-core discipline). Config is attack surface.
-6. Funds holding external positions exit through the RedemptionQueue (cash or in kind, at the NAV of settlement; a switched-off fallback can unwind an overdue request's share of the perps). In kind (`redeemSharesInKind`) never forfeits: from fund version 4 (`ComptrollerV4`, founder 2026-10-09: no exit may pay a redeemer less than their shares' value) it is refused while the fund holds perps or LPs, so the queue is the exit; a pure-spot fund keeps it, a slice of every token being its whole value. V3 funds still carry the old, forfeiting in kind on chain; the terminal doesn't offer it. Exits are never gated by the protocol, a pause, the guardian or an oracle (a token whose price can't be read is paid in kind); a manager can delay a queued redemption, and past its 4-day deadline the manager's fees stop. The fallback never forfeits: what the vault can't cover stays queued.
+```bash
+BASE_MAINNET_RPC=<archive RPC URL> ./scripts/test-all.sh
+```
 
-## melon-v1 coverage — every file accounted for (65/65)
+Fuzzing and static analysis:
 
-Cross-check against `../melon-v1/src/`. Statuses: **PORTED** (equivalent live here), **ABSORBED** (duties live in another contract), **REPLACED** (modern equivalent), **DELETED** (by design decision), **PENDING** (planned, see next PRs).
+```bash
+echidna . --contract EchidnaFund --config echidna.yaml
+medusa fuzz        # runs until stopped
+slither . --filter-paths 'lib/|test/|script/' --exclude-informational --exclude-optimization
+```
 
-| melon-v1 | Files | Status → where |
-|---|---|---|
-| `dependencies/` (DSAuth, DSGuard, DSMath, SafeMath, StandardToken, BurnableToken, PreminedToken, IERC20, TokenUser, WETH) | 10 | REPLACED → OZ 5.x (ERC20/SafeERC20/EnumerableSet/Math), native 0.8 checked math, custom-error modifiers |
-| `engine/` (Engine, AmguConsumer, IEngine) | 3 | DELETED → FROST protocol machinery (splitter → PolVault → FeeDistributor) replaces MLN/AMGU economics; no per-operation fees ever |
-| `exchanges/` (ExchangeAdapter + 8 venue adapters + 7 venue interfaces) | 16 | REPLACED → `interfaces/IIntegrationAdapter.sol` + `adapters/UniswapV3SwapAdapter.sol` + `adapters/AerodromeSlipstreamSwapAdapter.sol` (swaps; Slipstream router verified from source — `int24 tickSpacing` vs Uni's `uint24 fee`). All v1 venues were dead. Slipstream LP (dual-mode) lands as an External Position type, not an adapter |
-| `factory/Factory.sol` | 1 | DELETED → per-spoke factories obsolete (Comptroller deploys components directly) |
-| `factory/FundFactory.sol` | 1 | PORTED → `core/FundFactory.sol` (createFund, registry, + bytecode-cap enforcement) |
-| `fund/accounting/` (Accounting, IAccounting) | 2 | ABSORBED → Comptroller: `calcGav`, `calcGrossShareValue`, tracked assets (MAX 20 kept), `defaultSharePrice`. v1's `updateOwnedAssets` auto-prune → explicit `removeTrackedAsset` w/ zero-balance rule (no silent residue). `getShareCostInAsset` (multi-asset invest) dropped by design — denomination-asset deposits only, per v4 |
-| `fund/fees/` (FeeManager, ManagementFee, PerformanceFee, IFee, IFeeManager) | 5 | ABSORBED → Comptroller `_settleManagementFee` (spec continuous compounding, rpow) + `_settlePerformanceFee` (v4 continuous HWM, replaces v1's period/redeem-window model). v1's `getOwedPerformanceFees`-on-redemption → settled pre-burn via share price (equivalent, simpler). `interfaces/IFee.sol` reserved for the future plugin refactor |
-| `fund/hub/` (Hub, Spoke) | 2 | REPLACED → Comptroller-centric wiring, immutable refs, OZ auth. v1 `shutDownFund` PORTED → one-way `Comptroller.shutDownFund` + owner pause toggle + factory-guardian emergency pause (deposits only; exits never gated) |
-| `fund/participation/` (Participation, IParticipation) | 2 | ABSORBED → Comptroller: `requestDeposit`/`cancelDepositRequest`/`executeDepositRequest` (+ `REQUEST_TTL` = v1 `REQUEST_LIFESPAN`), `redeemSharesInKind` (= `redeemQuantity`), `redeemSharesForDenominationAsset` (new canonical). Dropped by design: multi-asset `investAllowed` lists, AMGU incentives, ETH executor bribes (keeper executes), `historicalInvestors` (subgraph's job). v1's price-update request gating → `minRequestDuration` + feed-heartbeat market-hours gate |
-| `fund/policies/` (PolicyManager, IPolicyManager, IPolicy, AddressList, TradingSignatures, UserWhitelist, AssetBlacklist, AssetWhitelist, MaxConcentration, MaxPositions, PriceTolerance) | 11 | PolicyManager/IPolicy ABSORBED/PORTED → Comptroller policy hooks + `interfaces/IPolicy.sol` (v4 hook taxonomy; investor-restricting hooks lock after launch). UserWhitelist PORTED → `policies/AllowedDepositorsPolicy.sol`. MaxConcentration PORTED → `policies/MaxConcentrationPolicy.sol` (PostCallOnIntegration). + new `MinMaxDepositPolicy` (v4) + `CumulativeSlippageTolerancePolicy` (v4 drain rate-limiter, 7d linear replenish). AddressList → OZ EnumerableSet. TradingSignatures obsolete. MaxPositions → covered by bytecode caps (MAX_TRACKED_ASSETS/MAX_EXTERNAL_POSITIONS). PriceTolerance → superseded by CumulativeSlippageTolerance (same goal, better mechanism). PENDING: Asset{Black,White}list per-fund policies + dust policies |
-| `fund/shares/` (Shares, IShares) | 2 | PORTED → `fund/Shares.sol` (`createFor/destroyFor` → `mint/burn`; v1 blocked all transfers — ours allows w/ timelock + PreTransferShares policies) |
-| `fund/trading/` (Trading, ITrading) | 2 | PORTED → `Comptroller.callOnIntegration` (v4 IntegrationManager model: factory-curated adapter registry, vault-balance-delta accounting, auto-tracked incoming assets, PostCallOnIntegration policies; v1's open-make-order escrow accounting is obsolete) |
-| `fund/vault/` (Vault, IVault) | 2 | PORTED → `fund/Vault.sol` (1:1 dumb custody, + SafeERC20 + explicit `to`) |
-| `prices/` (IPriceSource, KyberPriceFeed) | 2 | REPLACED → `core/ValueInterpreter.sol` (pull oracles, per-asset heartbeat; equity heartbeat = market-hours gate). `hasValidPrice` → `isSupportedAsset` + revert-on-stale |
-| `registry/IRegistry.sol`, `version/` (Registry, Version, IVersion) | 4 | SPLIT: asset registry → ValueInterpreter primitives; fund registry + **name reservation** (`reserveFundName`/`canUseFundName` → `isFundNameTaken`) → FundFactory; adapter/position-type registries → FundFactory; MLN/engine/incentive plumbing DELETED. Version's reconfiguration → `createReconfigurationRequest`/`executeReconfiguration` (2-day timelock); protocol-level `shutDownFund` → guardian deposit-pause + adapter/type deregistration (exits never blockable — stricter than v1) |
+## Deployments
 
-## Status / next PRs
+Base mainnet, chain ID 8453.
 
-DONE: ValueInterpreter (oracle-only pricing, staleness/market-hours gate) · GAV + share price · executeDepositRequest (async, TTL, min-duration) · management fee (continuous compounding) · performance fee (continuous HWM) · redemptions (denomination-asset canonical + in-kind 24/7 fallback) · sharesActionTimelock (redeem + transfer) · policy hooks + AllowedDepositors/MinMaxDeposit · tracked-asset rules · external positions in GAV (managed − debt, floored per position) · `settleFees()` public poke · shutdown/pause lane (one-way `shutDownFund`, owner subscription switch, factory-guardian instant pause with owner-only unpause; redemptions NEVER gated) · trading via `callOnIntegration` (factory-curated adapter registry w/ guardian insta-deregister, balance-delta accounting, auto-tracking) · UniswapV3 + AerodromeSlipstream swap adapters · MaxConcentration + CumulativeSlippageTolerance trading policies · **external-position lifecycle** (typed registry on factory, create/callOn/dust-gated remove, policy hooks on each) · **HyperliquidPerpPosition** (attested-equity hedge leg: keeper attests account equity, 1-day attestation TTL gates GAV like a market-hours heartbeat; immutable bridge account; vault→bridge→vault flows as fund actions) · AllowedExternalPositionTypes policy · **reconfiguration** (signal → 2-day investor exit window → execute: new Comptroller adopts existing Shares/Vault/holders, HWM + tracked assets carry, old comptroller dies for deposits, external positions must wind down first) · Allowed/Disallowed adapter-incoming-asset policies · in-kind redemption skip-list (one broken asset can never block the guaranteed exit) · fund-name reservation · holdings views (calcAssetGav, getFundHoldings) · Base Sepolia deploy + two-phase seed scripts (`script/`). **57 tests green. Function-level melon-v1 audit complete 2026-09-13 — see coverage table.**
+| Contract | Address |
+|---|---|
+| FundFactory | `0x3dce6E26f2eA86Cc07620e82392841F5A5c40f30` |
+| ValueInterpreter | `0xDD3462fCCEd430050D2151aad077CA7a7722E922` |
+| PoolPriceRegistrar | `0xD607063AfC815423A6E7ad79CF6E42F112b7C340` |
+| RedemptionQueue | `0x4E3030D8be82a72E3f551a438F8D20cab50bCA07` |
+| VerantaPriceStore | `0xCC04114e1435e970715E133a942e1aEA0BC1E246` |
+| VerantaPerpConfig | `0x59Ed5B7251749cB2f1220A32c372779470CE15d4` |
 
-**PROTOCOL FEATURE-COMPLETE 2026-09-13** (+ same-day extensions: **derivative pricing** in the ValueInterpreter — v4-style feeds, primitives-only underlyings so cycles are impossible, quote must be primitive — with the generic **ERC4626PriceFeed** + **ERC4626Adapter** (deposit/redeem into any curated 4626 vault: Morpho/Euler/Yearn-class yield) and the **UniswapV3LPPosition** twin (fee-keyed, no gauge, 100% LP fees, same oracle-fair valuation) and the **side-pocket class**: zero-priced assets (unpriceable moonshots) holdable ONLY by funds created with the immutable `allowRiskyAssets` flag — valued at ZERO in GAV until realized by sale, so no oracle to manipulate and no fees on paper gains; in-kind redemption pays out the bag pro-rata; the slippage policy auto-rate-limits moonshot deployment; and **SolanaAccountPosition** — Model-1 native-Solana access: keeper-operated fund wallet on Solana, CCTP outbound locked on-chain to the immutable wallet, factory-pinned attestor, public mandate string; Squads-policy upgrade (Model 2) and CCIP-PDA control (Model 3) staged in the living doc). Also: **SlipstreamLPPosition** (dual-mode LP leg — unstaked fees-to-vault vs gauge-staked AERO-to-vault; valued at the ORACLE-fair sqrt price ported from frosty-core PriceOracle, never pool state) + TickMath/LiquidityAmounts libs + `ValueInterpreter.calcUsdRate`. **62 tests green · Slither/Aderyn triaged (zero-check fixes applied) · Echidna 3/3 properties over 20k calls · coverage: core contracts 90–100% — see AUDIT_TOOLING_RESULTS.md.**
+The full record, with every adapter, policy and feed, is [`deployments/base-mainnet-release.json`](deployments/base-mainnet-release.json). The other files in `deployments/` record earlier deployments that are no longer in use.
 
-Remaining before mainnet (not blocking testnet/subgraph/terminal work):
-1. (optional) Attestation depth: multi-attestor median / equity-delta bounds — the self-attestation vector is already closed by factory-pinned attestors (managers cannot choose who prices their hedge; protocol key rotates globally via one setAttestor)
-2. Long fuzz campaigns (echidna 500k+ / medusa) + external audits ×2
-3. Proxy/beacon deployments (gas + upgradability polish; reconfiguration already covers config swaps)
-4. Pending-fee preview views if the terminal wants them (workaround: eth_call staticcall `settleFees()`)
+## Security
+
+The contracts are tested with unit tests, fork tests against Base mainnet state, invariant tests, Echidna and Medusa fuzzing, and Slither.
+
+They have not been audited by a third party. This is beta software: use it at your own risk.
+
+## License
+
+GPL-3.0. `src/libraries/TickMath.sol` and `src/libraries/LiquidityAmounts.sol` are GPL-2.0-or-later, from Uniswap.
+
+## Acknowledgements
+
+The fund architecture follows Melon Protocol v1 and patterns from Enzyme v4 ([enzymefinance/protocol](https://github.com/enzymefinance/protocol)). The contracts build on [OpenZeppelin Contracts](https://github.com/OpenZeppelin/openzeppelin-contracts) and use tick and liquidity math from [Uniswap v3](https://github.com/Uniswap/v3-core).
