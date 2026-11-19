@@ -72,10 +72,10 @@ flowchart TD
 
 | Directory | Contents |
 |---|---|
-| `src/adapters` | Trading integrations: Uniswap v3 and v4, Aerodrome (basic and Slipstream pools), ERC-4626 vaults and FrostyFi's managed liquidity vaults. An adapter never holds funds between calls, and the Comptroller checks every trade by the Vault's balance changes, not by what the adapter reports. |
+| `src/adapters` | Trading integrations: Uniswap v3 and v4, Aerodrome (basic and Slipstream pools), ERC-4626 vaults and FrostyFi's managed-range vaults. An adapter never holds funds between calls, and the Comptroller checks every trade by the Vault's balance changes, not by what the adapter reports. |
 | `src/policies` | Pass/fail checks run on fund actions: depositor and share-transfer allowlists, deposit size, allowed or blocked assets, concentration, position count, minimum pool liquidity, and a limit on the value lost to trades over time. |
 | `src/positions` | External positions. Currently one type: a fund's perp account on Veranta, valued into the fund as spot-equivalent legs at the same oracle prices as its spot holdings. |
-| `src/pricing` | Price feeds: pool price adapters (Uniswap v3 and v4, Aerodrome), the Veranta price store and its adapters, and derivative feeds for ERC-4626 and managed liquidity vault shares. |
+| `src/pricing` | Price feeds: pool price adapters (Uniswap v3 and v4, Aerodrome), the Veranta price store and its adapters, and derivative feeds for ERC-4626 and managed-range vault shares. |
 | `src/protect`, `src/profile` | Small registries with no funds and no permissions: hedge settings read by the keeper, and a fund's public links. |
 
 ### Pricing
@@ -86,7 +86,7 @@ The `ValueInterpreter` reads three kinds of feed:
 - **Pool price adapters** for tokens with no feed. A token is priced from its own pool over a 30-minute window: on concentrated-liquidity pools the window is split into five slices and the median is used, so a price moves only once it has held. A pool needs $25,000 of liquidity to be registered and for a fund to buy its token. Under $5,000 of liquidity the token is valued at about zero.
 - **The Veranta price store** for perp markets and for tokenized stocks without a Chainlink feed. It stores Pyth-signed prices that anyone can relay; a price must have been confirmed recently to be read.
 
-Vault shares (ERC-4626 and managed liquidity vaults) are priced as derivatives: a share resolves to its underlying tokens, which are priced by the feeds above.
+Vault shares (ERC-4626 and managed-range vaults) are priced as derivatives: a share resolves to its underlying tokens, which are priced by the feeds above.
 
 ## Design rules
 
@@ -171,7 +171,7 @@ The fork suites in `test/fork` run against Base mainnet state and skip themselve
 BASE_MAINNET_RPC=<archive RPC URL> forge test --match-path 'test/fork/*'
 ```
 
-`BASE_FORK_BLOCK` pins the fork to a block. The managed liquidity vault suites read the build output of `funds-yield`, which must be checked out and built next to this repository (`../funds-yield`).
+`BASE_FORK_BLOCK` pins the fork to a block. The managed-range vault suites read the build output of `funds-yield`, which must be checked out and built next to this repository (`../funds-yield`).
 
 To run everything and fail if any test failed or was skipped:
 
@@ -208,9 +208,11 @@ The contracts are tested with unit tests, fork tests against Base mainnet state,
 
 They have not been audited by a third party. This is beta software: use it at your own risk.
 
+To report a vulnerability, use GitHub's private reporting: open the repository's **Security** tab and click **Report a vulnerability**, or go to [the report form](https://github.com/FrostyLabsAi/funds-core/security/advisories/new). Please don't open a public issue.
+
 ## License
 
-GPL-3.0. `src/libraries/TickMath.sol` and `src/libraries/LiquidityAmounts.sol` are GPL-2.0-or-later, from Uniswap.
+GPL-3.0; see [`LICENSE`](LICENSE). `src/libraries/TickMath.sol` and `src/libraries/LiquidityAmounts.sol` are GPL-2.0-or-later, from Uniswap.
 
 ## Acknowledgements
 
