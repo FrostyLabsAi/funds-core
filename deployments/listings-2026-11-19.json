@@ -1,0 +1,19 @@
+{
+	"chainlinkStocks": [
+		{ "symbol": "ANTc", "token": "0xb20000000000000000000016e38FD364d271Ba28", "feed": "0xeEDc7412E991a3F2BD693eb2aC7fB0F27d4660dA" }
+	],
+	"verantaStocks": [
+		{ "symbol": "TTWOc", "token": "0xB200000000000000000000f720C26062Bc3067Da", "pair": 166, "referencePrice": 21385524000 },
+		{ "symbol": "MRNAc", "token": "0xB200000000000000000000e215e9B76ecBA02468", "pair": 128, "referencePrice": 20188500000 },
+		{ "symbol": "HOODc", "token": "0xb2000000000000000000006F944897540579D3f2", "pair": 91, "referencePrice": 7011493000 },
+		{ "symbol": "LITEc", "token": "0xB200000000000000000000eDA6C2c6F11E0F838f", "pair": 122, "referencePrice": 54001142000 },
+		{ "symbol": "BEc", "token": "0xb20000000000000000000016f9dfe862feBA122b", "pair": 121, "referencePrice": 17050750000 }
+	],
+	"perpMarkets": [
+		{ "base": "ANT", "pair": 222 }
+	],
+	"poolPriced": [
+		{ "symbol": "ORCLc", "token": "0xb200000000000000000000347AFbA223D7B6b63C", "pool": "0x62b5452e80e50b047dcf6dd3fb6a1d266c678eb5" },
+		{ "symbol": "HIMSc", "token": "0xB20000000000000000000043a599976181Bcf336", "pool": "0x41d7793faa4ca181b6f021423ff3f9015c00b2ff" }
+	]
+}

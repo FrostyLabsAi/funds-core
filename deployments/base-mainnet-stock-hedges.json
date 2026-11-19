@@ -91,6 +91,97 @@
       "token": "0xb2000000000000000000004884b426556b92883d",
       "symbol": "MSTRc",
       "decimals": 8
+    },
+    {
+      "pairIndex": 91,
+      "perp": "HOOD",
+      "token": "0xb2000000000000000000006F944897540579D3f2",
+      "symbol": "HOODc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 121,
+      "perp": "BE",
+      "token": "0xb20000000000000000000016f9dfe862feBA122b",
+      "symbol": "BEc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 122,
+      "perp": "LITE",
+      "token": "0xB200000000000000000000eDA6C2c6F11E0F838f",
+      "symbol": "LITEc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 128,
+      "perp": "MRNA",
+      "token": "0xB200000000000000000000e215e9B76ecBA02468",
+      "symbol": "MRNAc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 166,
+      "perp": "TTWO",
+      "token": "0xB200000000000000000000f720C26062Bc3067Da",
+      "symbol": "TTWOc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 222,
+      "perp": "ANT",
+      "token": "0xb20000000000000000000016e38FD364d271Ba28",
+      "symbol": "ANTc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 98,
+      "perp": "AMD",
+      "token": "0xB2000000000000000000000d8Ce462E99ee7A47B",
+      "symbol": "AMDc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 100,
+      "perp": "MU",
+      "token": "0xb200000000000000000000Fd2f87532B90095211",
+      "symbol": "MUc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 107,
+      "perp": "MRVL",
+      "token": "0xB200000000000000000000eC3c4c7395Cc609813",
+      "symbol": "MRVLc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 110,
+      "perp": "PLTR",
+      "token": "0xb2000000000000000000007d16372840dF4dAbbe",
+      "symbol": "PLTRc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 111,
+      "perp": "AVGO",
+      "token": "0xB200000000000000000000Fc737aeA6196aB5a4c",
+      "symbol": "AVGOc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 112,
+      "perp": "NFLX",
+      "token": "0xb20000000000000000000058B8c947e44011dFE6",
+      "symbol": "NFLXc",
+      "decimals": 8
+    },
+    {
+      "pairIndex": 120,
+      "perp": "LLY",
+      "token": "0xB200000000000000000000f1a0F91e34892E4718",
+      "symbol": "LLYc",
+      "decimals": 8
     }
   ]
 }
